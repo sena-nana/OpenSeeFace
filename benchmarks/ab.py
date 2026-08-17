@@ -19,6 +19,19 @@ import onnxruntime as ort
 import psutil
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from preprocess import imagenet_nchw, retina_nchw  # noqa: E402
+
+
+def _ort_dylib() -> Path | None:
+    capi = Path(ort.__file__).resolve().parent / "capi"
+    for pat in ("libonnxruntime*.dylib", "libonnxruntime.so*", "onnxruntime.dll"):
+        hits = sorted(capi.glob(pat))
+        if hits:
+            return hits[0]
+    return None
 
 
 def rss() -> dict:
@@ -73,24 +86,6 @@ def session(path: Path, threads: int) -> ort.InferenceSession:
     opt.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     opt.log_severity_level = 3
     return ort.InferenceSession(str(path), sess_options=opt, providers=["CPUExecutionProvider"])
-
-
-_MEAN = np.float32([0.485, 0.456, 0.406])
-_STD = np.float32([0.229, 0.224, 0.225])
-_MEAN = -(_MEAN / _STD)
-_STD = 1.0 / (_STD * 255.0)
-
-
-def imagenet_nchw(bgr: np.ndarray, size: int) -> np.ndarray:
-    im = cv2.resize(bgr, (size, size), interpolation=cv2.INTER_LINEAR)[:, :, ::-1]
-    im = np.float32(im) * _STD + _MEAN
-    return np.transpose(np.expand_dims(im, 0), (0, 3, 1, 2)).astype(np.float32)
-
-
-def retina_nchw(bgr: np.ndarray) -> np.ndarray:
-    im = np.float32(cv2.resize(bgr, (640, 640), interpolation=cv2.INTER_LINEAR))
-    im -= (104, 117, 123)
-    return np.expand_dims(im.transpose(2, 0, 1), 0)
 
 
 def lm_meta(model: int) -> tuple[str, int]:
@@ -229,9 +224,7 @@ def python_bench(args, dump: Path) -> dict:
         x2, y2 = clamp(x + w + int(w * 0.1), y + h + int(h * 0.125))
         if x2 - x1 >= 4 and y2 - y1 >= 4:
             t1 = time.perf_counter()
-            crop = np.float32(frame[y1:y2, x1:x2, ::-1])
-            crop = cv2.resize(crop, (lm_size, lm_size), interpolation=cv2.INTER_LINEAR)
-            crop = np.transpose(np.expand_dims(crop * _STD + _MEAN, 0), (0, 3, 1, 2)).astype(np.float32)
+            crop = imagenet_nchw(frame[y1:y2, x1:x2], lm_size)
             out = as_f32(lm_sess.run(None, adapt_feed(lm_sess, {"input": crop})))[0]
             landmarks_ms = (time.perf_counter() - t1) * 1000
             _, lms = decode_lms(out[0], (x1, y1, (x2 - x1) / lm_size, (y2 - y1) / lm_size), args.model)
@@ -262,9 +255,10 @@ def python_bench(args, dump: Path) -> dict:
 
 def compare(py: dict, rs: dict) -> None:
     print("A/B  Python onnxruntime  vs  Rust ort")
+    dylib = rs.get("ort_dylib") or "static"
     print(
         f"  python {py.get('runtime_version')}  rust crate {rs.get('crate_version')}  "
-        f"device={rs.get('device', 'cpu')}"
+        f"device={rs.get('device', 'cpu')}  ort={Path(str(dylib)).name}"
     )
     header = f"{'model':<18} {'metric':<16} {'python':>10} {'ort-rust':>10} {'rust/py':>8}"
     print(header)
@@ -317,11 +311,19 @@ def main() -> int:
 
     crate = ROOT / "runtime-ort"
     rust_bin = crate / "target" / "release" / "osf-bench"
-    build = ["cargo", "build", "--release", "--bin", "osf-bench"]
+    features = []
     if args.device == "gpu":
-        build += ["--features", "gpu"]
-    if args.device == "gpu" or not rust_bin.is_file():
-        subprocess.run(build, cwd=crate, check=True)
+        features.append("gpu")
+    dylib = _ort_dylib()
+    if dylib:
+        features.append("shared-ort")
+    build = ["cargo", "build", "--release", "--bin", "osf-bench"]
+    if features:
+        build += ["--features", ",".join(features)]
+    subprocess.run(build, cwd=crate, check=True)
+    env = os.environ.copy()
+    if dylib:
+        env["ORT_DYLIB_PATH"] = str(dylib)
     common = [
         "--models-dir", args.models_dir, "--image", args.image, "--model", str(args.model),
         "--threads", str(args.threads), "--warmup", str(args.warmup), "--iters", str(args.iters),
@@ -329,6 +331,7 @@ def main() -> int:
     ]
     subprocess.run(
         [str(rust_bin), *common, "--out", str(out / "rust.json"), "--ref-dir", str(dump)],
+        env=env,
         check=True,
     )
     rs = json.loads((out / "rust.json").read_text())

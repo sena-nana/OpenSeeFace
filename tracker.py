@@ -10,6 +10,7 @@ import copy
 from similaritytransform import SimilarityTransform
 from retinaface import RetinaFaceDetector
 from remedian import remedian
+from preprocess import imagenet_hwc, imagenet_nchw, imagenet_nchw_rgb_float
 
 def run_onnx(session, feeds):
     adapted = {k: np.asarray(v, np.float16) for k, v in feeds.items()}
@@ -566,19 +567,6 @@ class Tracker():
         self.detection = onnxruntime.InferenceSession(os.path.join(model_base_path, "mnv3_detection_opt.onnx"), sess_options=options, providers=providersList)
         self.faces = []
 
-        # Image normalization constants
-        self.mean = np.float32(np.array([0.485, 0.456, 0.406]))
-        self.std = np.float32(np.array([0.229, 0.224, 0.225]))
-        self.mean = self.mean / self.std
-        self.std = self.std * 255.0
-
-        self.mean = - self.mean
-        self.std = 1.0 / self.std
-        self.mean_32 = np.tile(self.mean, [32, 32, 1])
-        self.std_32 = np.tile(self.std, [32, 32, 1])
-        self.mean_224 = np.tile(self.mean, [224, 224, 1])
-        self.std_224 = np.tile(self.std, [224, 224, 1])
-
         # PnP solving
         self.face_3d = np.array([
             [ 0.4551769692672  ,  0.300895790030204, -0.764429433974752],
@@ -675,16 +663,10 @@ class Tracker():
         self.try_hard = try_hard
 
         self.res = 224.
-        self.mean_res = self.mean_224
-        self.std_res = self.std_224
         if model_type < 0:
             self.res = 56.
-            self.mean_res = np.tile(self.mean, [56, 56, 1])
-            self.std_res = np.tile(self.std, [56, 56, 1])
         if model_type < -1:
             self.res = 112.
-            self.mean_res = np.tile(self.mean, [112, 112, 1])
-            self.std_res = np.tile(self.std, [112, 112, 1])
         self.res_i = int(self.res)
         self.out_res = 27.
         if model_type < 0:
@@ -709,9 +691,7 @@ class Tracker():
         self.fail_count = 0
 
     def detect_faces(self, frame):
-        im = cv2.resize(frame, (224, 224), interpolation=cv2.INTER_LINEAR)[:,:,::-1] * self.std_224 + self.mean_224
-        im = np.expand_dims(im, 0)
-        im = np.transpose(im, (0,3,1,2))
+        im = imagenet_nchw(frame, 224)
         outputs, maxpool = run_onnx(self.detection, {'input': im})
         outputs = np.array(outputs)
         maxpool = np.array(maxpool)
@@ -865,11 +845,9 @@ class Tracker():
 
     def preprocess(self, im, crop):
         x1, y1, x2, y2 = crop
-        im = np.float32(im[y1:y2, x1:x2,::-1]) # Crop and BGR to RGB
-        im = cv2.resize(im, (self.res_i, self.res_i), interpolation=cv2.INTER_LINEAR) * self.std_res + self.mean_res
-        im = np.expand_dims(im, 0)
-        im = np.transpose(im, (0,3,1,2))
-        return im
+        rgb = np.float32(im[y1:y2, x1:x2, ::-1])
+        rgb = cv2.resize(rgb, (self.res_i, self.res_i), interpolation=cv2.INTER_LINEAR)
+        return imagenet_nchw_rgb_float(rgb)
 
     def equalize(self, im):
         im_yuv = cv2.cvtColor(im, cv2.COLOR_BGR2YUV)
@@ -907,9 +885,8 @@ class Tracker():
                 full_frame[0:32, 0:32] = im
             else:
                 full_frame[0:32, 32:64] = im
-        im = im.astype(np.float32)[:,:,::-1] * self.std_32 + self.mean_32
-        im = np.expand_dims(im, 0)
-        im = np.transpose(im, (0,3,2,1))
+        hwc = imagenet_hwc(im)
+        im = np.transpose(hwc[None], (0, 3, 2, 1))
         return im, x1, y1, scale, reference, a
 
     def extract_face(self, frame, lms):

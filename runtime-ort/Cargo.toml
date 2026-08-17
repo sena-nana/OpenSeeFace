@@ -10,6 +10,8 @@ publish = false
 default = []
 # CoreML on macOS, CUDA elsewhere (lax match picks the closest prebuilt ORT).
 gpu = ["ort/lax-feature-matching", "ort/coreml", "ort/cuda"]
+# Load the same libonnxruntime as Python (ORT_DYLIB_PATH).
+shared-ort = ["ort/load-dynamic"]
 
 [dependencies]
 anyhow = "1"

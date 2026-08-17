@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use osf_ort::{
     cosine, detect_faces, imagenet_nchw, max_abs, mean_abs, model_path, read_f32_le, retina_nchw,
-    rss, BgrImage, Device, Latency, LmSpec, OrtModel, VERSION,
+    rss, BgrImage, Device, Latency, LmSpec, OrtModel, TensorF16, VERSION,
 };
 use serde::Serialize;
 
@@ -40,6 +40,7 @@ struct Report {
     backend: &'static str,
     crate_version: &'static str,
     device: String,
+    ort_dylib: Option<String>,
     threads: usize,
     models: HashMap<String, ModelReport>,
     pipeline: Pipeline,
@@ -80,113 +81,71 @@ fn main() -> Result<()> {
     let spec = LmSpec::from_type(args.model)?;
     let mut models = HashMap::new();
 
-    let det_in = match args.ref_dir.as_ref() {
-        Some(d) => osf_ort::TensorF32 {
-            shape: vec![1, 3, 224, 224],
-            data: read_f32_le(d.join("detection_input.bin"))?,
-        },
-        None => imagenet_nchw(&frame, 224),
+    let dump = |name: &str| args.ref_dir.as_ref().map(|d| d.join(name));
+    let load = |name: &str, shape: Vec<i64>, fb: TensorF16| -> Result<TensorF16> {
+        match dump(name) {
+            Some(p) if p.is_file() => Ok(TensorF16::from_f32(shape, read_f32_le(p)?)),
+            _ => Ok(fb),
+        }
     };
-    models.insert(
-        "detection".into(),
-        bench(
-            &model_path(&args.models_dir, "mnv3_detection_opt.onnx"),
-            "mnv3_detection_opt.onnx",
-            &det_in,
-            args.threads,
-            device,
-            args.warmup,
-            args.iters,
-            args.ref_dir
-                .as_ref()
-                .map(|d| d.join("detection_output_0.bin")),
-        )?,
-    );
-
-    let lm_in = match args.ref_dir.as_ref() {
-        Some(d) if d.join("landmarks_input.bin").is_file() => osf_ort::TensorF32 {
-            shape: vec![1, 3, spec.size as i64, spec.size as i64],
-            data: read_f32_le(d.join("landmarks_input.bin"))?,
-        },
-        _ => imagenet_nchw(&frame, spec.size),
-    };
-    models.insert(
-        spec.file.trim_end_matches(".onnx").into(),
-        bench(
-            &model_path(&args.models_dir, spec.file),
-            spec.file,
-            &lm_in,
-            args.threads,
-            device,
-            args.warmup,
-            args.iters,
-            args.ref_dir
-                .as_ref()
-                .map(|d| d.join("landmarks_output.bin")),
-        )?,
-    );
-
-    let gaze = model_path(&args.models_dir, "mnv3_gaze32_split_opt.onnx");
-    if gaze.is_file() {
-        let gin = match args.ref_dir.as_ref() {
-            Some(d) if d.join("gaze_input.bin").is_file() => osf_ort::TensorF32 {
-                shape: vec![2, 3, 32, 32],
-                data: read_f32_le(d.join("gaze_input.bin"))?,
-            },
-            _ => osf_ort::TensorF32 {
-                shape: vec![2, 3, 32, 32],
-                data: vec![0.0; 2 * 3 * 32 * 32],
-            },
-        };
+    let mut go = |key: &str, file: &str, input: &TensorF16, out: &str| -> Result<()> {
         models.insert(
-            "gaze".into(),
+            key.into(),
             bench(
-                &gaze,
-                "mnv3_gaze32_split_opt.onnx",
-                &gin,
+                &model_path(&args.models_dir, file),
+                file,
+                input,
                 args.threads,
                 device,
                 args.warmup,
                 args.iters,
-                args.ref_dir.as_ref().map(|d| d.join("gaze_output.bin")),
+                dump(out),
             )?,
         );
+        Ok(())
+    };
+
+    go(
+        "detection",
+        "mnv3_detection_opt.onnx",
+        &load("detection_input.bin", vec![1, 3, 224, 224], imagenet_nchw(&frame, 224))?,
+        "detection_output_0.bin",
+    )?;
+    go(
+        spec.file.trim_end_matches(".onnx"),
+        spec.file,
+        &load(
+            "landmarks_input.bin",
+            vec![1, 3, spec.size as i64, spec.size as i64],
+            imagenet_nchw(&frame, spec.size),
+        )?,
+        "landmarks_output.bin",
+    )?;
+    if model_path(&args.models_dir, "mnv3_gaze32_split_opt.onnx").is_file() {
+        go(
+            "gaze",
+            "mnv3_gaze32_split_opt.onnx",
+            &load("gaze_input.bin", vec![2, 3, 32, 32], TensorF16::zeros(vec![2, 3, 32, 32]))?,
+            "gaze_output.bin",
+        )?;
+    }
+    if model_path(&args.models_dir, "retinaface_640x640_opt.onnx").is_file() {
+        go(
+            "retinaface",
+            "retinaface_640x640_opt.onnx",
+            &load("retinaface_input.bin", vec![1, 3, 640, 640], retina_nchw(&frame))?,
+            "retinaface_output_0.bin",
+        )?;
     }
 
-    let rf = model_path(&args.models_dir, "retinaface_640x640_opt.onnx");
-    if rf.is_file() {
-        let rin = match args.ref_dir.as_ref() {
-            Some(d) if d.join("retinaface_input.bin").is_file() => osf_ort::TensorF32 {
-                shape: vec![1, 3, 640, 640],
-                data: read_f32_le(d.join("retinaface_input.bin"))?,
-            },
-            _ => retina_nchw(&frame),
-        };
-        models.insert(
-            "retinaface".into(),
-            bench(
-                &rf,
-                "retinaface_640x640_opt.onnx",
-                &rin,
-                args.threads,
-                device,
-                args.warmup,
-                args.iters,
-                args.ref_dir
-                    .as_ref()
-                    .map(|d| d.join("retinaface_output_0.bin")),
-            )?,
-        );
-    }
-
-    let pipeline = pipeline(&args, &frame, spec, device)?;
     let report = Report {
         backend: "ort-rust",
         crate_version: VERSION,
         device: device.as_str().into(),
+        ort_dylib: std::env::var("ORT_DYLIB_PATH").ok(),
         threads: args.threads,
         models,
-        pipeline,
+        pipeline: pipeline(&args, &frame, spec, device)?,
     };
     let json = serde_json::to_string_pretty(&report)?;
     if let Some(p) = &args.out {
@@ -202,7 +161,7 @@ fn main() -> Result<()> {
 fn bench(
     path: &std::path::Path,
     filename: &str,
-    input: &osf_ort::TensorF32,
+    input: &TensorF16,
     threads: usize,
     device: Device,
     warmup: u32,
@@ -216,12 +175,12 @@ fn bench(
     let first = m.run(input)?;
     let first_infer_ms = t0.elapsed().as_secs_f64() * 1000.0;
     for _ in 0..warmup {
-        m.run(input)?;
+        m.infer()?;
     }
     let mut samples = Vec::with_capacity(iters as usize);
     for _ in 0..iters {
         let t = Instant::now();
-        m.run(input)?;
+        m.infer()?;
         samples.push(t.elapsed().as_secs_f64() * 1000.0);
     }
     let accuracy = ref_out
@@ -229,12 +188,13 @@ fn bench(
         .map(|p| read_f32_le(p))
         .transpose()?
         .map(|r| {
-            let n = first[0].data.len().min(r.len());
+            let got = first[0].to_f32();
+            let n = got.len().min(r.len());
             Acc {
                 compared_elems: n,
-                max_abs: max_abs(&first[0].data[..n], &r[..n]),
-                mean_abs: mean_abs(&first[0].data[..n], &r[..n]),
-                cosine: cosine(&first[0].data[..n], &r[..n]),
+                max_abs: max_abs(&got[..n], &r[..n]),
+                mean_abs: mean_abs(&got[..n], &r[..n]),
+                cosine: cosine(&got[..n], &r[..n]),
             }
         });
     Ok(ModelReport {
@@ -294,20 +254,14 @@ fn pipeline(args: &Args, frame: &BgrImage, spec: LmSpec, device: Device) -> Resu
                     }
                     if let Some(lms) = v["landmarks"].as_array() {
                         if !lms.is_empty() {
-                            let crop = crop_img(
-                                frame,
-                                crop_box(frame, d).0,
-                                crop_box(frame, d).1,
-                                crop_box(frame, d).2,
-                                crop_box(frame, d).3,
-                            );
+                            let (x1, y1, x2, y2) = crop_box(frame, d);
+                            let crop = crop_img(frame, x1, y1, x2, y2);
                             let mut lm = OrtModel::open(
                                 model_path(&args.models_dir, spec.file),
                                 args.threads,
                                 device,
                                 1,
                             )?;
-                            let (x1, y1, x2, y2) = crop_box(frame, d);
                             let lin = imagenet_nchw(&crop, spec.size);
                             let out = lm.run(&lin)?;
                             let scale_x = (x2 - x1) as f32 / spec.size as f32;

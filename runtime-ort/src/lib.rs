@@ -5,19 +5,79 @@ use std::str::FromStr;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
+use half::f16;
 #[cfg(feature = "gpu")]
 use ort::ep::ExecutionProvider;
-use half::f16;
 use ort::logging::LogLevel;
 use ort::session::builder::GraphOptimizationLevel;
-use ort::session::Session;
-use ort::value::Tensor;
+use ort::session::{IoBinding, Session};
+use ort::value::{Tensor, TensorRef, ValueType};
+use ort::{api, AsPointer};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const IMAGENET_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const IMAGENET_STD: [f32; 3] = [0.229, 0.224, 0.225];
 const RETINA_MEAN: [f32; 3] = [104.0, 117.0, 123.0];
+
+const fn bake_lut(scale: [f32; 3], bias: [f32; 3]) -> [[f16; 256]; 3] {
+    let mut lut = [[f16::from_f32_const(0.0); 256]; 3];
+    let mut c = 0;
+    while c < 3 {
+        let mut v = 0;
+        while v < 256 {
+            lut[c][v] = f16::from_f32_const((v as f32) * scale[c] + bias[c]);
+            v += 1;
+        }
+        c += 1;
+    }
+    lut
+}
+
+/// Baked BGR-source → NCHW dest normalization.
+///
+/// ImageNet dest planes are RGB (`src = [2,1,0]`) with `(x/255 - mean) / std`.
+/// RetinaFace dest planes stay BGR and subtract `(104, 117, 123)`.
+#[derive(Clone, Copy, Debug)]
+pub struct ColorNorm {
+    pub scale: [f32; 3],
+    pub bias: [f32; 3],
+    /// BGR channel index for destination planes 0..2.
+    pub src: [usize; 3],
+    lut: [[f16; 256]; 3],
+}
+
+impl ColorNorm {
+    pub const IMAGENET: Self = {
+        let scale = [
+            1.0 / (IMAGENET_STD[0] * 255.0),
+            1.0 / (IMAGENET_STD[1] * 255.0),
+            1.0 / (IMAGENET_STD[2] * 255.0),
+        ];
+        let bias = [
+            -(IMAGENET_MEAN[0] / IMAGENET_STD[0]),
+            -(IMAGENET_MEAN[1] / IMAGENET_STD[1]),
+            -(IMAGENET_MEAN[2] / IMAGENET_STD[2]),
+        ];
+        Self {
+            scale,
+            bias,
+            src: [2, 1, 0],
+            lut: bake_lut(scale, bias),
+        }
+    };
+
+    pub const RETINA: Self = {
+        let scale = [1.0, 1.0, 1.0];
+        let bias = [-RETINA_MEAN[0], -RETINA_MEAN[1], -RETINA_MEAN[2]];
+        Self {
+            scale,
+            bias,
+            src: [0, 1, 2],
+            lut: bake_lut(scale, bias),
+        }
+    };
+}
 
 /// Matches `Tracker.model_type`.
 #[derive(Clone, Copy, Debug)]
@@ -107,9 +167,30 @@ impl LmSpec {
 }
 
 #[derive(Clone, Debug)]
-pub struct TensorF32 {
+pub struct TensorF16 {
     pub shape: Vec<i64>,
-    pub data: Vec<f32>,
+    pub data: Vec<f16>,
+}
+
+impl TensorF16 {
+    pub fn zeros(shape: Vec<i64>) -> Self {
+        let n: usize = shape.iter().map(|d| *d as usize).product();
+        Self {
+            shape,
+            data: vec![f16::ZERO; n],
+        }
+    }
+
+    pub fn from_f32(shape: Vec<i64>, data: impl IntoIterator<Item = f32>) -> Self {
+        Self {
+            shape,
+            data: data.into_iter().map(f16::from_f32).collect(),
+        }
+    }
+
+    pub fn to_f32(&self) -> Vec<f32> {
+        self.data.iter().map(|x| x.to_f32()).collect()
+    }
 }
 
 #[derive(Clone)]
@@ -175,48 +256,70 @@ impl BgrImage {
     }
 }
 
-fn imagenet_affine() -> ([f32; 3], [f32; 3]) {
-    let mut mean = [0.0; 3];
-    let mut std = [0.0; 3];
-    for c in 0..3 {
-        mean[c] = -(IMAGENET_MEAN[c] / IMAGENET_STD[c]);
-        std[c] = 1.0 / (IMAGENET_STD[c] * 255.0);
-    }
-    (mean, std)
-}
-
-pub fn imagenet_nchw(bgr: &BgrImage, size: u32) -> TensorF32 {
-    let im = bgr.resize(size, size);
-    let (mean, std) = imagenet_affine();
-    let n = (size * size) as usize;
-    let mut data = vec![0.0f32; 3 * n];
+fn apply_lut(src_bgr: &[u8], n: usize, norm: &ColorNorm, data: &mut [f16]) {
+    let src = norm.src;
+    let lut = &norm.lut;
     for i in 0..n {
-        let b = im.data[i * 3] as f32;
-        let g = im.data[i * 3 + 1] as f32;
-        let r = im.data[i * 3 + 2] as f32;
-        data[i] = r * std[0] + mean[0];
-        data[n + i] = g * std[1] + mean[1];
-        data[2 * n + i] = b * std[2] + mean[2];
-    }
-    TensorF32 {
-        shape: vec![1, 3, size as i64, size as i64],
-        data,
+        let p = i * 3;
+        data[i] = lut[0][src_bgr[p + src[0]] as usize];
+        data[n + i] = lut[1][src_bgr[p + src[1]] as usize];
+        data[2 * n + i] = lut[2][src_bgr[p + src[2]] as usize];
     }
 }
 
-pub fn retina_nchw(bgr: &BgrImage) -> TensorF32 {
-    let im = bgr.resize(640, 640);
-    let n = 640 * 640;
-    let mut data = vec![0.0f32; 3 * n];
-    for i in 0..n {
-        for c in 0..3 {
-            data[c * n + i] = im.data[i * 3 + c] as f32 - RETINA_MEAN[c];
+/// Fused bilinear resize + BGR/RGB remap + baked mean/std → f16 NCHW.
+pub fn nchw(bgr: &BgrImage, width: u32, height: u32, norm: &ColorNorm) -> TensorF16 {
+    let n = (width * height) as usize;
+    let mut data = vec![f16::ZERO; 3 * n];
+    let src = norm.src;
+    let lut = &norm.lut;
+    if width == bgr.width && height == bgr.height {
+        apply_lut(&bgr.data, n, norm, &mut data);
+        return TensorF16 {
+            shape: vec![1, 3, height as i64, width as i64],
+            data,
+        };
+    }
+    let fx = bgr.width as f32 / width as f32;
+    let fy = bgr.height as f32 / height as f32;
+    for y in 0..height {
+        let sy = (y as f32 + 0.5) * fy - 0.5;
+        let y0 = sy.floor().clamp(0.0, (bgr.height - 1) as f32) as u32;
+        let y1 = (y0 + 1).min(bgr.height - 1);
+        let wy = (sy - y0 as f32).clamp(0.0, 1.0);
+        for x in 0..width {
+            let sx = (x as f32 + 0.5) * fx - 0.5;
+            let x0 = sx.floor().clamp(0.0, (bgr.width - 1) as f32) as u32;
+            let x1 = (x0 + 1).min(bgr.width - 1);
+            let wx = (sx - x0 as f32).clamp(0.0, 1.0);
+            let i00 = ((y0 * bgr.width + x0) * 3) as usize;
+            let i10 = ((y0 * bgr.width + x1) * 3) as usize;
+            let i01 = ((y1 * bgr.width + x0) * 3) as usize;
+            let i11 = ((y1 * bgr.width + x1) * 3) as usize;
+            let o = (y * width + x) as usize;
+            for c in 0..3 {
+                let s = src[c];
+                let v = bgr.data[i00 + s] as f32 * (1.0 - wx) * (1.0 - wy)
+                    + bgr.data[i10 + s] as f32 * wx * (1.0 - wy)
+                    + bgr.data[i01 + s] as f32 * (1.0 - wx) * wy
+                    + bgr.data[i11 + s] as f32 * wx * wy;
+                let u = v.round().clamp(0.0, 255.0) as u8 as usize;
+                data[c * n + o] = lut[c][u];
+            }
         }
     }
-    TensorF32 {
-        shape: vec![1, 3, 640, 640],
+    TensorF16 {
+        shape: vec![1, 3, height as i64, width as i64],
         data,
     }
+}
+
+pub fn imagenet_nchw(bgr: &BgrImage, size: u32) -> TensorF16 {
+    nchw(bgr, size, size, &ColorNorm::IMAGENET)
+}
+
+pub fn retina_nchw(bgr: &BgrImage) -> TensorF16 {
+    nchw(bgr, 640, 640, &ColorNorm::RETINA)
 }
 
 /// `cpu` or `gpu` (CoreML on Apple, CUDA on NVIDIA).
@@ -248,6 +351,10 @@ impl FromStr for Device {
     }
 }
 
+fn oe(e: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::anyhow!("{e}")
+}
+
 fn gpu_eps() -> Result<Vec<ort::ep::ExecutionProviderDispatch>> {
     #[cfg(not(feature = "gpu"))]
     bail!("GPU requested; rebuild with `--features gpu`");
@@ -277,8 +384,15 @@ fn gpu_eps() -> Result<Vec<ort::ep::ExecutionProviderDispatch>> {
     }
 }
 
+struct BoundIo {
+    binding: IoBinding,
+    input: Tensor<f16>,
+    input_shape: Vec<i64>,
+}
+
 pub struct OrtModel {
     session: Session,
+    bound: Option<BoundIo>,
     pub input_name: String,
     pub load_ms: f64,
 }
@@ -297,27 +411,27 @@ impl OrtModel {
         let path = path.as_ref();
         let start = Instant::now();
         let mut builder = Session::builder()
-            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .map_err(oe)?
             .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .map_err(oe)?
             .with_intra_threads(threads.max(1))
-            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .map_err(oe)?
             .with_inter_threads(1)
-            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .map_err(oe)?
             .with_parallel_execution(false)
-            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .map_err(oe)?
+            .with_memory_pattern(true)
+            .map_err(oe)?
             .with_log_level(LogLevel::Error)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .map_err(oe)?;
         if device == Device::Gpu {
             builder = builder
                 .with_dimension_override("batch_size", batch.max(1))
-                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .map_err(oe)?
                 .with_execution_providers(gpu_eps()?)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                .map_err(oe)?;
         }
-        let session = builder
-            .commit_from_file(path)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let session = builder.commit_from_file(path).map_err(oe)?;
         let load_ms = start.elapsed().as_secs_f64() * 1000.0;
         let input_name = session
             .inputs()
@@ -326,48 +440,126 @@ impl OrtModel {
             .unwrap_or_else(|| "input".into());
         Ok(Self {
             session,
+            bound: None,
             input_name,
             load_ms,
         })
     }
 
-    pub fn run(&mut self, input: &TensorF32) -> Result<Vec<TensorF32>> {
+    fn bind(&mut self, input: &TensorF16) -> Result<()> {
+        if self.bound.as_ref().is_some_and(|b| b.input_shape == input.shape) {
+            return self.write_input(input);
+        }
+        let batch = input.shape.first().copied().unwrap_or(1);
+        let mut specs = Vec::new();
+        for o in self.session.outputs() {
+            let ValueType::Tensor { shape, .. } = o.dtype() else {
+                bail!("expected tensor output {}", o.name());
+            };
+            let mut dims: Vec<i64> = shape.iter().copied().collect();
+            if dims.first().is_some_and(|d| *d <= 0) {
+                dims[0] = batch;
+            }
+            specs.push((o.name().to_string(), dims));
+        }
+        if specs.iter().any(|(_, s)| s.iter().any(|d| *d <= 0)) {
+            let probe = self.run_unbound(input)?;
+            specs = self
+                .session
+                .outputs()
+                .iter()
+                .zip(&probe)
+                .map(|(o, t)| (o.name().to_string(), t.shape.clone()))
+                .collect();
+        }
+        let input_t = Tensor::from_array((input.shape.clone(), input.data.clone())).map_err(oe)?;
+        let mut binding = self.session.create_binding().map_err(oe)?;
+        binding
+            .bind_input(self.input_name.clone(), &input_t)
+            .map_err(oe)?;
+        for (name, shape) in specs {
+            let n: usize = shape.iter().map(|d| *d as usize).product();
+            binding
+                .bind_output(name, Tensor::from_array((shape, vec![f16::ZERO; n])).map_err(oe)?)
+                .map_err(oe)?;
+        }
+        self.bound = Some(BoundIo {
+            binding,
+            input: input_t,
+            input_shape: input.shape.clone(),
+        });
+        Ok(())
+    }
+
+    fn write_input(&mut self, input: &TensorF16) -> Result<()> {
         let name = self.input_name.clone();
-        let data: Vec<f16> = input.data.iter().copied().map(f16::from_f32).collect();
-        let tensor = Tensor::from_array((input.shape.clone(), data))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let outputs = self
-            .session
-            .run(ort::inputs![name => tensor])
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let mut out = Vec::with_capacity(outputs.len());
-        for i in 0..outputs.len() {
-            let (shape, data) = outputs[i]
-                .try_extract_tensor::<f16>()
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            out.push(TensorF32 {
-                shape: shape.iter().copied().collect(),
-                data: data.iter().map(|x| x.to_f32()).collect(),
-            });
+        let bound = self.bound.as_mut().context("unbound")?;
+        {
+            let (_, buf) = bound.input.try_extract_tensor_mut::<f16>().map_err(oe)?;
+            buf.copy_from_slice(&input.data);
         }
-        if out.is_empty() {
-            bail!("empty model output");
-        }
-        Ok(out)
+        bound.binding.bind_input(name, &bound.input).map_err(oe)
+    }
+
+    fn run_unbound(&mut self, input: &TensorF16) -> Result<Vec<TensorF16>> {
+        let tensor = TensorRef::from_array_view((input.shape.as_slice(), input.data.as_slice()))
+            .map_err(oe)?;
+        collect_f16(
+            &self
+                .session
+                .run(ort::inputs![self.input_name.as_str() => tensor])
+                .map_err(oe)?,
+        )
+    }
+
+    pub fn infer(&mut self) -> Result<()> {
+        let OrtModel { session, bound, .. } = self;
+        let bound = bound.as_ref().context("infer() needs run() first")?;
+        let status = unsafe {
+            (api().RunWithBinding)(session.ptr().cast_mut(), core::ptr::null(), bound.binding.ptr())
+        };
+        unsafe { ort::Error::result_from_status(status) }.map_err(oe)
+    }
+
+    pub fn run(&mut self, input: &TensorF16) -> Result<Vec<TensorF16>> {
+        self.bind(input)?;
+        let OrtModel { session, bound, .. } = self;
+        collect_f16(
+            &session
+                .run_binding(&bound.as_ref().unwrap().binding)
+                .map_err(oe)?,
+        )
     }
 }
 
+fn collect_f16(outputs: &ort::session::SessionOutputs<'_>) -> Result<Vec<TensorF16>> {
+    let mut out = Vec::with_capacity(outputs.len());
+    for i in 0..outputs.len() {
+        let (shape, data) = outputs[i]
+            .try_extract_tensor::<f16>()
+            .map_err(oe)?;
+        out.push(TensorF16 {
+            shape: shape.iter().copied().collect(),
+            data: data.to_vec(),
+        });
+    }
+    if out.is_empty() {
+        bail!("empty model output");
+    }
+    Ok(out)
+}
+
 pub fn detect_faces(
-    outputs: &TensorF32,
-    maxpool: &TensorF32,
+    outputs: &TensorF16,
+    maxpool: &TensorF16,
     fw: u32,
     fh: u32,
     thresh: f32,
 ) -> Vec<[f32; 5]> {
     let plane = 56 * 56;
-    let mut heat = outputs.data[..plane].to_vec();
+    let mut heat: Vec<f32> = outputs.data[..plane].iter().map(|x| x.to_f32()).collect();
     for i in 0..plane {
-        if (heat[i] - maxpool.data[i]).abs() > 1e-6 {
+        if (heat[i] - maxpool.data[i].to_f32()).abs() > 1e-6 {
             heat[i] = 0.0;
         }
     }
@@ -382,7 +574,7 @@ pub fn detect_faces(
         if heat[i] >= thresh {
             let y = (i / 56) as f32;
             let x = (i % 56) as f32;
-            let r = outputs.data[plane + i] * 112.0;
+            let r = outputs.data[plane + i].to_f32() * 112.0;
             let sx = fw as f32 / 224.0;
             let sy = fh as f32 / 224.0;
             dets.push([
@@ -397,7 +589,7 @@ pub fn detect_faces(
     dets
 }
 
-pub fn decode_landmarks(t: &TensorF32, crop: [f32; 4], spec: LmSpec) -> (f32, Vec<[f32; 3]>) {
+pub fn decode_landmarks(t: &TensorF16, crop: [f32; 4], spec: LmSpec) -> (f32, Vec<[f32; 3]>) {
     let c0 = spec.points;
     let g = spec.grid() as usize;
     let cells = g * g;
@@ -408,11 +600,11 @@ pub fn decode_landmarks(t: &TensorF32, crop: [f32; 4], spec: LmSpec) -> (f32, Ve
     for p in 0..c0 {
         let base = p * cells;
         let (best, conf) = (0..cells)
-            .map(|i| (i, data[base + i]))
+            .map(|i| (i, data[base + i].to_f32()))
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
             .unwrap_or((0, 0.0));
-        let off_x = logit(data[(c0 + p) * cells + best], spec.logit) * res;
-        let off_y = logit(data[(2 * c0 + p) * cells + best], spec.logit) * res;
+        let off_x = logit(data[(c0 + p) * cells + best].to_f32(), spec.logit) * res;
+        let off_y = logit(data[(2 * c0 + p) * cells + best].to_f32(), spec.logit) * res;
         let tm = best as f32;
         let x = crop[1] + crop[3] * (res * (tm / g as f32).floor() / spec.out_res as f32 + off_x);
         let y = crop[0] + crop[2] * (res * (tm % g as f32).floor() / spec.out_res as f32 + off_y);
@@ -557,4 +749,54 @@ pub fn read_f32_le(path: impl AsRef<Path>) -> Result<Vec<f32>> {
 
 pub fn model_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn solid(b: u8, g: u8, r: u8) -> BgrImage {
+        BgrImage {
+            width: 2,
+            height: 2,
+            data: vec![b, g, r].repeat(4),
+        }
+    }
+
+    #[test]
+    fn imagenet_lut_matches_affine() {
+        let n = ColorNorm::IMAGENET;
+        for v in [0u8, 1, 17, 128, 255] {
+            for c in 0..3 {
+                let got = n.lut[c][v as usize].to_f32();
+                let exp = v as f32 * n.scale[c] + n.bias[c];
+                assert!((got - exp).abs() < 2e-3, "c={c} v={v} {got} vs {exp}");
+            }
+        }
+    }
+
+    #[test]
+    fn imagenet_swaps_bgr_to_rgb() {
+        let red = imagenet_nchw(&solid(0, 0, 255), 2);
+        let n = ColorNorm::IMAGENET;
+        let exp_r = 255.0 * n.scale[0] + n.bias[0];
+        let exp_g = n.bias[1];
+        let exp_b = n.bias[2];
+        assert!((red.data[0].to_f32() - exp_r).abs() < 2e-3);
+        assert!((red.data[4].to_f32() - exp_g).abs() < 2e-3);
+        assert!((red.data[8].to_f32() - exp_b).abs() < 2e-3);
+    }
+
+    #[test]
+    fn retina_keeps_bgr() {
+        let blue = retina_nchw(&BgrImage {
+            width: 640,
+            height: 640,
+            data: vec![200u8, 10, 3].repeat(640 * 640),
+        });
+        assert!((blue.data[0].to_f32() - (200.0 - 104.0)).abs() < 2e-3);
+        assert!((blue.data[640 * 640].to_f32() - (10.0 - 117.0)).abs() < 2e-3);
+        assert!((blue.data[2 * 640 * 640].to_f32() - (3.0 - 123.0)).abs() < 2e-3);
+    }
+
 }

@@ -7,6 +7,7 @@ import queue
 import threading
 import json
 import copy
+from preprocess import retina_nchw
 
 def py_cpu_nms(dets, thresh):
     """ Pure Python NMS baseline.
@@ -80,17 +81,12 @@ class RetinaFaceDetector():
 
     def detect_retina(self, frame, is_background=False):
         h, w, _ = frame.shape
-        im = None
-        im = cv2.resize(frame, (self.res_w, self.res_h), interpolation=cv2.INTER_LINEAR)
         resize_w = w / self.res_w
         resize_w = 1 / resize_w
         resize_h = h / self.res_h
         resize_h = 1 / resize_h
-        im = np.float32(im)
         scale = np.array((self.res_w / resize_w, self.res_h / resize_h, self.res_w / resize_w, self.res_h / resize_h))
-        im -= (104, 117, 123)
-        im = im.transpose(2, 0, 1)
-        im = np.expand_dims(im, 0)
+        im = retina_nchw(frame, (self.res_w, self.res_h))
         in0 = self.session.get_inputs()[0]
         output = [np.asarray(o, np.float32) for o in self.session.run([], {in0.name: np.asarray(im, np.float16)})]
         loc, conf = output[0][0], output[1][0]
