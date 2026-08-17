@@ -38,7 +38,7 @@ A simple demonstration can be achieved by creating a new scene in Unity, adding 
 
     python facetracker.py --visualize 3 --pnp-points 1 --max-threads 4 -c video.mp4
 
-__Note__: If dependencies were installed using [poetry](https://python-poetry.org/), the commands have to be executed from a `poetry shell` or have to be prefixed with `poetry run`.
+__Note__: If dependencies were installed with [uv](https://docs.astral.sh/uv/), run commands as `uv run python facetracker.py ...` (or activate `.venv` first).
 
 This way the tracking script will output its own tracking visualization while also demonstrating the transmission of tracking data to Unity.
 
@@ -129,32 +129,28 @@ When distributing it, you should also distribute the `Licenses` folder along wit
 
 The release builds contain a custom build of ONNX Runtime without telemetry.
 
-# Dependencies (Python 3.6 - 3.9)
+# Dependencies (Python 3.9+)
 
 * ONNX Runtime
 * OpenCV
 * Pillow
 * Numpy
 
-The required libraries can be installed using pip:
+This repository is managed with [uv](https://docs.astral.sh/uv/). It creates an isolated `.venv` and does not install into the system Python:
 
-     pip install onnxruntime opencv-python pillow numpy
+     uv sync
 
-Alternatively poetry can be used to 
-install all dependencies for this project in a separate virtual env:
+Then run the tracker through uv:
 
-     poetry install
+     uv run python facetracker.py --help
 
-# Dependencies
+`uv sync` also installs the `dev` group (psutil for the A/B benchmark). Use `uv sync --no-dev` for runtime-only.
 
-* onnxruntime
-* OpenCV
-* Pillow
-* Numpy
+# Rust ORT runtime
 
-The required libraries can be installed using pip:
- 
-	pip install onnxruntime opencv-python pillow numpy
+`runtime-ort` runs the same ONNX files in `models/` via [ort](https://github.com/pykeio/ort). A/B against Python (startup, RSS, latency, tensor parity):
+
+    uv run python benchmarks/ab.py --model 3 --threads 4
 
 # References
 

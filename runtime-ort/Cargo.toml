@@ -1,0 +1,16 @@
+[package]
+name = "osf-ort"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-2-Clause"
+description = "ort runtime for the OpenSeeFace ONNX models"
+publish = false
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+libc = "0.2"
+ort = "2.0.0-rc.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

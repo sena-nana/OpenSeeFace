@@ -1,8 +1,14 @@
 *.mp4
-__pycache__/*
+__pycache__/
+*.py[cod]
+.venv/
+.uv/
 Binary/*
 Samples/*
 *.zip
 *.7z
 CSharp/*
 VSeeFace/*
+target/
+runtime-ort/target/
+benchmarks/out/
