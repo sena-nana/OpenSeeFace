@@ -7,6 +7,7 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 #[cfg(feature = "gpu")]
 use ort::ep::ExecutionProvider;
+use half::f16;
 use ort::logging::LogLevel;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
@@ -331,9 +332,10 @@ impl OrtModel {
     }
 
     pub fn run(&mut self, input: &TensorF32) -> Result<Vec<TensorF32>> {
-        let tensor = Tensor::from_array((input.shape.clone(), input.data.clone()))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let name = self.input_name.clone();
+        let data: Vec<f16> = input.data.iter().copied().map(f16::from_f32).collect();
+        let tensor = Tensor::from_array((input.shape.clone(), data))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let outputs = self
             .session
             .run(ort::inputs![name => tensor])
@@ -341,11 +343,11 @@ impl OrtModel {
         let mut out = Vec::with_capacity(outputs.len());
         for i in 0..outputs.len() {
             let (shape, data) = outputs[i]
-                .try_extract_tensor::<f32>()
+                .try_extract_tensor::<f16>()
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             out.push(TensorF32 {
                 shape: shape.iter().copied().collect(),
-                data: data.to_vec(),
+                data: data.iter().map(|x| x.to_f32()).collect(),
             });
         }
         if out.is_empty() {

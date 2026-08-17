@@ -54,6 +54,17 @@ def latency(warmup: int, samples: list[float]) -> dict:
     }
 
 
+def adapt_feed(sess: ort.InferenceSession, feed: dict) -> dict:
+    name = sess.get_inputs()[0].name
+    if name not in feed and len(feed) == 1:
+        feed = {name: next(iter(feed.values()))}
+    return {k: np.asarray(v, np.float16) for k, v in feed.items()}
+
+
+def as_f32(outs) -> list:
+    return [np.asarray(o, np.float32) for o in outs]
+
+
 def session(path: Path, threads: int) -> ort.InferenceSession:
     opt = ort.SessionOptions()
     opt.inter_op_num_threads = 1
@@ -100,11 +111,9 @@ def bench_one(path: Path, feed: dict, threads: int, warmup: int, iters: int) -> 
     t0 = time.perf_counter()
     sess = session(path, threads)
     startup = (time.perf_counter() - t0) * 1000
-    name = sess.get_inputs()[0].name
-    if name not in feed and len(feed) == 1:
-        feed = {name: next(iter(feed.values()))}
+    feed = adapt_feed(sess, feed)
     t1 = time.perf_counter()
-    first = sess.run(None, feed)
+    first = as_f32(sess.run(None, feed))
     first_ms = (time.perf_counter() - t1) * 1000
     for _ in range(warmup):
         sess.run(None, feed)
@@ -204,7 +213,7 @@ def python_bench(args, dump: Path) -> dict:
     det_sess = session(md / "mnv3_detection_opt.onnx", args.threads)
     lm_sess = session(md / lm_name, args.threads)
     t0 = time.perf_counter()
-    dout = det_sess.run(None, {det_sess.get_inputs()[0].name: imagenet_nchw(frame, 224)})
+    dout = as_f32(det_sess.run(None, adapt_feed(det_sess, {"input": imagenet_nchw(frame, 224)})))
     dets = detect_faces(dout[0], dout[1], frame)
     detect_ms = (time.perf_counter() - t0) * 1000
     detections, landmarks, faces, landmarks_ms = [], [], 0, 0.0
@@ -223,7 +232,7 @@ def python_bench(args, dump: Path) -> dict:
             crop = np.float32(frame[y1:y2, x1:x2, ::-1])
             crop = cv2.resize(crop, (lm_size, lm_size), interpolation=cv2.INTER_LINEAR)
             crop = np.transpose(np.expand_dims(crop * _STD + _MEAN, 0), (0, 3, 1, 2)).astype(np.float32)
-            out = lm_sess.run(None, {lm_sess.get_inputs()[0].name: crop})[0]
+            out = as_f32(lm_sess.run(None, adapt_feed(lm_sess, {"input": crop})))[0]
             landmarks_ms = (time.perf_counter() - t1) * 1000
             _, lms = decode_lms(out[0], (x1, y1, (x2 - x1) / lm_size, (y2 - y1) / lm_size), args.model)
             faces = 1

@@ -11,6 +11,10 @@ from similaritytransform import SimilarityTransform
 from retinaface import RetinaFaceDetector
 from remedian import remedian
 
+def run_onnx(session, feeds):
+    adapted = {k: np.asarray(v, np.float16) for k, v in feeds.items()}
+    return [np.asarray(o, np.float32) for o in session.run([], adapted)]
+
 def resolve(name):
     f = os.path.join(os.path.dirname(__file__), name)
     return f
@@ -136,7 +140,7 @@ def matrix_to_quaternion(m):
     return q
 
 def worker_thread(session, frame, input, crop_info, queue, input_name, idx, tracker):
-    output = session.run([], {input_name: input})[0]
+    output = run_onnx(session, {input_name: input})[0]
     conf, lms = tracker.landmarks(output[0], crop_info)
     if conf > tracker.threshold:
         try:
@@ -708,7 +712,7 @@ class Tracker():
         im = cv2.resize(frame, (224, 224), interpolation=cv2.INTER_LINEAR)[:,:,::-1] * self.std_224 + self.mean_224
         im = np.expand_dims(im, 0)
         im = np.transpose(im, (0,3,1,2))
-        outputs, maxpool = self.detection.run([], {'input': im})
+        outputs, maxpool = run_onnx(self.detection, {'input': im})
         outputs = np.array(outputs)
         maxpool = np.array(maxpool)
         outputs[0, 0, outputs[0, 0] != maxpool[0, 0]] = 0
@@ -940,7 +944,7 @@ class Tracker():
             return [(1.0, 0.0, 0.0, 0.0), (1.0, 0.0, 0.0, 0.0)]
         both_eyes = np.concatenate((right_eye, left_eye))
         results = None
-        results = self.gaze_model.run([], {self.input_name: both_eyes})
+        results = run_onnx(self.gaze_model, {self.gaze_model.get_inputs()[0].name: both_eyes})
         open = [0, 0]
         open[0] = 1#results[1][0].argmax()
         open[1] = 1#results[1][1].argmax()
@@ -1104,7 +1108,7 @@ class Tracker():
         start_model = time.perf_counter()
         outputs = {}
         if num_crops == 1:
-            output = self.session.run([], {self.input_name: crops[0]})[0]
+            output = run_onnx(self.session, {self.input_name: crops[0]})[0]
             conf, lms = self.landmarks(output[0], crop_info[0])
             if conf > self.threshold:
                 try:

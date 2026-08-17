@@ -101,6 +101,8 @@ Four pretrained face landmark models are included. Using the `--model` switch, i
 
 FPS measurements are from running on one core of my CPU.
 
+The shipped ONNX files use native float16 weights and I/O. Runtimes convert float32 buffers at the session edge.
+
 Pytorch weights for use with `model.py` can be found [here](https://mega.nz/file/vvYXlYQT#h7FpEg4tmOCJNxjpsDEw0JomJIkVGKwrt4OUV0RNDDU). Some unoptimized ONNX models can be found [here](https://github.com/emilianavt/OpenSeeFace/issues/48).
 
 # Results

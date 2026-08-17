@@ -91,7 +91,8 @@ class RetinaFaceDetector():
         im -= (104, 117, 123)
         im = im.transpose(2, 0, 1)
         im = np.expand_dims(im, 0)
-        output = self.session.run([], {"input0": im})
+        in0 = self.session.get_inputs()[0]
+        output = [np.asarray(o, np.float32) for o in self.session.run([], {in0.name: np.asarray(im, np.float16)})]
         loc, conf = output[0][0], output[1][0]
         boxes = decode(loc, self.priorbox, [0.1, 0.2])
         boxes = boxes * scale
