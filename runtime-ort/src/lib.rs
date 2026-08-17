@@ -1,9 +1,12 @@
 //! ort inference for the same ONNX files used by the Python tracker.
 
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
+#[cfg(feature = "gpu")]
+use ort::ep::ExecutionProvider;
 use ort::logging::LogLevel;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
@@ -215,6 +218,64 @@ pub fn retina_nchw(bgr: &BgrImage) -> TensorF32 {
     }
 }
 
+/// `cpu` or `gpu` (CoreML on Apple, CUDA on NVIDIA).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Device {
+    #[default]
+    Cpu,
+    Gpu,
+}
+
+impl Device {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Gpu => "gpu",
+        }
+    }
+}
+
+impl FromStr for Device {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "cpu" => Ok(Self::Cpu),
+            "gpu" => Ok(Self::Gpu),
+            _ => bail!("unknown device {s:?}, expected cpu|gpu"),
+        }
+    }
+}
+
+fn gpu_eps() -> Result<Vec<ort::ep::ExecutionProviderDispatch>> {
+    #[cfg(not(feature = "gpu"))]
+    bail!("GPU requested; rebuild with `--features gpu`");
+
+    #[cfg(feature = "gpu")]
+    {
+        #[allow(unused_mut)]
+        let mut eps = Vec::new();
+        #[cfg(target_os = "macos")]
+        if ort::ep::CoreML::default().is_available().unwrap_or(false) {
+            eps.push(
+                ort::ep::CoreML::default()
+                    .with_compute_units(ort::ep::coreml::ComputeUnits::CPUAndGPU)
+                    .with_model_format(ort::ep::coreml::ModelFormat::MLProgram)
+                    .build()
+                    .error_on_failure(),
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        if ort::ep::CUDA::default().is_available().unwrap_or(false) {
+            eps.push(ort::ep::CUDA::default().build().error_on_failure());
+        }
+        if eps.is_empty() {
+            bail!("GPU requested but no GPU execution provider is available");
+        }
+        Ok(eps)
+    }
+}
+
 pub struct OrtModel {
     session: Session,
     pub input_name: String,
@@ -223,9 +284,18 @@ pub struct OrtModel {
 
 impl OrtModel {
     pub fn load(path: impl AsRef<Path>, threads: usize) -> Result<Self> {
+        Self::open(path, threads, Device::Cpu, 1)
+    }
+
+    pub fn open(
+        path: impl AsRef<Path>,
+        threads: usize,
+        device: Device,
+        batch: i64,
+    ) -> Result<Self> {
         let path = path.as_ref();
         let start = Instant::now();
-        let session = Session::builder()
+        let mut builder = Session::builder()
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| anyhow::anyhow!("{e}"))?
@@ -236,7 +306,15 @@ impl OrtModel {
             .with_parallel_execution(false)
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .with_log_level(LogLevel::Error)
-            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if device == Device::Gpu {
+            builder = builder
+                .with_dimension_override("batch_size", batch.max(1))
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .with_execution_providers(gpu_eps()?)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        let session = builder
             .commit_from_file(path)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let load_ms = start.elapsed().as_secs_f64() * 1000.0;

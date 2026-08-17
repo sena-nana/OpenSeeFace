@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use osf_ort::{
     cosine, detect_faces, imagenet_nchw, max_abs, mean_abs, model_path, read_f32_le, retina_nchw,
-    rss, BgrImage, Latency, LmSpec, OrtModel, VERSION,
+    rss, BgrImage, Device, Latency, LmSpec, OrtModel, VERSION,
 };
 use serde::Serialize;
 
@@ -25,6 +26,9 @@ struct Args {
     warmup: u32,
     #[arg(long, default_value_t = 30)]
     iters: u32,
+    /// cpu | gpu (CoreML on Apple, CUDA on NVIDIA)
+    #[arg(long, default_value = "cpu")]
+    device: String,
     #[arg(long)]
     out: Option<PathBuf>,
     #[arg(long)]
@@ -35,6 +39,7 @@ struct Args {
 struct Report {
     backend: &'static str,
     crate_version: &'static str,
+    device: String,
     threads: usize,
     models: HashMap<String, ModelReport>,
     pipeline: Pipeline,
@@ -70,6 +75,7 @@ struct Pipeline {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let device = Device::from_str(&args.device)?;
     let frame = BgrImage::load(&args.image)?;
     let spec = LmSpec::from_type(args.model)?;
     let mut models = HashMap::new();
@@ -88,6 +94,7 @@ fn main() -> Result<()> {
             "mnv3_detection_opt.onnx",
             &det_in,
             args.threads,
+            device,
             args.warmup,
             args.iters,
             args.ref_dir
@@ -110,6 +117,7 @@ fn main() -> Result<()> {
             spec.file,
             &lm_in,
             args.threads,
+            device,
             args.warmup,
             args.iters,
             args.ref_dir
@@ -137,6 +145,7 @@ fn main() -> Result<()> {
                 "mnv3_gaze32_split_opt.onnx",
                 &gin,
                 args.threads,
+                device,
                 args.warmup,
                 args.iters,
                 args.ref_dir.as_ref().map(|d| d.join("gaze_output.bin")),
@@ -160,6 +169,7 @@ fn main() -> Result<()> {
                 "retinaface_640x640_opt.onnx",
                 &rin,
                 args.threads,
+                device,
                 args.warmup,
                 args.iters,
                 args.ref_dir
@@ -169,10 +179,11 @@ fn main() -> Result<()> {
         );
     }
 
-    let pipeline = pipeline(&args, &frame, spec)?;
+    let pipeline = pipeline(&args, &frame, spec, device)?;
     let report = Report {
         backend: "ort-rust",
         crate_version: VERSION,
+        device: device.as_str().into(),
         threads: args.threads,
         models,
         pipeline,
@@ -193,11 +204,14 @@ fn bench(
     filename: &str,
     input: &osf_ort::TensorF32,
     threads: usize,
+    device: Device,
     warmup: u32,
     iters: u32,
     ref_out: Option<PathBuf>,
 ) -> Result<ModelReport> {
-    let mut m = OrtModel::load(path, threads).with_context(|| path.display().to_string())?;
+    let batch = input.shape.first().copied().unwrap_or(1).max(1);
+    let mut m = OrtModel::open(path, threads, device, batch)
+        .with_context(|| path.display().to_string())?;
     let t0 = Instant::now();
     let first = m.run(input)?;
     let first_infer_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -233,10 +247,12 @@ fn bench(
     })
 }
 
-fn pipeline(args: &Args, frame: &BgrImage, spec: LmSpec) -> Result<Pipeline> {
-    let mut det = OrtModel::load(
+fn pipeline(args: &Args, frame: &BgrImage, spec: LmSpec, device: Device) -> Result<Pipeline> {
+    let mut det = OrtModel::open(
         model_path(&args.models_dir, "mnv3_detection_opt.onnx"),
         args.threads,
+        device,
+        1,
     )?;
     let t0 = Instant::now();
     let din = imagenet_nchw(frame, 224);
@@ -252,7 +268,12 @@ fn pipeline(args: &Args, frame: &BgrImage, spec: LmSpec) -> Result<Pipeline> {
         faces = 1;
         let (x1, y1, x2, y2) = crop_box(frame, d);
         if x2 - x1 >= 4 && y2 - y1 >= 4 {
-            let mut lm = OrtModel::load(model_path(&args.models_dir, spec.file), args.threads)?;
+            let mut lm = OrtModel::open(
+                model_path(&args.models_dir, spec.file),
+                args.threads,
+                device,
+                1,
+            )?;
             let t1 = Instant::now();
             let crop = crop_img(frame, x1, y1, x2, y2);
             let lin = imagenet_nchw(&crop, spec.size);
@@ -280,9 +301,11 @@ fn pipeline(args: &Args, frame: &BgrImage, spec: LmSpec) -> Result<Pipeline> {
                                 crop_box(frame, d).2,
                                 crop_box(frame, d).3,
                             );
-                            let mut lm = OrtModel::load(
+                            let mut lm = OrtModel::open(
                                 model_path(&args.models_dir, spec.file),
                                 args.threads,
+                                device,
+                                1,
                             )?;
                             let (x1, y1, x2, y2) = crop_box(frame, d);
                             let lin = imagenet_nchw(&crop, spec.size);

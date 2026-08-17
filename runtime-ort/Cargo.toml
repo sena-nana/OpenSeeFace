@@ -6,6 +6,11 @@ license = "BSD-2-Clause"
 description = "ort runtime for the OpenSeeFace ONNX models"
 publish = false
 
+[features]
+default = []
+# CoreML on macOS, CUDA elsewhere (lax match picks the closest prebuilt ORT).
+gpu = ["ort/lax-feature-matching", "ort/coreml", "ort/cuda"]
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

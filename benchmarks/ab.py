@@ -253,7 +253,10 @@ def python_bench(args, dump: Path) -> dict:
 
 def compare(py: dict, rs: dict) -> None:
     print("A/B  Python onnxruntime  vs  Rust ort")
-    print(f"  python {py.get('runtime_version')}  rust crate {rs.get('crate_version')}")
+    print(
+        f"  python {py.get('runtime_version')}  rust crate {rs.get('crate_version')}  "
+        f"device={rs.get('device', 'cpu')}"
+    )
     header = f"{'model':<18} {'metric':<16} {'python':>10} {'ort-rust':>10} {'rust/py':>8}"
     print(header)
     print("-" * len(header))
@@ -292,6 +295,7 @@ def main() -> int:
     p.add_argument("--threads", type=int, default=4)
     p.add_argument("--warmup", type=int, default=8)
     p.add_argument("--iters", type=int, default=30)
+    p.add_argument("--device", default="cpu", choices=["cpu", "gpu"])
     p.add_argument("--out-dir", default=str(ROOT / "benchmarks" / "out"))
     args = p.parse_args()
 
@@ -304,11 +308,15 @@ def main() -> int:
 
     crate = ROOT / "runtime-ort"
     rust_bin = crate / "target" / "release" / "osf-bench"
-    if not rust_bin.is_file():
-        subprocess.run(["cargo", "build", "--release", "--bin", "osf-bench"], cwd=crate, check=True)
+    build = ["cargo", "build", "--release", "--bin", "osf-bench"]
+    if args.device == "gpu":
+        build += ["--features", "gpu"]
+    if args.device == "gpu" or not rust_bin.is_file():
+        subprocess.run(build, cwd=crate, check=True)
     common = [
         "--models-dir", args.models_dir, "--image", args.image, "--model", str(args.model),
         "--threads", str(args.threads), "--warmup", str(args.warmup), "--iters", str(args.iters),
+        "--device", args.device,
     ]
     subprocess.run(
         [str(rust_bin), *common, "--out", str(out / "rust.json"), "--ref-dir", str(dump)],

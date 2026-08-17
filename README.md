@@ -152,6 +152,10 @@ Then run the tracker through uv:
 
     uv run python benchmarks/ab.py --model 3 --threads 4
 
+GPU (CoreML on Apple, CUDA on NVIDIA):
+
+    uv run python benchmarks/ab.py --model 3 --threads 4 --device gpu
+
 # References
 
 ## Training dataset
