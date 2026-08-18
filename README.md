@@ -132,6 +132,8 @@ Output post-process (`none` vs default `one-euro`) on the same raw pose and land
 
     cargo run --release --manifest-path runtime-ort/Cargo.toml --bin osf-bench -- --suite filter --model 3 --threads 4
 
+Symmetry / relative-distance / 3D-projection landmark correction after PnP (alone and stacked with One Euro) was tried and rejected: dark-frame NME got worse and clean measurements were pulled off. Notes: [benchmarks/geom-eval.md](benchmarks/geom-eval.md).
+
 # References
 
 ## Training dataset
