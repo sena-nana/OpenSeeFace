@@ -134,6 +134,8 @@ Output post-process (`none` vs default `one-euro`) on the same raw pose and land
 
 Symmetry / relative-distance / 3D-projection landmark correction after PnP (alone and stacked with One Euro) was tried and rejected: dark-frame NME got worse and clean measurements were pulled off. Notes: [benchmarks/geom-eval.md](benchmarks/geom-eval.md).
 
+Velocity / confidence / trajectory outlier rejection after PnP (alone and stacked with One Euro) was tried and rejected: hold lag pulled clean wander off, injected spikes did not improve NME, and the stack added step lag. Notes: [benchmarks/outlier-eval.md](benchmarks/outlier-eval.md).
+
 # References
 
 ## Training dataset
