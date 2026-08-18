@@ -41,7 +41,7 @@ Webcam or video with the built-in overlay (no Unity required):
 * The highest quality model is selected with `--model 3`, the fastest model with the lowest tracking quality is `--model 0`.
 * Lower tracking quality mainly means more rigid tracking, making it harder to detect blinking and eyebrow motion.
 * Depending on the frame rate, face tracking can easily use up a whole CPU core. At 30fps for a single face, it should still use less than 100% of one core on a decent CPU. If tracking uses too much CPU, try lowering the frame rate. A frame rate of 20 is probably fine and anything above 30 should rarely be necessary.
-* When setting the number of faces to track to a higher number than the number of faces actually in view, the face detection model will run every `--scan-every` frames. This can slow things down, so try to set `--faces` no higher than the actual number of faces you are tracking.
+* Once all `--faces` slots are filled, full-frame detection is skipped. The next crop comes from the previous frame's landmarks (eyes+nose fit). Detection runs again only after a lost face, or every `--scan-every` frames when fewer faces are tracked than `--faces`. Set `--faces` no higher than the number of faces you are actually tracking.
 
 # Unity compatibility
 
@@ -123,7 +123,7 @@ Face-size adaptive tracking: CPU zooms the 224 detector on small faces and switc
     cargo run --release --manifest-path runtime-ort/Cargo.toml --bin osf-bench -- --suite scale
     cargo run --release --features gpu --manifest-path runtime-ort/Cargo.toml --bin osf-bench -- --suite scale --device gpu
 
-Next-frame crop uses an eyes+nose similarity fit (jitter / hold report):
+Next-frame crop uses an eyes+nose similarity fit. After a face is locked, that crop is reused and the 224 detector is not run (`osf-bench --suite crop`):
 
     cargo run --release --manifest-path runtime-ort/Cargo.toml --bin osf-bench -- --suite crop --model 3 --threads 4
 
