@@ -16,7 +16,7 @@ try:
     import onnx
     from onnx import TensorProto, helper, numpy_helper
 except ImportError:
-    sys.stderr.write("wrap_preprocess.py needs the `onnx` package (uv sync --group dev)\n")
+        sys.stderr.write("wrap_preprocess.py needs the `onnx` package (uv sync in repo root)\n")
     raise
 
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], np.float32)

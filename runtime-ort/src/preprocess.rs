@@ -78,6 +78,93 @@ pub struct BgrImage {
 }
 
 impl BgrImage {
+    pub fn new(width: u32, height: u32, data: Vec<u8>) -> Self {
+        Self {
+            width,
+            height,
+            data,
+        }
+    }
+
+    pub fn zeros(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            data: vec![0u8; width as usize * height as usize * 3],
+        }
+    }
+
+    pub fn get(&self, x: i32, y: i32) -> [u8; 3] {
+        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
+            return [0, 0, 0];
+        }
+        let i = ((y as u32 * self.width + x as u32) * 3) as usize;
+        [self.data[i], self.data[i + 1], self.data[i + 2]]
+    }
+
+    pub fn set(&mut self, x: i32, y: i32, c: [u8; 3]) {
+        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
+            return;
+        }
+        let i = ((y as u32 * self.width + x as u32) * 3) as usize;
+        self.data[i] = c[0];
+        self.data[i + 1] = c[1];
+        self.data[i + 2] = c[2];
+    }
+
+    pub fn flip_h(&self) -> Self {
+        let mut out = Self::zeros(self.width, self.height);
+        for y in 0..self.height as i32 {
+            for x in 0..self.width as i32 {
+                out.set(self.width as i32 - 1 - x, y, self.get(x, y));
+            }
+        }
+        out
+    }
+
+    pub fn sample(&self, x: f32, y: f32) -> [u8; 3] {
+        if self.width == 0 || self.height == 0 {
+            return [0, 0, 0];
+        }
+        let x0 = x.floor().clamp(0.0, (self.width - 1) as f32) as i32;
+        let y0 = y.floor().clamp(0.0, (self.height - 1) as f32) as i32;
+        let x1 = (x0 + 1).min(self.width as i32 - 1);
+        let y1 = (y0 + 1).min(self.height as i32 - 1);
+        let wx = (x - x0 as f32).clamp(0.0, 1.0);
+        let wy = (y - y0 as f32).clamp(0.0, 1.0);
+        let p00 = self.get(x0, y0);
+        let p10 = self.get(x1, y0);
+        let p01 = self.get(x0, y1);
+        let p11 = self.get(x1, y1);
+        let mut o = [0u8; 3];
+        for c in 0..3 {
+            let v = p00[c] as f32 * (1.0 - wx) * (1.0 - wy)
+                + p10[c] as f32 * wx * (1.0 - wy)
+                + p01[c] as f32 * (1.0 - wx) * wy
+                + p11[c] as f32 * wx * wy;
+            o[c] = v.round().clamp(0.0, 255.0) as u8;
+        }
+        o
+    }
+
+    /// OpenCV `getRotationMatrix2D` + `warpAffine` (positive degrees CCW).
+    pub fn rotate_about(&self, angle_rad: f32, center: (f32, f32)) -> Self {
+        let a = angle_rad;
+        let (cos, sin) = (a.cos(), a.sin());
+        let (cx, cy) = center;
+        let mut out = Self::zeros(self.width, self.height);
+        for y in 0..self.height as i32 {
+            for x in 0..self.width as i32 {
+                let dx = x as f32 - cx;
+                let dy = y as f32 - cy;
+                let sx = cos * dx + sin * dy + cx;
+                let sy = -sin * dx + cos * dy + cy;
+                out.set(x, y, self.sample(sx, sy));
+            }
+        }
+        out
+    }
+
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let img = image::open(path).or_else(|_| image::load_from_memory(&std::fs::read(path)?))?;

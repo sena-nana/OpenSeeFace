@@ -1,29 +1,45 @@
-//! ort inference for the same ONNX files used by the Python tracker.
+//! ORT inference and the OpenSeeFace tracker (`facetracker` binary).
 
 mod adaptive;
+mod capture;
 mod decode;
 mod enhance;
 mod enhance_gpu;
+mod features;
+mod gaze;
+mod geom;
 mod gpu_pre;
 mod metrics;
+mod pnp;
 mod preprocess;
+mod retinaface;
 mod session;
+mod tracker;
+mod udp;
+mod viz;
 
 pub use adaptive::{
     center_2x, det_window, face_on_224, nme, pick_lm, AdaptiveCfg, AdaptiveState, DetWindow,
     FAST_LM,
 };
+pub use capture::{list_cameras, mirror_bgr, InputSource, VideoOut};
 pub use decode::{
-    decode_landmarks, detect_faces, landmark_bbox, mean_conf, LmSpec, TensorF16, EYE_IDX,
+    decode_landmarks, detect_faces, detect_faces_n, landmark_bbox, mean_conf, LmSpec, TensorF16,
+    EYE_IDX,
 };
 pub use enhance::{enhance_bgr, enhance_bgr_in_place, EnhanceCfg, HeMode};
+pub use features::FEATURE_NAMES;
 pub use gpu_pre::GpuTracker;
 pub use metrics::{cosine, max_abs, mean_abs, model_path, read_f32_le, rss, Latency, Rss};
+pub use pnp::Camera;
 pub use preprocess::{
     crop_box, crop_box_pad, crop_img, face_crop, imagenet_nchw, iou, nchw, paste_bgr, resize_bgr,
     retina_nchw, synth_canvas, BgrImage, ColorNorm,
 };
 pub use session::{Device, OrtModel};
+pub use tracker::{model_base_path, FaceInfo, Tracker, TrackerConfig};
+pub use udp::{encode_face, encode_faces, FacePacket, PACKET_FRAME_SIZE};
+pub use viz::{draw_tracking, dump_symmetric_points, VizWindow};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

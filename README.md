@@ -4,9 +4,7 @@
 
 **Note**: This is a tracking library, **not** a stand-alone avatar puppeteering program. I'm also working on [VSeeFace](https://www.vseeface.icu/), which allows animating [VRM](https://vrm.dev/en/how_to_make_vrm/) and [VSFAvatar](https://www.youtube.com/watch?v=jhQ8DF87I5I) 3D models by using OpenSeeFace tracking. [VTube Studio](https://denchisoft.com/) uses OpenSeeFace for webcam based tracking to animate Live2D models. A renderer for the Godot engine can be found [here](https://github.com/virtual-puppet-project/vpuppr).
 
-This project implements a facial landmark detection model based on MobileNetV3.
-
-As Pytorch 1.3 CPU inference speed on Windows is very low, the model was converted to ONNX format. Using [onnxruntime](https://github.com/microsoft/onnxruntime) it can run at 30 - 60 fps tracking a single face. There are four models, with different speed to tracking quality trade-offs.
+This project implements a facial landmark detection model based on MobileNetV3. Tracking runs in Rust (`runtime-ort` / `facetracker`) on the shipped ONNX models via [ort](https://github.com/pykeio/ort). There are four models, with different speed to tracking quality trade-offs.
 
 If anyone is curious, the name is a silly pun on the open seas and seeing faces. There's no deeper meaning.
 
@@ -24,25 +22,27 @@ I ran OpenSeeFace on a sample clip from the video presentation for [3D Face Reco
 
 A sample Unity project for VRM based avatar animation can be found [here](https://github.com/emilianavt/OpenSeeFaceSample).
 
-The face tracking itself is done by the `facetracker.py` Python 3.7 script. It is a commandline program, so you should start it manually from cmd or write a batch file to start it. If you downloaded a release and are on Windows, you can run the `facetracker.exe` inside the `Binary` folder without having Python installed. You can also use the `run.bat` inside the `Binary` folder for a basic demonstration of the tracker.
+The face tracking itself is done by the `facetracker` Rust program (`runtime-ort`). It is a commandline program, so you should start it manually from a terminal or write a batch file to start it. If you downloaded a release and are on Windows, you can run `facetracker.exe` inside the `Binary` folder. You can also use `run.bat` inside that folder for a basic demonstration of the tracker.
 
 The script will perform the tracking on webcam input or video file and send the tracking data over UDP. This design also allows tracking to be done on a separate PC from the one who uses the tracking information. This can be useful to enhance performance and to avoid accidentially revealing camera footage.
 
 The provided `OpenSee` Unity component can receive these UDP packets and provides the received information through a public field called `trackingData`. The `OpenSeeShowPoints` component can visualize the landmark points of a detected face. It also serves as an example. Please look at it to see how to properly make use of the `OpenSee` component. Further examples are included in the `Examples` folder. The UDP packets are received in a separate thread, so any components using the `trackingData` field of the `OpenSee` component should first copy the field and access this copy, because otherwise the information may get overwritten during processing. This design also means that the field will keep updating, even if the `OpenSee` component is disabled.
 
-Run the python script with `--help` to learn about the possible options you can set.
+Run the tracker with `--help` to learn about the possible options you can set.
 
-    python facetracker.py --help
+    cargo run --release --manifest-path runtime-ort/Cargo.toml --bin facetracker -- --help
+
+Or, after `./make_exe.sh` / `make_exe.bat`:
+
+    dist/facetracker/facetracker --help
 
 A simple demonstration can be achieved by creating a new scene in Unity, adding an empty game object and both the `OpenSee` and `OpenSeeShowPoints` components to it. While the scene is playing, run the face tracker on a video file:
 
-    python facetracker.py --visualize 3 --pnp-points 1 --max-threads 4 -c video.mp4
-
-__Note__: If dependencies were installed with [uv](https://docs.astral.sh/uv/), run commands as `uv run python facetracker.py ...` (or activate `.venv` first).
+    cargo run --release --manifest-path runtime-ort/Cargo.toml --bin facetracker -- --visualize 3 --pnp-points 1 --max-threads 4 -c video.mp4
 
 This way the tracking script will output its own tracking visualization while also demonstrating the transmission of tracking data to Unity.
 
-The included `OpenSeeLauncher` component allows starting the face tracker program from Unity. It is designed to work with the pyinstaller created executable distributed in the binary release bundles. It provides three public API functions:
+The included `OpenSeeLauncher` component allows starting the face tracker program from Unity. It is designed to work with the `facetracker` binary from a release bundle (same CLI flags as before). It provides three public API functions:
 
 * `public string[] ListCameras()` returns the names of available cameras. The index of the camera in the array corresponds to its ID for the `cameraIndex` field. Setting the `cameraIndex` to `-1` will disable webcam capturing.
 * `public bool StartTracker()` will start the tracker. If it is already running, it will shut down the running instance and start a new one with the current settings.
@@ -103,7 +103,7 @@ FPS measurements are from running on one core of my CPU.
 
 The shipped ONNX files use native float16 weights and I/O. Runtimes convert float32 buffers at the session edge.
 
-Pytorch weights for use with `model.py` can be found [here](https://mega.nz/file/vvYXlYQT#h7FpEg4tmOCJNxjpsDEw0JomJIkVGKwrt4OUV0RNDDU). Some unoptimized ONNX models can be found [here](https://github.com/emilianavt/OpenSeeFace/issues/48).
+Pytorch weights for use with `train/model.py` can be found [here](https://mega.nz/file/vvYXlYQT#h7FpEg4tmOCJNxjpsDEw0JomJIkVGKwrt4OUV0RNDDU). Some unoptimized ONNX models can be found [here](https://github.com/emilianavt/OpenSeeFace/issues/48).
 
 # Results
 
@@ -123,54 +123,48 @@ The landmark model is quite robust with respect to the size and orientation of t
 
 # Release builds
 
-The builds in the release section of this repository contain a `facetracker.exe` inside a `Binary` folder that was built using `pyinstaller` and contains all required dependencies.
+The builds in the release section of this repository contain a `facetracker` binary (Windows: `facetracker.exe`) inside a `Binary` folder, built with Cargo from `runtime-ort`.
 
-To run it, at least the `models` folder has to be placed in the same folder as `facetracker.exe`. Placing it in a common parent folder should work too.
+To run it, at least the `models` folder has to be placed in the same folder as `facetracker`. Placing it in a common parent folder should work too.
 
 When distributing it, you should also distribute the `Licenses` folder along with it to make sure you conform to requirements set forth by some of the third party libraries. Unused models can be removed from redistributed packages without issue.
 
-The release builds contain a custom build of ONNX Runtime without telemetry.
+Local package:
 
-# Dependencies (Python 3.9+)
+     ./make_exe.sh
+     # Windows: make_exe.bat
 
-* ONNX Runtime
-* OpenCV
-* Pillow
-* Numpy
+# Training (Python)
 
-This repository is managed with [uv](https://docs.astral.sh/uv/). It creates an isolated `.venv` and does not install into the system Python:
+Tracking no longer uses Python. `train/` keeps the PyTorch architectures (`model.py`) and `export_onnx.py` so new weights can be written to the ONNX files the Rust tracker loads. See [train/README.md](train/README.md).
 
      uv sync
+     uv run python train/export_onnx.py --help
 
-Then run the tracker through uv:
-
-     uv run python facetracker.py --help
-
-`uv sync` also installs the `dev` group (psutil for the A/B benchmark). Use `uv sync --no-dev` for runtime-only.
+`geffnet` and `torch` are required only for training/export. GPU fused preprocess graphs for the optional Rust `--features gpu` path are still generated by `runtime-ort/scripts/wrap_preprocess.py` (needs `onnx`).
 
 # Rust ORT runtime
 
-`runtime-ort` runs the same ONNX files in `models/` via [ort](https://github.com/pykeio/ort). A/B against Python (startup, RSS, latency, tensor parity):
+`runtime-ort` runs the ONNX files in `models/` via [ort](https://github.com/pykeio/ort). The product binary is `facetracker`. Micro-benchmarks:
 
-    uv run python benchmarks/ab.py --model 3 --threads 4
+    cargo run --release --manifest-path runtime-ort/Cargo.toml --bin osf-bench -- --model 3 --threads 4
 
 GPU (CoreML on Apple, CUDA on NVIDIA). Per-model `bench()` times bound inference only.
 The GPU *pipeline* runs Resize+Normalize on the EP (fused MLProgram on CoreML; device tensors on CUDA)
 so the CPU does not build f16 NCHW or read back full heatmaps between detect and landmarks:
 
-    uv run python benchmarks/ab.py --model 3 --threads 4 --device gpu
+    cargo run --release --features gpu --manifest-path runtime-ort/Cargo.toml --bin osf-bench -- --model 3 --threads 4 --device gpu
 
 Realistic crop / glasses scenarios (synthetic webcam canvases, tracking loop, optional Wikimedia glasses photos). Default `--suite micro` is unchanged:
 
-    uv run python benchmarks/ab.py --suite realistic --model 3 --threads 4
-    uv run python benchmarks/ab.py --suite realistic --device gpu --frames 8
-
-`--scenarios` selects a subset (`track_scan3,glasses_synth,gaze_glasses`). Photos land in `benchmarks/fixtures/cache/` via `uv run python benchmarks/fetch_fixtures.py` and are skipped if offline. Optional `--wflw-root` adds extra stills from a local WFLW tree. JSON: `benchmarks/out/scenarios.json`.
+    cargo run --release --manifest-path runtime-ort/Cargo.toml --bin osf-bench -- --suite realistic --model 3 --threads 4
+    cargo run --release --features gpu --manifest-path runtime-ort/Cargo.toml --bin osf-bench -- --suite realistic --device gpu --frames 8
 
 Face-size adaptive tracking: CPU zooms the 224 detector on small faces and switches to the 112px landmark model on large ones; GPU only zooms detect. `--adaptive` on `osf-bench` enables it for the realistic suite. `--suite scale` A/Bs default thresholds against a fixed model-3 baseline:
 
     cargo run --release --manifest-path runtime-ort/Cargo.toml --bin osf-bench -- --suite scale
     cargo run --release --features gpu --manifest-path runtime-ort/Cargo.toml --bin osf-bench -- --suite scale --device gpu
+
 # References
 
 ## Training dataset

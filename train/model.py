@@ -1,8 +1,11 @@
-# This file is not used by the tracking application and currently outdated
+# Architectures and Adaptive Wing Loss for training OpenSeeFace models.
+# Not used by the Rust tracker; export ONNX with train/export_onnx.py.
+import numpy as np
 import torch
 import torch.nn as nn
 import geffnet.mobilenetv3 # geffnet.mobilenetv3._gen_mobilenet_v3 needs to be patched to return the parameters instead of instantiating the network, based on commit c450c12ae6ffb1757f62dde3c2765da3c10f6def
 from geffnet.efficientnet_builder import round_channels
+import cv2
 
 class DSConv2d(nn.Module):
     def __init__(self, in_planes, out_planes, kernels_per_layer=4, groups=1, old=0):

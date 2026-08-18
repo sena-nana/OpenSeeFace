@@ -95,6 +95,18 @@ pub fn detect_faces(
     fh: u32,
     thresh: f32,
 ) -> Vec<[f32; 5]> {
+    detect_faces_n(outputs, maxpool, fw, fh, thresh, 1)
+}
+
+/// Heatmap detections, highest confidence first, up to `max_faces`.
+pub fn detect_faces_n(
+    outputs: &TensorF16,
+    maxpool: &TensorF16,
+    fw: u32,
+    fh: u32,
+    thresh: f32,
+    max_faces: usize,
+) -> Vec<[f32; 5]> {
     let plane = 56 * 56;
     let mut heat: Vec<f32> = outputs.data[..plane].iter().map(|x| x.to_f32()).collect();
     for i in 0..plane {
@@ -109,21 +121,22 @@ pub fn detect_faces(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     let mut dets = Vec::new();
-    if let Some(&i) = order.first() {
-        if heat[i] >= thresh {
-            let y = (i / 56) as f32;
-            let x = (i % 56) as f32;
-            let r = outputs.data[plane + i].to_f32() * 112.0;
-            let sx = fw as f32 / 224.0;
-            let sy = fh as f32 / 224.0;
-            dets.push([
-                (x * 4.0 - r) * sx,
-                (y * 4.0 - r) * sy,
-                2.0 * r * sx,
-                2.0 * r * sy,
-                heat[i],
-            ]);
+    let sx = fw as f32 / 224.0;
+    let sy = fh as f32 / 224.0;
+    for &i in order.iter().take(max_faces.max(1)) {
+        if heat[i] < thresh {
+            break;
         }
+        let y = (i / 56) as f32;
+        let x = (i % 56) as f32;
+        let r = outputs.data[plane + i].to_f32() * 112.0;
+        dets.push([
+            (x * 4.0 - r) * sx,
+            (y * 4.0 - r) * sy,
+            2.0 * r * sx,
+            2.0 * r * sy,
+            heat[i],
+        ]);
     }
     dets
 }
