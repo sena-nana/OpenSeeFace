@@ -11,7 +11,6 @@ use osf_ort::{
 
 #[derive(Parser, Debug)]
 #[command(name = "facetracker", about = "OpenSeeFace tracker (Rust ORT)")]
-#[allow(dead_code)]
 struct Args {
     #[arg(short, long, default_value = "127.0.0.1")]
     ip: String,
@@ -75,32 +74,17 @@ struct Args {
     repeat_video: i32,
     #[arg(long, default_value = "")]
     dump_points: String,
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 0, hide = true)]
     benchmark: i32,
-    // Old Python/Unity flags: accepted, ignored.
-    #[arg(short = 'a', long, hide = true, default_value_t = 0)]
-    list_dcaps: i32,
-    #[arg(short = 'D', long, hide = true)]
-    dcap: Option<i32>,
-    #[arg(short = 'B', long, hide = true, default_value_t = 0)]
-    blackmagic: i32,
+    /// OpenSeeLauncher sends this with `--benchmark`; ignored.
     #[arg(long, hide = true)]
-    dformat: Option<String>,
-    #[arg(long, hide = true, default_value = "")]
-    log_data: String,
-    #[arg(long, hide = true, default_value = "")]
-    log_output: String,
-    #[arg(long, hide = true, default_value_t = 1)]
-    use_dshowcapture: i32,
-    #[arg(long, hide = true)]
-    blackmagic_options: Option<String>,
-    #[arg(long, hide = true)]
+    #[allow(dead_code)]
     priority: Option<i32>,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    if args.list_cameras > 0 || args.list_dcaps > 0 {
+    if args.list_cameras > 0 {
         for (i, name) in list_cameras().context("list cameras")? {
             if args.list_cameras == 1 {
                 println!("{i}: {name}");

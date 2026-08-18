@@ -2,9 +2,9 @@
 
 # Overview
 
-**Note**: This is a tracking library, **not** a stand-alone avatar puppeteering program. I'm also working on [VSeeFace](https://www.vseeface.icu/), which allows animating [VRM](https://vrm.dev/en/how_to_make_vrm/) and [VSFAvatar](https://www.youtube.com/watch?v=jhQ8DF87I5I) 3D models by using OpenSeeFace tracking. [VTube Studio](https://denchisoft.com/) uses OpenSeeFace for webcam based tracking to animate Live2D models. A renderer for the Godot engine can be found [here](https://github.com/virtual-puppet-project/vpuppr).
+This project is a facial landmark tracking library based on MobileNetV3. Tracking runs in Rust (`runtime-ort` / `facetracker`) on the shipped ONNX models via [ort](https://github.com/pykeio/ort). There are four models, with different speed to tracking quality trade-offs.
 
-This project implements a facial landmark detection model based on MobileNetV3. Tracking runs in Rust (`runtime-ort` / `facetracker`) on the shipped ONNX models via [ort](https://github.com/pykeio/ort). There are four models, with different speed to tracking quality trade-offs.
+It is **not** a stand-alone avatar puppeteering program. [VSeeFace](https://www.vseeface.icu/), [VTube Studio](https://denchisoft.com/), and a [Godot renderer](https://github.com/virtual-puppet-project/vpuppr) consume the UDP stream. Unity scripts here are a compatibility layer.
 
 If anyone is curious, the name is a silly pun on the open seas and seeing faces. There's no deeper meaning.
 
@@ -20,66 +20,20 @@ I ran OpenSeeFace on a sample clip from the video presentation for [3D Face Reco
 
 # Usage
 
-A sample Unity project for VRM based avatar animation can be found [here](https://github.com/emilianavt/OpenSeeFaceSample).
+The tracker is the `facetracker` CLI in `runtime-ort`. It reads a webcam, still, or video file, runs detection and landmarks, and writes one 1785-byte OpenSee packet per face to UDP (`127.0.0.1:11573` by default). Tracking can run on a different machine from the consumer.
 
-The face tracking itself is done by the `facetracker` Rust program (`runtime-ort`). It is a commandline program, so you should start it manually from a terminal or write a batch file to start it. If you downloaded a release and are on Windows, you can run `facetracker.exe` inside the `Binary` folder. You can also use `run.bat` inside that folder for a basic demonstration of the tracker.
-
-The script will perform the tracking on webcam input or video file and send the tracking data over UDP. This design also allows tracking to be done on a separate PC from the one who uses the tracking information. This can be useful to enhance performance and to avoid accidentially revealing camera footage.
-
-The provided `OpenSee` Unity component can receive these UDP packets and provides the received information through a public field called `trackingData`. The `OpenSeeShowPoints` component can visualize the landmark points of a detected face. It also serves as an example. Please look at it to see how to properly make use of the `OpenSee` component. Further examples are included in the `Examples` folder. The UDP packets are received in a separate thread, so any components using the `trackingData` field of the `OpenSee` component should first copy the field and access this copy, because otherwise the information may get overwritten during processing. This design also means that the field will keep updating, even if the `OpenSee` component is disabled.
-
-Run the tracker with `--help` to learn about the possible options you can set.
+If you downloaded a release on Windows, run `facetracker.exe` from the `Binary` folder (`run.bat` is a short camera demo). From source:
 
     cargo run --release --manifest-path runtime-ort/Cargo.toml --bin facetracker -- --help
 
-Or, after `./make_exe.sh` / `make_exe.bat`:
+After `./make_exe.sh` / `make_exe.bat`:
 
     dist/facetracker/facetracker --help
 
-A simple demonstration can be achieved by creating a new scene in Unity, adding an empty game object and both the `OpenSee` and `OpenSeeShowPoints` components to it. While the scene is playing, run the face tracker on a video file:
+Webcam or video with the built-in overlay (no Unity required):
 
-    cargo run --release --manifest-path runtime-ort/Cargo.toml --bin facetracker -- --visualize 3 --pnp-points 1 --max-threads 4 -c video.mp4
-
-This way the tracking script will output its own tracking visualization while also demonstrating the transmission of tracking data to Unity.
-
-The included `OpenSeeLauncher` component allows starting the face tracker program from Unity. It is designed to work with the `facetracker` binary from a release bundle (same CLI flags as before). It provides three public API functions:
-
-* `public string[] ListCameras()` returns the names of available cameras. The index of the camera in the array corresponds to its ID for the `cameraIndex` field. Setting the `cameraIndex` to `-1` will disable webcam capturing.
-* `public bool StartTracker()` will start the tracker. If it is already running, it will shut down the running instance and start a new one with the current settings.
-* `public void StopTracker()` will stop the tracker. The tracker is stopped automatically when the application is terminated or the `OpenSeeLauncher` object is destroyed.
-
-The `OpenSeeLauncher` component uses WinAPI job objects to ensure that the tracker child process is terminated if the application crashes or closes without terminating the tracker process first.
-
-Additional custom commandline arguments should be added one by one into elements of `commandlineArguments` array. For example `-v 1` should be added as two elements, one element containing `-v` and one containing `1`, not a single one containing both parts.
-
-The included `OpenSeeIKTarget` component can be used in conjunction with FinalIK or other IK solutions to animate head motion.
-
-## Expression detection
-
-The `OpenSeeExpression` component can be added to the same component as the `OpenSeeFace` component to detect specific facial expressions. It has to be calibrated on a per-user basis. It can be controlled either through the checkboxes in the Unity Editor or through the equivalent public methods that can be found in its source code.
-
-To calibrate this system, you have to gather example data for each expression. If the capture process is going too fast, you can use the `recordingSkip` option to slow it down.
-
-The general process is as follows:
-
-* Type in a name for the expression you want to calibrate.
-* Make the expression and hold it, then tick the recording box.
-* Keep holding the expression and move your head around and turn it in various directions.
-* After a short while, start talking while doing so if the expression should be compatible with talking.
-* After doing this for a while, untick the recording box and work on capturing another expression.
-* Tick the train box and see if the expressions you gathered data for are detected accurately.
-* You should also get some statistics in the lower part of the component.
-* If there are issues with any expression being detected, keep adding data to it.
-
-To delete the captured data for an expression, type in its name and tick the "Clear" box.
-
-To save both the trained model and the captured training data, type in a filename including its full path in the "Filename" field and tick the "Save" box. To load it, enter the filename and tick the "Load" box.
-
-### Hints
-
-* A reasonable number of expressions is six, including the neutral one.
-* Before starting to capture expressions, make some faces and wiggle your eyebrows around, to warm up the feature detection part of the tracker.
-* Once you have a detection model that works decently, when using it take a moment to check all the expressions work as intended and add a little data if not.
+    cargo run --release --manifest-path runtime-ort/Cargo.toml --bin facetracker -- -c 0 --visualize 3 --pnp-points 1 --max-threads 4
+    cargo run --release --manifest-path runtime-ort/Cargo.toml --bin facetracker -- -c video.mp4 --visualize 3 --pnp-points 1 --max-threads 4
 
 # General notes
 
@@ -88,6 +42,10 @@ To save both the trained model and the captured training data, type in a filenam
 * Lower tracking quality mainly means more rigid tracking, making it harder to detect blinking and eyebrow motion.
 * Depending on the frame rate, face tracking can easily use up a whole CPU core. At 30fps for a single face, it should still use less than 100% of one core on a decent CPU. If tracking uses too much CPU, try lowering the frame rate. A frame rate of 20 is probably fine and anything above 30 should rarely be necessary.
 * When setting the number of faces to track to a higher number than the number of faces actually in view, the face detection model will run every `--scan-every` frames. This can slow things down, so try to set `--faces` no higher than the actual number of faces you are tracking.
+
+# Unity compatibility
+
+The binary is still named `facetracker` and still sends 1785-byte OpenSee UDP packets, so `Unity/OpenSeeLauncher.cs` can start it. `--benchmark` / `--priority` are accepted for that launcher. Receiver scripts are in `Unity/` and `Examples/`; copy `OpenSee.trackingData` before use (it is written from another thread). Sample project: [OpenSeeFaceSample](https://github.com/emilianavt/OpenSeeFaceSample).
 
 # Models
 
@@ -145,7 +103,7 @@ Tracking no longer uses Python. `train/` keeps the PyTorch architectures (`model
 
 # Rust ORT runtime
 
-`runtime-ort` runs the ONNX files in `models/` via [ort](https://github.com/pykeio/ort). The product binary is `facetracker`. Micro-benchmarks:
+`runtime-ort` runs the ONNX files in `models/` via [ort](https://github.com/pykeio/ort). The tracker binary is `facetracker`. Micro-benchmarks:
 
     cargo run --release --manifest-path runtime-ort/Cargo.toml --bin osf-bench -- --model 3 --threads 4
 

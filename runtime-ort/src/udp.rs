@@ -1,4 +1,4 @@
-//! UDP packet matching Unity `OpenSee.packetFrameSize` (1785 bytes / face).
+//! OpenSee UDP packet (1785 bytes / face). Same layout as Unity `OpenSee.packetFrameSize`.
 
 /// 8+4+8+8+1+4+12+12+16+272+544+840+56 = 1785
 pub const PACKET_FRAME_SIZE: usize = 1785;
