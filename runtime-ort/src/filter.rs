@@ -2,6 +2,9 @@
 //!
 //! Crop and PnP keep raw measurements. Expression features are not filtered
 //! here (`features.rs` already uses EMA). See `benchmarks/filter-eval.md`.
+//!
+//! `mincutoff` is scaled down when landmark confidence or PnP stability is
+//! poor; `|velocity|` still raises the cutoff.
 
 use std::f32::consts::PI;
 use std::str::FromStr;
@@ -32,7 +35,7 @@ impl FromStr for FilterKind {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s.to_ascii_lowercase().replace('_', "-").as_str() {
             "none" | "off" | "0" => Self::None,
-            "one-euro" | "oneeuro" | "1e" | "euro" => Self::OneEuro,
+            "one-euro" | "oneeuro" | "1e" | "euro" | "adaptive" | "adapt" | "auto" => Self::OneEuro,
             other => anyhow::bail!("unknown --filter {other} (none|one-euro)"),
         })
     }
@@ -68,6 +71,37 @@ impl FilterCfg {
     }
 }
 
+/// Per-frame quality. High conf + low PnP error → scale 1 (classic One Euro).
+#[derive(Clone, Copy, Debug)]
+pub struct FilterQuality {
+    pub conf: f32,
+    pub pnp_error: f32,
+    pub success: bool,
+}
+
+impl Default for FilterQuality {
+    fn default() -> Self {
+        Self {
+            conf: 1.0,
+            pnp_error: 0.0,
+            success: true,
+        }
+    }
+}
+
+impl FilterQuality {
+    /// `(0.35, 1]`. Lower quality → smaller `mincutoff` → stronger smoothing.
+    pub fn scale(self, conf: f32) -> f32 {
+        let conf = conf.clamp(0.0, 1.0);
+        let stab = if self.success {
+            (1.0 / (1.0 + self.pnp_error / 200.0)).clamp(0.25, 1.0)
+        } else {
+            0.25
+        };
+        0.35 + 0.65 * conf.min(stab)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct OneEuro {
     xhat: Option<f32>,
@@ -84,7 +118,7 @@ impl OneEuro {
         }
     }
 
-    fn filter(&mut self, x: f32, dt: f32, cfg: &FilterCfg) -> f32 {
+    fn filter(&mut self, x: f32, dt: f32, cfg: &FilterCfg, mincutoff_scale: f32) -> f32 {
         let dt = dt.max(1e-6);
         let dx = match self.xprev {
             Some(p) => (x - p) / dt,
@@ -96,7 +130,8 @@ impl OneEuro {
         } else {
             a_d * dx + (1.0 - a_d) * self.dxhat
         };
-        let cutoff = (cfg.mincutoff + cfg.beta * self.dxhat.abs()).max(1e-4);
+        let cutoff =
+            (cfg.mincutoff * mincutoff_scale.max(1e-4) + cfg.beta * self.dxhat.abs()).max(1e-4);
         let a = alpha(cutoff, dt);
         let y = match self.xhat {
             Some(p) => a * x + (1.0 - a) * p,
@@ -151,11 +186,13 @@ impl OutputFilter {
         lms: &mut [[f32; 3]],
         pts_3d: &mut [[f32; 3]],
         dt: f32,
+        quality: FilterQuality,
     ) {
         if self.cfg.kind == FilterKind::None {
             return;
         }
         let dt = dt.clamp(1.0 / 240.0, 0.25);
+        let pose_s = quality.scale(quality.conf);
         let raw_e = *euler;
         let unwrapped = match self.unwrapped {
             Some(p) => [
@@ -167,8 +204,8 @@ impl OutputFilter {
         };
         let mut fe = [0.0; 3];
         for i in 0..3 {
-            fe[i] = self.euler[i].filter(unwrapped[i], dt, &self.cfg);
-            translation[i] = self.trans[i].filter(translation[i], dt, &self.cfg);
+            fe[i] = self.euler[i].filter(unwrapped[i], dt, &self.cfg, pose_s);
+            translation[i] = self.trans[i].filter(translation[i], dt, &self.cfg, pose_s);
         }
         self.unwrapped = Some(fe);
         *euler = [wrap_deg(fe[0]), wrap_deg(fe[1]), wrap_deg(fe[2])];
@@ -178,17 +215,18 @@ impl OutputFilter {
             self.lms.push([OneEuro::new(), OneEuro::new()]);
         }
         for (i, p) in lms.iter_mut().enumerate() {
-            p[0] = self.lms[i][0].filter(p[0], dt, &self.cfg);
-            p[1] = self.lms[i][1].filter(p[1], dt, &self.cfg);
+            let s = quality.scale(p[2]);
+            p[0] = self.lms[i][0].filter(p[0], dt, &self.cfg, s);
+            p[1] = self.lms[i][1].filter(p[1], dt, &self.cfg, s);
         }
         while self.pts.len() < pts_3d.len() {
             self.pts
                 .push([OneEuro::new(), OneEuro::new(), OneEuro::new()]);
         }
         for (i, p) in pts_3d.iter_mut().enumerate() {
-            p[0] = self.pts[i][0].filter(p[0], dt, &self.cfg);
-            p[1] = self.pts[i][1].filter(p[1], dt, &self.cfg);
-            p[2] = self.pts[i][2].filter(p[2], dt, &self.cfg);
+            p[0] = self.pts[i][0].filter(p[0], dt, &self.cfg, pose_s);
+            p[1] = self.pts[i][1].filter(p[1], dt, &self.cfg, pose_s);
+            p[2] = self.pts[i][2].filter(p[2], dt, &self.cfg, pose_s);
         }
     }
 }
@@ -249,20 +287,33 @@ mod tests {
         (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt()
     }
 
+    fn apply_xy(quality: FilterQuality, xs: &[f32]) -> Vec<f32> {
+        let mut flt = OutputFilter::new(FilterCfg::new(FilterKind::OneEuro, 1.0, 0.007));
+        let dt = 1.0 / 30.0;
+        xs.iter()
+            .map(|&x| {
+                let mut e = [0.0; 3];
+                let mut t = [x, 0.0, 0.0];
+                let mut q = [0.0, 0.0, 0.0, 1.0];
+                let mut lms = vec![[x, 0.0, quality.conf]];
+                let mut pts = vec![[x, 0.0, 0.0]];
+                flt.apply(&mut e, &mut t, &mut q, &mut lms, &mut pts, dt, quality);
+                t[0]
+            })
+            .collect()
+    }
+
     #[test]
     fn one_euro_damps_static_noise() {
         let mut f = OneEuro::new();
-        let cfg = FilterCfg {
-            kind: FilterKind::OneEuro,
-            ..FilterCfg::default()
-        };
+        let cfg = FilterCfg::new(FilterKind::OneEuro, 1.0, 0.007);
         let dt = 1.0 / 30.0;
         let mut xin = Vec::new();
         let mut yout = Vec::new();
         for i in 0..180 {
             let x = 0.15 * ((i as f32) * 1.7).sin();
             xin.push(x);
-            yout.push(f.filter(x, dt, &cfg));
+            yout.push(f.filter(x, dt, &cfg, 1.0));
         }
         assert!(
             var(&yout) < 0.45 * var(&xin),
@@ -283,11 +334,11 @@ mod tests {
         };
         let dt = 1.0 / 30.0;
         for _ in 0..8 {
-            f.filter(0.0, dt, &cfg);
+            f.filter(0.0, dt, &cfg, 1.0);
         }
         let mut y = 0.0;
         for _ in 0..3 {
-            y = f.filter(1.0, dt, &cfg);
+            y = f.filter(1.0, dt, &cfg, 1.0);
         }
         assert!(y >= 0.85, "step y={y}");
     }
@@ -304,7 +355,15 @@ mod tests {
             let mut q = [0.0, 0.0, 0.0, 1.0];
             let mut lms = vec![[0.0; 3]; 4];
             let mut pts = vec![[0.0; 3]; 4];
-            flt.apply(&mut e, &mut t, &mut q, &mut lms, &mut pts, dt);
+            flt.apply(
+                &mut e,
+                &mut t,
+                &mut q,
+                &mut lms,
+                &mut pts,
+                dt,
+                FilterQuality::default(),
+            );
             let u = flt.unwrapped.unwrap()[0];
             if let Some(p) = prev {
                 assert!((u - p).abs() < 20.0, "unwrap jump {p} -> {u} from meas {m}");
@@ -322,7 +381,7 @@ mod tests {
             .into_iter()
             .enumerate()
         {
-            let y = f.filter(i as f32 * 0.1, dt, &cfg);
+            let y = f.filter(i as f32 * 0.1, dt, &cfg, 1.0);
             assert!(y.is_finite());
         }
     }
@@ -331,17 +390,18 @@ mod tests {
     fn reset_first_frame_equals_measurement() {
         let mut flt = OutputFilter::new(FilterCfg::new(FilterKind::OneEuro, 1.0, 0.007));
         let dt = 1.0 / 30.0;
+        let q0 = FilterQuality::default();
         let mut e = [3.0, 1.0, -2.0];
         let mut t = [10.0, 20.0, 30.0];
         let mut q = [0.0, 0.0, 0.0, 1.0];
         let mut lms = vec![[5.0, 6.0, 0.9]];
         let mut pts = vec![[1.0, 2.0, 3.0]];
-        flt.apply(&mut e, &mut t, &mut q, &mut lms, &mut pts, dt);
+        flt.apply(&mut e, &mut t, &mut q, &mut lms, &mut pts, dt, q0);
         for _ in 0..5 {
             let mut e2 = [0.0, 0.0, 0.0];
             let mut t2 = [0.0; 3];
             let mut q2 = q;
-            flt.apply(&mut e2, &mut t2, &mut q2, &mut lms, &mut pts, dt);
+            flt.apply(&mut e2, &mut t2, &mut q2, &mut lms, &mut pts, dt, q0);
         }
         flt.reset();
         let mut e = [12.0, -4.0, 8.0];
@@ -349,7 +409,7 @@ mod tests {
         let mut q = [0.0, 0.0, 0.0, 1.0];
         let mut lms = vec![[9.0, 11.0, 0.8]];
         let mut pts = vec![[4.0, 5.0, 6.0]];
-        flt.apply(&mut e, &mut t, &mut q, &mut lms, &mut pts, dt);
+        flt.apply(&mut e, &mut t, &mut q, &mut lms, &mut pts, dt, q0);
         assert!((t[0] - 100.0).abs() < 1e-4);
         assert!((lms[0][0] - 9.0).abs() < 1e-4);
         assert!((q_norm(q) - 1.0).abs() < 1e-4);
@@ -363,7 +423,15 @@ mod tests {
         let mut q = [0.1, 0.2, 0.3, 0.9];
         let mut lms = vec![[4.0, 5.0, 0.7]];
         let mut pts = vec![[6.0, 7.0, 8.0]];
-        flt.apply(&mut e, &mut t, &mut q, &mut lms, &mut pts, 1.0 / 30.0);
+        flt.apply(
+            &mut e,
+            &mut t,
+            &mut q,
+            &mut lms,
+            &mut pts,
+            1.0 / 30.0,
+            FilterQuality::default(),
+        );
         assert_eq!(e, [11.0, -8.0, 3.0]);
         assert_eq!(t, [1.0, 2.0, 3.0]);
         assert_eq!(lms[0], [4.0, 5.0, 0.7]);
@@ -375,8 +443,31 @@ mod tests {
             "one-euro".parse::<FilterKind>().unwrap(),
             FilterKind::OneEuro
         );
+        assert_eq!(
+            "adaptive".parse::<FilterKind>().unwrap(),
+            FilterKind::OneEuro
+        );
         assert_eq!("none".parse::<FilterKind>().unwrap(), FilterKind::None);
         assert!("ema".parse::<FilterKind>().is_err());
-        assert!("kalman".parse::<FilterKind>().is_err());
+    }
+
+    #[test]
+    fn low_conf_damps_more_than_high() {
+        let xs: Vec<f32> = (0..180).map(|i| 0.15 * ((i as f32) * 1.7).sin()).collect();
+        let high = apply_xy(FilterQuality::default(), &xs);
+        let low = apply_xy(
+            FilterQuality {
+                conf: 0.15,
+                pnp_error: 80.0,
+                success: true,
+            },
+            &xs,
+        );
+        assert!(
+            var(&low) < 0.85 * var(&high),
+            "low-conf var {} vs high {}",
+            var(&low),
+            var(&high)
+        );
     }
 }

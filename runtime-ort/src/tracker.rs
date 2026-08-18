@@ -7,7 +7,7 @@ use anyhow::Result;
 use crate::crop::{stable_landmark_bbox, CropSmoothState};
 use crate::decode::{decode_landmarks, detect_faces_n, LmSpec};
 use crate::features::FeatureExtractor;
-use crate::filter::{FilterCfg, FilterKind, OutputFilter};
+use crate::filter::{FilterCfg, FilterKind, FilterQuality, OutputFilter};
 use crate::gaze::get_eye_state;
 use crate::geom::{clamp_to_im, group_rects};
 use crate::pnp::{adjust_3d, estimate_depth, Camera, CONTOUR_PTS, CONTOUR_PTS_T, FACE_3D};
@@ -672,6 +672,11 @@ impl Tracker {
                 &mut out.lms,
                 &mut out.pts_3d,
                 dt,
+                FilterQuality {
+                    conf: fi.conf,
+                    pnp_error: fi.pnp_error,
+                    success: fi.success,
+                },
             );
             results.push(out);
             let _ = max_fu;

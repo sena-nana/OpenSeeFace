@@ -11,8 +11,8 @@ use osf_ort::{
     detect_faces, enhance_bgr, face_crop, imagenet_nchw, iou, max_abs, mean_abs, mean_conf,
     model_path, nme, paste_bgr, pick_lm, read_f32_le, resize_bgr, retina_nchw, rss, synth_canvas,
     unwrap_deg, xywh_iou, AdaptiveCfg, AdaptiveState, BgrImage, CropTrack, DetWindow, Device,
-    EnhanceCfg, FilterCfg, FilterKind, GpuTracker, Latency, LmSpec, OrtModel, OutputFilter,
-    TensorF16, Tracker, TrackerConfig, EYE_IDX, FAST_LM, VERSION,
+    EnhanceCfg, FilterCfg, FilterKind, FilterQuality, GpuTracker, Latency, LmSpec, OrtModel,
+    OutputFilter, TensorF16, Tracker, TrackerConfig, EYE_IDX, FAST_LM, VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -2070,6 +2070,9 @@ struct RawTrack {
     quaternion: [f32; 4],
     lms: Vec<[f32; 3]>,
     pts_3d: [[f32; 3]; 70],
+    conf: f32,
+    pnp_error: f32,
+    success: bool,
     hit: bool,
     e2e_ms: f64,
 }
@@ -2085,6 +2088,8 @@ struct FilterSceneScore {
     pose_rmse: f32,
     filter_us: f64,
     e2e_p50_ms: f64,
+    mean_conf: f32,
+    mean_pnp_error: f32,
     hits: usize,
     frames: usize,
 }
@@ -2097,6 +2102,7 @@ struct FilterReport {
     noisy_nme_ratio: f32,
     step_lag_extra: f32,
     filter_us: f64,
+    vs_speed_jitter: f32,
     scenes: Vec<FilterSceneScore>,
 }
 
@@ -2134,6 +2140,9 @@ fn capture_raw(tracker: &mut Tracker, seq: &ScaleSeq) -> Result<Vec<RawTrack>> {
                 quaternion: f.quaternion,
                 lms: f.lms.clone(),
                 pts_3d: f.pts_3d,
+                conf: f.conf,
+                pnp_error: f.pnp_error,
+                success: f.success,
                 hit: true,
                 e2e_ms,
             });
@@ -2144,6 +2153,9 @@ fn capture_raw(tracker: &mut Tracker, seq: &ScaleSeq) -> Result<Vec<RawTrack>> {
                 quaternion: [0.0, 0.0, 0.0, 1.0],
                 lms: Vec::new(),
                 pts_3d: [[0.0; 3]; 70],
+                conf: 0.0,
+                pnp_error: 0.0,
+                success: false,
                 hit: false,
                 e2e_ms,
             });
@@ -2152,13 +2164,27 @@ fn capture_raw(tracker: &mut Tracker, seq: &ScaleSeq) -> Result<Vec<RawTrack>> {
     Ok(out)
 }
 
-fn replay_filter(raw: &[RawTrack], cfg: FilterCfg, dt: f32) -> (Vec<RawTrack>, f64) {
+fn replay_filter(
+    raw: &[RawTrack],
+    cfg: FilterCfg,
+    dt: f32,
+    use_track_quality: bool,
+) -> (Vec<RawTrack>, f64) {
     let mut flt = OutputFilter::new(cfg);
     let t0 = Instant::now();
     let mut out = Vec::with_capacity(raw.len());
     for r in raw {
         let mut s = r.clone();
         if s.hit {
+            let q = if use_track_quality {
+                FilterQuality {
+                    conf: s.conf,
+                    pnp_error: s.pnp_error,
+                    success: s.success,
+                }
+            } else {
+                FilterQuality::default()
+            };
             flt.apply(
                 &mut s.euler,
                 &mut s.translation,
@@ -2166,6 +2192,7 @@ fn replay_filter(raw: &[RawTrack], cfg: FilterCfg, dt: f32) -> (Vec<RawTrack>, f
                 &mut s.lms,
                 &mut s.pts_3d,
                 dt,
+                q,
             );
         } else {
             flt.reset();
@@ -2174,6 +2201,10 @@ fn replay_filter(raw: &[RawTrack], cfg: FilterCfg, dt: f32) -> (Vec<RawTrack>, f
     }
     let us = t0.elapsed().as_secs_f64() * 1e6 / raw.len().max(1) as f64;
     (out, us)
+}
+
+fn raw_mean(raw: &[RawTrack], f: fn(&RawTrack) -> f32) -> f32 {
+    mean_f32(&raw.iter().filter(|r| r.hit).map(f).collect::<Vec<_>>()).unwrap_or(0.0)
 }
 
 fn lms_center(lms: &[[f32; 3]]) -> [f32; 2] {
@@ -2293,7 +2324,7 @@ fn make_step_seq(face: &BgrImage, face_h: f32, frac: f32, n: usize, dx: f32) -> 
 
 fn print_filter_row(s: &FilterSceneScore) {
     eprintln!(
-        "  {:8} {:10} jitter_e={:.3} jitter_c={:.3} lag={:.1} nme={:.4} pose={:.3} filt={:.1}us e2e={:.2}ms rec={:.2}",
+        "  {:8} {:10} jitter_e={:.3} jitter_c={:.3} lag={:.1} nme={:.4} pose={:.3} filt={:.1}us e2e={:.2}ms rec={:.2} conf={:.3} pnp={:.1}",
         s.scene,
         s.filter,
         s.jitter_euler,
@@ -2303,7 +2334,9 @@ fn print_filter_row(s: &FilterSceneScore) {
         s.pose_rmse,
         s.filter_us,
         s.e2e_p50_ms,
-        s.hits as f32 / s.frames.max(1) as f32
+        s.hits as f32 / s.frames.max(1) as f32,
+        s.mean_conf,
+        s.mean_pnp_error
     );
 }
 
@@ -2352,15 +2385,19 @@ fn run_filter_suite(args: &Args, _spec: LmSpec, device: Device, out: &Path) -> R
         ("step", step),
     ];
 
-    let kinds: [(&str, FilterCfg); 2] = [
-        ("none", FilterCfg::default()),
-        ("one-euro", FilterCfg::new(FilterKind::OneEuro, 1.0, 0.007)),
+    let euro = FilterCfg::new(FilterKind::OneEuro, 1.0, 0.007);
+    let kinds: [(&str, FilterCfg, bool); 3] = [
+        ("none", FilterCfg::default(), false),
+        ("speed", euro, false),
+        ("one-euro", euro, true),
     ];
 
     let mut scores = Vec::new();
     for (scene_name, seq) in &scenes {
         let mut tracker = open_filter_tracker(args, SCALE_W, SCALE_H)?;
         let raw = capture_raw(&mut tracker, seq)?;
+        let mean_c = raw_mean(&raw, |r| r.conf);
+        let mean_p = raw_mean(&raw, |r| r.pnp_error);
         let teacher = if *scene_name == "noisy" {
             let mut t = open_filter_tracker(args, SCALE_W, SCALE_H)?;
             let clean = scenes
@@ -2376,11 +2413,11 @@ fn run_filter_suite(args: &Args, _spec: LmSpec, device: Device, out: &Path) -> R
             raw.clone()
         };
         let e2e = Latency::from_samples(0, &raw.iter().map(|r| r.e2e_ms).collect::<Vec<_>>());
-        for (fname, cfg) in &kinds {
+        for (fname, cfg, use_q) in &kinds {
             let (filt, filter_us) = if *fname == "none" {
                 (raw.clone(), 0.0)
             } else {
-                replay_filter(&raw, *cfg, dt)
+                replay_filter(&raw, *cfg, dt, *use_q)
             };
             let (je, jc) = jitter_of(&filt);
             let (nme_t, pose) = nme_pose(&filt, &teacher);
@@ -2399,6 +2436,8 @@ fn run_filter_suite(args: &Args, _spec: LmSpec, device: Device, out: &Path) -> R
                 pose_rmse: pose,
                 filter_us,
                 e2e_p50_ms: e2e.p50_ms,
+                mean_conf: mean_c,
+                mean_pnp_error: mean_p,
                 hits: filt.iter().filter(|r| r.hit).count(),
                 frames: filt.len(),
             };
@@ -2414,12 +2453,17 @@ fn run_filter_suite(args: &Args, _spec: LmSpec, device: Device, out: &Path) -> R
             .map(f)
             .unwrap_or(0.0)
     };
-    let none_j = pick("static", "none", |s| s.jitter_euler.max(s.jitter_center));
-    let euro_j = pick("static", "one-euro", |s| {
-        s.jitter_euler.max(s.jitter_center)
-    });
+    let jitter = |s: &FilterSceneScore| s.jitter_euler.max(s.jitter_center);
+    let none_j = pick("static", "none", jitter);
+    let euro_j = pick("static", "one-euro", jitter);
+    let speed_j = pick("static", "speed", jitter);
     let drop = if none_j > 1e-6 {
         (none_j - euro_j) / none_j
+    } else {
+        0.0
+    };
+    let vs_speed_jitter = if speed_j > 1e-6 {
+        (speed_j - euro_j) / speed_j
     } else {
         0.0
     };
@@ -2439,8 +2483,9 @@ fn run_filter_suite(args: &Args, _spec: LmSpec, device: Device, out: &Path) -> R
         .map(|s| s.filter_us)
         .fold(0.0, f64::max);
     eprintln!(
-        "one-euro vs none: drop={:.1}% nme_ratio={nme_ratio:.3} lag_extra={lag_extra:.1} filt={filter_us:.1}us",
-        drop * 100.0
+        "one-euro vs none: drop={:.1}% nme_ratio={nme_ratio:.3} lag_extra={lag_extra:.1} filt={filter_us:.1}us vs_speed_jitter={:.1}%",
+        drop * 100.0,
+        vs_speed_jitter * 100.0
     );
 
     let report = FilterReport {
@@ -2450,6 +2495,7 @@ fn run_filter_suite(args: &Args, _spec: LmSpec, device: Device, out: &Path) -> R
         noisy_nme_ratio: nme_ratio,
         step_lag_extra: lag_extra,
         filter_us,
+        vs_speed_jitter,
         scenes: scores,
     };
     if let Some(dir) = out.parent() {
