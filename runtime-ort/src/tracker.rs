@@ -7,6 +7,7 @@ use anyhow::Result;
 use crate::crop::{stable_landmark_bbox, CropSmoothState};
 use crate::decode::{decode_landmarks, detect_faces_n, LmSpec};
 use crate::features::FeatureExtractor;
+use crate::filter::{FilterCfg, FilterKind, OutputFilter};
 use crate::gaze::get_eye_state;
 use crate::geom::{clamp_to_im, group_rects};
 use crate::pnp::{adjust_3d, estimate_depth, Camera, CONTOUR_PTS, CONTOUR_PTS_T, FACE_3D};
@@ -65,10 +66,11 @@ pub struct FaceInfo {
     update_counts: [[f32; 2]; 66],
     features: FeatureExtractor,
     crop_smooth: CropSmoothState,
+    output_filter: OutputFilter,
 }
 
 impl FaceInfo {
-    fn new(id: i32, model_type: i32, max_feature_updates: f32) -> Self {
+    fn new(id: i32, model_type: i32, max_feature_updates: f32, filter: FilterCfg) -> Self {
         let mut s = Self {
             id,
             conf: 0.0,
@@ -93,6 +95,7 @@ impl FaceInfo {
             update_counts: [[0.0; 2]; 66],
             features: FeatureExtractor::new(max_feature_updates),
             crop_smooth: CropSmoothState::default(),
+            output_filter: OutputFilter::new(filter),
         };
         s.update_contour(model_type);
         s
@@ -135,6 +138,7 @@ impl FaceInfo {
         self.fail_count = 0;
         self.coord = None;
         self.crop_smooth.reset();
+        self.output_filter.reset();
     }
 
     fn update_det(
@@ -186,6 +190,7 @@ pub struct Tracker {
     wait_count: i32,
     frame_count: i32,
     model_dir: PathBuf,
+    last_tick: Option<std::time::Instant>,
 }
 
 pub struct TrackerConfig {
@@ -205,6 +210,9 @@ pub struct TrackerConfig {
     pub max_feature_updates: f32,
     pub static_model: bool,
     pub try_hard: bool,
+    pub filter: FilterKind,
+    pub filter_mincutoff: f32,
+    pub filter_beta: f32,
 }
 
 impl Default for TrackerConfig {
@@ -226,6 +234,9 @@ impl Default for TrackerConfig {
             max_feature_updates: 0.0,
             static_model: true,
             try_hard: false,
+            filter: FilterKind::OneEuro,
+            filter_mincutoff: 1.0,
+            filter_beta: 0.007,
         }
     }
 }
@@ -273,8 +284,16 @@ impl Tracker {
         if cfg.model_type == -1 {
             feature_level = 1;
         }
+        let filter_cfg = FilterCfg::new(cfg.filter, cfg.filter_mincutoff, cfg.filter_beta);
         let face_info = (0..max_faces)
-            .map(|id| FaceInfo::new(id as i32, cfg.model_type, cfg.max_feature_updates))
+            .map(|id| {
+                FaceInfo::new(
+                    id as i32,
+                    cfg.model_type,
+                    cfg.max_feature_updates,
+                    filter_cfg,
+                )
+            })
             .collect();
         Ok(Self {
             width: cfg.width,
@@ -305,6 +324,7 @@ impl Tracker {
             wait_count: 0,
             frame_count: 0,
             model_dir: dir,
+            last_tick: None,
         })
     }
 
@@ -428,6 +448,13 @@ impl Tracker {
     pub fn predict(&mut self, frame: &BgrImage) -> Vec<FaceInfo> {
         self.frame_count += 1;
         self.wait_count += 1;
+        let now = std::time::Instant::now();
+        let dt = self
+            .last_tick
+            .map(|t| now.duration_since(t).as_secs_f32())
+            .unwrap_or(1.0 / 30.0)
+            .clamp(1.0 / 240.0, 0.25);
+        self.last_tick = Some(now);
         let mut new_faces: Vec<[f32; 4]> = self.faces.clone();
         let bonus_cutoff = new_faces.len();
         if self.detected == 0 {
@@ -596,6 +623,7 @@ impl Tracker {
                     fi.update_counts = [[0.0; 2]; 66];
                     fi.update_contour(model_type);
                     fi.crop_smooth.reset();
+                    fi.output_filter.reset();
                 }
             } else {
                 fi.fail_count = 0;
@@ -636,7 +664,16 @@ impl Tracker {
                 .or_else(|| fi.crop_smooth.last_box())
                 .unwrap_or([0.0, 0.0, 1.0, 1.0]);
             detected.push(next);
-            results.push(fi.clone());
+            let mut out = fi.clone();
+            fi.output_filter.apply(
+                &mut out.euler,
+                &mut out.translation,
+                &mut out.quaternion,
+                &mut out.lms,
+                &mut out.pts_3d,
+                dt,
+            );
+            results.push(out);
             let _ = max_fu;
         }
 

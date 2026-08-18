@@ -10,8 +10,9 @@ use osf_ort::{
     center_2x, cosine, crop_box, crop_box_pad, crop_img, decode_landmarks, det_window,
     detect_faces, enhance_bgr, face_crop, imagenet_nchw, iou, max_abs, mean_abs, mean_conf,
     model_path, nme, paste_bgr, pick_lm, read_f32_le, resize_bgr, retina_nchw, rss, synth_canvas,
-    xywh_iou, AdaptiveCfg, AdaptiveState, BgrImage, CropTrack, DetWindow, Device, EnhanceCfg,
-    GpuTracker, Latency, LmSpec, OrtModel, TensorF16, EYE_IDX, FAST_LM, VERSION,
+    unwrap_deg, xywh_iou, AdaptiveCfg, AdaptiveState, BgrImage, CropTrack, DetWindow, Device,
+    EnhanceCfg, FilterCfg, FilterKind, GpuTracker, Latency, LmSpec, OrtModel, OutputFilter,
+    TensorF16, Tracker, TrackerConfig, EYE_IDX, FAST_LM, VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -32,7 +33,7 @@ struct Args {
     /// cpu | gpu (CoreML on Apple, CUDA on NVIDIA)
     #[arg(long, default_value = "cpu")]
     device: String,
-    /// micro | realistic | all | scale | enhance | crop
+    /// micro | realistic | all | scale | enhance | crop | filter
     #[arg(long, default_value = "micro")]
     suite: String,
     #[arg(long)]
@@ -177,6 +178,11 @@ fn main() -> Result<()> {
     if args.suite == "crop" {
         let path = args.out.clone().unwrap_or_else(default_crop_out);
         run_crop_suite(&args, spec, device, &path)?;
+        return Ok(());
+    }
+    if args.suite == "filter" {
+        let path = args.out.clone().unwrap_or_else(default_filter_out);
+        run_filter_suite(&args, spec, device, &path)?;
         return Ok(());
     }
     let run_micro = args.suite == "micro" || args.suite == "all";
@@ -1032,6 +1038,10 @@ fn default_enhance_out() -> PathBuf {
 
 fn default_crop_out() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../benchmarks/out/crop_sweep.json")
+}
+
+fn default_filter_out() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../benchmarks/out/filter.json")
 }
 
 const SCALE_FRACS: [f32; 7] = [0.10, 0.14, 0.20, 0.28, 0.36, 0.48, 0.60];
@@ -2043,6 +2053,403 @@ fn run_crop_suite(args: &Args, _spec: LmSpec, device: Device, out: &Path) -> Res
     }
     let report = CropReport {
         frames: n,
+        scenes: scores,
+    };
+    if let Some(dir) = out.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    fs::write(out, serde_json::to_string_pretty(&report)?)?;
+    eprintln!("wrote {}", out.display());
+    Ok(())
+}
+
+#[derive(Clone)]
+struct RawTrack {
+    euler: [f32; 3],
+    translation: [f32; 3],
+    quaternion: [f32; 4],
+    lms: Vec<[f32; 3]>,
+    pts_3d: [[f32; 3]; 70],
+    hit: bool,
+    e2e_ms: f64,
+}
+
+#[derive(Serialize)]
+struct FilterSceneScore {
+    scene: String,
+    filter: String,
+    jitter_euler: f32,
+    jitter_center: f32,
+    lag_frames: f32,
+    nme_vs_teacher: f32,
+    pose_rmse: f32,
+    filter_us: f64,
+    e2e_p50_ms: f64,
+    hits: usize,
+    frames: usize,
+}
+
+#[derive(Serialize)]
+struct FilterReport {
+    frames: usize,
+    dt: f32,
+    static_jitter_drop: f32,
+    noisy_nme_ratio: f32,
+    step_lag_extra: f32,
+    filter_us: f64,
+    scenes: Vec<FilterSceneScore>,
+}
+
+fn open_filter_tracker(args: &Args, w: u32, h: u32) -> Result<Tracker> {
+    Tracker::new(TrackerConfig {
+        width: w,
+        height: h,
+        model_type: 3,
+        threshold: Some(0.1),
+        detection_threshold: 0.5,
+        max_threads: args.threads.max(1),
+        silent: true,
+        model_dir: Some(args.models_dir.clone()),
+        no_gaze: true,
+        max_feature_updates: 900.0,
+        static_model: true,
+        filter: FilterKind::None,
+        discard_after: 60,
+        scan_every: 3,
+        ..TrackerConfig::default()
+    })
+}
+
+fn capture_raw(tracker: &mut Tracker, seq: &ScaleSeq) -> Result<Vec<RawTrack>> {
+    tracker.set_size(SCALE_W, SCALE_H);
+    let mut out = Vec::with_capacity(seq.frames.len());
+    for frame in &seq.frames {
+        let t0 = Instant::now();
+        let faces = tracker.predict(frame);
+        let e2e_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        if let Some(f) = faces.first() {
+            out.push(RawTrack {
+                euler: f.euler,
+                translation: f.translation,
+                quaternion: f.quaternion,
+                lms: f.lms.clone(),
+                pts_3d: f.pts_3d,
+                hit: true,
+                e2e_ms,
+            });
+        } else {
+            out.push(RawTrack {
+                euler: [0.0; 3],
+                translation: [0.0; 3],
+                quaternion: [0.0, 0.0, 0.0, 1.0],
+                lms: Vec::new(),
+                pts_3d: [[0.0; 3]; 70],
+                hit: false,
+                e2e_ms,
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn replay_filter(raw: &[RawTrack], cfg: FilterCfg, dt: f32) -> (Vec<RawTrack>, f64) {
+    let mut flt = OutputFilter::new(cfg);
+    let t0 = Instant::now();
+    let mut out = Vec::with_capacity(raw.len());
+    for r in raw {
+        let mut s = r.clone();
+        if s.hit {
+            flt.apply(
+                &mut s.euler,
+                &mut s.translation,
+                &mut s.quaternion,
+                &mut s.lms,
+                &mut s.pts_3d,
+                dt,
+            );
+        } else {
+            flt.reset();
+        }
+        out.push(s);
+    }
+    let us = t0.elapsed().as_secs_f64() * 1e6 / raw.len().max(1) as f64;
+    (out, us)
+}
+
+fn lms_center(lms: &[[f32; 3]]) -> [f32; 2] {
+    let n = lms.len().min(66);
+    if n == 0 {
+        return [0.0, 0.0];
+    }
+    let s = n as f32;
+    [
+        lms.iter().take(n).map(|p| p[0]).sum::<f32>() / s,
+        lms.iter().take(n).map(|p| p[1]).sum::<f32>() / s,
+    ]
+}
+
+fn euler_delta(a: [f32; 3], b: [f32; 3]) -> f32 {
+    let d0 = unwrap_deg(a[0], b[0]) - a[0];
+    let d1 = unwrap_deg(a[1], b[1]) - a[1];
+    let d2 = unwrap_deg(a[2], b[2]) - a[2];
+    (d0 * d0 + d1 * d1 + d2 * d2).sqrt()
+}
+
+fn jitter_of(rows: &[RawTrack]) -> (f32, f32) {
+    let mut eul = Vec::new();
+    let mut ctr = Vec::new();
+    let mut prev: Option<&RawTrack> = None;
+    for r in rows {
+        if !r.hit {
+            prev = None;
+            continue;
+        }
+        if let Some(p) = prev {
+            eul.push(euler_delta(p.euler, r.euler));
+            let a = lms_center(&p.lms);
+            let b = lms_center(&r.lms);
+            ctr.push((a[0] - b[0]).hypot(a[1] - b[1]));
+        }
+        prev = Some(r);
+    }
+    (mean_f32(&eul).unwrap_or(0.0), mean_f32(&ctr).unwrap_or(0.0))
+}
+
+fn nme_pose(pred: &[RawTrack], teacher: &[RawTrack]) -> (f32, f32) {
+    let mut nmes = Vec::new();
+    let mut poses = Vec::new();
+    for (p, t) in pred.iter().zip(teacher) {
+        if p.hit && t.hit && p.lms.len() >= 46 && t.lms.len() >= 46 {
+            if let Some(v) = nme(&p.lms, &t.lms) {
+                nmes.push(v);
+            }
+            poses.push(euler_delta(t.euler, p.euler));
+        }
+    }
+    (
+        mean_f32(&nmes).unwrap_or(0.0),
+        mean_f32(&poses).unwrap_or(0.0),
+    )
+}
+
+fn lag_frames(raw: &[RawTrack], filt: &[RawTrack]) -> f32 {
+    let n = raw.len();
+    if n < 8 {
+        return 0.0;
+    }
+    let mid = n / 2;
+    let xs: Vec<f32> = raw.iter().map(|r| lms_center(&r.lms)[1]).collect();
+    let ys: Vec<f32> = filt.iter().map(|r| lms_center(&r.lms)[1]).collect();
+    let pre = median_f32(&xs[..mid]);
+    let post = median_f32(&xs[mid..]);
+    let span = (post - pre).abs();
+    if span < 8.0 {
+        return 0.0;
+    }
+    let target = pre + 0.5 * (post - pre);
+    let rising = post > pre;
+    let cross = |v: &[f32]| {
+        v.iter()
+            .enumerate()
+            .skip(mid.saturating_sub(1))
+            .find(|(_, y)| if rising { **y >= target } else { **y <= target })
+            .map(|(i, _)| i as f32)
+            .unwrap_or(n as f32)
+    };
+    (cross(&ys) - cross(&xs)).max(0.0)
+}
+
+fn median_f32(v: &[f32]) -> f32 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    s[s.len() / 2]
+}
+
+fn make_step_seq(face: &BgrImage, face_h: f32, frac: f32, n: usize, dx: f32) -> ScaleSeq {
+    let n = n.max(8);
+    let target = ((SCALE_H as f32 * frac) as u32).max(8);
+    let scale = target as f32 / face_h.max(1.0);
+    let fw = ((face.width as f32 * scale) as u32).max(8);
+    let fh = ((face.height as f32 * scale) as u32).max(8);
+    let resized = resize_bgr(face, fw, fh);
+    let mut frames = Vec::with_capacity(n);
+    let mid = n / 2;
+    for i in 0..n {
+        let extra = if i >= mid { dx } else { 0.0 };
+        let x = (SCALE_W as i32 - fw as i32) / 2 + extra as i32;
+        let y = (SCALE_H as i32 - fh as i32) / 2;
+        let mut canvas = synth_canvas(SCALE_W, SCALE_H);
+        paste_bgr(&mut canvas, &resized, x, y);
+        frames.push(canvas);
+    }
+    ScaleSeq {
+        face_frac: frac,
+        frames,
+    }
+}
+
+fn print_filter_row(s: &FilterSceneScore) {
+    eprintln!(
+        "  {:8} {:10} jitter_e={:.3} jitter_c={:.3} lag={:.1} nme={:.4} pose={:.3} filt={:.1}us e2e={:.2}ms rec={:.2}",
+        s.scene,
+        s.filter,
+        s.jitter_euler,
+        s.jitter_center,
+        s.lag_frames,
+        s.nme_vs_teacher,
+        s.pose_rmse,
+        s.filter_us,
+        s.e2e_p50_ms,
+        s.hits as f32 / s.frames.max(1) as f32
+    );
+}
+
+fn run_filter_suite(args: &Args, _spec: LmSpec, device: Device, out: &Path) -> Result<()> {
+    let mut pipe = open_cpu_pipe(args, LmSpec::from_type(3)?, false)?;
+    let seed = BgrImage::load(&args.image)?;
+    let (tile, face_h) = extract_face_tile(&mut pipe, &seed)?;
+    let n = args.frames.max(30);
+    let dt = 1.0 / 30.0;
+    eprintln!(
+        "filter: seed face_h={face_h:.1}px, {n} frames/scene ({})",
+        device.as_str()
+    );
+
+    let mut static_clean = make_scale_seq_n(&tile, face_h, 0.20, n, false);
+    if let Some(first) = static_clean.frames.first().cloned() {
+        static_clean.frames = vec![first; n];
+    }
+    let static_seq = ScaleSeq {
+        face_frac: static_clean.face_frac,
+        frames: static_clean
+            .frames
+            .iter()
+            .enumerate()
+            .map(|(i, f)| degrade_noise(f, 16.0, 0x51A71C ^ (i as u32 * 131)))
+            .collect(),
+    };
+    let wander = make_scale_seq_n(&tile, face_h, 0.20, n, true);
+    let far = make_scale_seq_n(&tile, face_h, 0.08, n, true);
+    let noisy = ScaleSeq {
+        face_frac: wander.face_frac,
+        frames: wander
+            .frames
+            .iter()
+            .enumerate()
+            .map(|(i, f)| degrade_noise(f, 34.0, 0xC0FFEE ^ (i as u32 * 997)))
+            .collect(),
+    };
+    let step = make_step_seq(&tile, face_h, 0.20, n, 160.0);
+    let static_teacher_seq = static_clean;
+    let scenes: [(&str, ScaleSeq); 5] = [
+        ("static", static_seq),
+        ("wander", wander),
+        ("far", far),
+        ("noisy", noisy),
+        ("step", step),
+    ];
+
+    let kinds: [(&str, FilterCfg); 2] = [
+        ("none", FilterCfg::default()),
+        ("one-euro", FilterCfg::new(FilterKind::OneEuro, 1.0, 0.007)),
+    ];
+
+    let mut scores = Vec::new();
+    for (scene_name, seq) in &scenes {
+        let mut tracker = open_filter_tracker(args, SCALE_W, SCALE_H)?;
+        let raw = capture_raw(&mut tracker, seq)?;
+        let teacher = if *scene_name == "noisy" {
+            let mut t = open_filter_tracker(args, SCALE_W, SCALE_H)?;
+            let clean = scenes
+                .iter()
+                .find(|(n, _)| *n == "wander")
+                .map(|(_, s)| s)
+                .unwrap();
+            capture_raw(&mut t, clean)?
+        } else if *scene_name == "static" {
+            let mut t = open_filter_tracker(args, SCALE_W, SCALE_H)?;
+            capture_raw(&mut t, &static_teacher_seq)?
+        } else {
+            raw.clone()
+        };
+        let e2e = Latency::from_samples(0, &raw.iter().map(|r| r.e2e_ms).collect::<Vec<_>>());
+        for (fname, cfg) in &kinds {
+            let (filt, filter_us) = if *fname == "none" {
+                (raw.clone(), 0.0)
+            } else {
+                replay_filter(&raw, *cfg, dt)
+            };
+            let (je, jc) = jitter_of(&filt);
+            let (nme_t, pose) = nme_pose(&filt, &teacher);
+            let lag = if *scene_name == "step" {
+                lag_frames(&raw, &filt)
+            } else {
+                0.0
+            };
+            let sc = FilterSceneScore {
+                scene: (*scene_name).into(),
+                filter: (*fname).into(),
+                jitter_euler: je,
+                jitter_center: jc,
+                lag_frames: lag,
+                nme_vs_teacher: nme_t,
+                pose_rmse: pose,
+                filter_us,
+                e2e_p50_ms: e2e.p50_ms,
+                hits: filt.iter().filter(|r| r.hit).count(),
+                frames: filt.len(),
+            };
+            print_filter_row(&sc);
+            scores.push(sc);
+        }
+    }
+
+    let pick = |scene: &str, filt: &str, f: fn(&FilterSceneScore) -> f32| -> f32 {
+        scores
+            .iter()
+            .find(|s| s.scene == scene && s.filter == filt)
+            .map(f)
+            .unwrap_or(0.0)
+    };
+    let none_j = pick("static", "none", |s| s.jitter_euler.max(s.jitter_center));
+    let euro_j = pick("static", "one-euro", |s| {
+        s.jitter_euler.max(s.jitter_center)
+    });
+    let drop = if none_j > 1e-6 {
+        (none_j - euro_j) / none_j
+    } else {
+        0.0
+    };
+    let none_nme = pick("noisy", "none", |s| s.nme_vs_teacher);
+    let euro_nme = pick("noisy", "one-euro", |s| s.nme_vs_teacher);
+    let nme_ratio = if none_nme > 1e-6 {
+        euro_nme / none_nme
+    } else {
+        1.0
+    };
+    let none_lag = pick("step", "none", |s| s.lag_frames);
+    let euro_lag = pick("step", "one-euro", |s| s.lag_frames);
+    let lag_extra = (euro_lag - none_lag).max(0.0);
+    let filter_us = scores
+        .iter()
+        .filter(|s| s.filter == "one-euro")
+        .map(|s| s.filter_us)
+        .fold(0.0, f64::max);
+    eprintln!(
+        "one-euro vs none: drop={:.1}% nme_ratio={nme_ratio:.3} lag_extra={lag_extra:.1} filt={filter_us:.1}us",
+        drop * 100.0
+    );
+
+    let report = FilterReport {
+        frames: n,
+        dt,
+        static_jitter_drop: drop,
+        noisy_nme_ratio: nme_ratio,
+        step_lag_extra: lag_extra,
+        filter_us,
         scenes: scores,
     };
     if let Some(dir) = out.parent() {

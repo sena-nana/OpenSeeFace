@@ -7,6 +7,7 @@ mod decode;
 mod enhance;
 mod enhance_gpu;
 mod features;
+mod filter;
 mod gaze;
 mod geom;
 mod gpu_pre;
@@ -31,6 +32,7 @@ pub use decode::{
 };
 pub use enhance::{enhance_bgr, enhance_bgr_in_place, EnhanceCfg, HeMode};
 pub use features::FEATURE_NAMES;
+pub use filter::{unwrap_deg, FilterCfg, FilterKind, OutputFilter};
 pub use geom::xywh_iou;
 pub use gpu_pre::GpuTracker;
 pub use metrics::{cosine, max_abs, mean_abs, model_path, read_f32_le, rss, Latency, Rss};

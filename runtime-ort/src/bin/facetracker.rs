@@ -6,7 +6,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use osf_ort::{
     draw_tracking, dump_symmetric_points, encode_faces, list_cameras, mirror_bgr, model_base_path,
-    FacePacket, InputSource, Tracker, TrackerConfig, VideoOut, VizWindow, PACKET_FRAME_SIZE,
+    FacePacket, FilterKind, InputSource, Tracker, TrackerConfig, VideoOut, VizWindow,
+    PACKET_FRAME_SIZE,
 };
 
 #[derive(Parser, Debug)]
@@ -74,6 +75,13 @@ struct Args {
     repeat_video: i32,
     #[arg(long, default_value = "")]
     dump_points: String,
+    /// Output post-process: none | one-euro
+    #[arg(long, default_value = "one-euro")]
+    filter: String,
+    #[arg(long, default_value_t = 1.0)]
+    filter_mincutoff: f32,
+    #[arg(long, default_value_t = 0.007)]
+    filter_beta: f32,
     #[arg(long, default_value_t = 0, hide = true)]
     benchmark: i32,
     /// OpenSeeLauncher sends this with `--benchmark`; ignored.
@@ -108,6 +116,7 @@ fn main() -> Result<()> {
     )?;
     let sock = UdpSocket::bind("0.0.0.0:0").context("udp bind")?;
     let dest = format!("{}:{}", args.ip, args.port);
+    let filter: FilterKind = args.filter.parse().context("--filter")?;
     let pace =
         (args.fps > 0 && !input.is_video).then(|| Duration::from_secs_f64(1.0 / args.fps as f64));
 
@@ -161,6 +170,9 @@ fn main() -> Result<()> {
                 max_feature_updates: args.max_feature_updates,
                 static_model: args.no_3d_adapt == 1,
                 try_hard: args.try_hard == 1,
+                filter,
+                filter_mincutoff: args.filter_mincutoff,
+                filter_beta: args.filter_beta,
                 ..TrackerConfig::default()
             })?);
             if args.visualize != 0 {
@@ -287,6 +299,7 @@ fn run_benchmark(args: &Args) -> Result<()> {
             detection_threshold: 0.1,
             max_feature_updates: 900.0,
             static_model: args.no_3d_adapt == 1,
+            filter: FilterKind::None,
             ..TrackerConfig::default()
         })?;
         let mut total = 0.0;

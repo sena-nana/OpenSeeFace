@@ -42,6 +42,7 @@ Webcam or video with the built-in overlay (no Unity required):
 * Lower tracking quality mainly means more rigid tracking, making it harder to detect blinking and eyebrow motion.
 * Depending on the frame rate, face tracking can easily use up a whole CPU core. At 30fps for a single face, it should still use less than 100% of one core on a decent CPU. If tracking uses too much CPU, try lowering the frame rate. A frame rate of 20 is probably fine and anything above 30 should rarely be necessary.
 * Once all `--faces` slots are filled, full-frame detection is skipped. The next crop comes from the previous frame's landmarks (eyes+nose fit). Detection runs again only after a lost face, or every `--scan-every` frames when fewer faces are tracked than `--faces`. Set `--faces` no higher than the number of faces you are actually tracking.
+* `--filter` (default `one-euro`) smooths UDP pose and 2D landmarks after PnP. Crop tracking and expression features are unchanged. `--filter none` keeps raw measurements. If Unity `OpenSeeIKTarget.smooth` is also on, lower it to 0–0.1 to avoid double smoothing. A/B notes: [benchmarks/filter-eval.md](benchmarks/filter-eval.md).
 
 # Unity compatibility
 
@@ -126,6 +127,10 @@ Face-size adaptive tracking: CPU zooms the 224 detector on small faces and switc
 Next-frame crop uses an eyes+nose similarity fit. After a face is locked, that crop is reused and the 224 detector is not run (`osf-bench --suite crop`):
 
     cargo run --release --manifest-path runtime-ort/Cargo.toml --bin osf-bench -- --suite crop --model 3 --threads 4
+
+Output post-process (`none` vs default `one-euro`) on the same raw pose and landmarks (`osf-bench --suite filter`). Decision notes: [benchmarks/filter-eval.md](benchmarks/filter-eval.md).
+
+    cargo run --release --manifest-path runtime-ort/Cargo.toml --bin osf-bench -- --suite filter --model 3 --threads 4
 
 # References
 
