@@ -2,6 +2,8 @@
 
 mod adaptive;
 mod decode;
+mod enhance;
+mod enhance_gpu;
 mod gpu_pre;
 mod metrics;
 mod preprocess;
@@ -14,6 +16,7 @@ pub use adaptive::{
 pub use decode::{
     decode_landmarks, detect_faces, landmark_bbox, mean_conf, LmSpec, TensorF16, EYE_IDX,
 };
+pub use enhance::{enhance_bgr, enhance_bgr_in_place, EnhanceCfg, HeMode};
 pub use gpu_pre::GpuTracker;
 pub use metrics::{cosine, max_abs, mean_abs, model_path, read_f32_le, rss, Latency, Rss};
 pub use preprocess::{

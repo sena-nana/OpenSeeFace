@@ -8,10 +8,10 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use osf_ort::{
     center_2x, cosine, crop_box, crop_box_pad, crop_img, decode_landmarks, det_window,
-    detect_faces, face_crop, imagenet_nchw, iou, landmark_bbox, max_abs, mean_abs, mean_conf,
-    model_path, nme, paste_bgr, pick_lm, read_f32_le, resize_bgr, retina_nchw, rss, synth_canvas,
-    AdaptiveCfg, AdaptiveState, BgrImage, DetWindow, Device, GpuTracker, Latency, LmSpec, OrtModel,
-    TensorF16, EYE_IDX, FAST_LM, VERSION,
+    detect_faces, enhance_bgr, face_crop, imagenet_nchw, iou, landmark_bbox, max_abs, mean_abs,
+    mean_conf, model_path, nme, paste_bgr, pick_lm, read_f32_le, resize_bgr, retina_nchw, rss,
+    synth_canvas, AdaptiveCfg, AdaptiveState, BgrImage, DetWindow, Device, EnhanceCfg, GpuTracker,
+    Latency, LmSpec, OrtModel, TensorF16, EYE_IDX, FAST_LM, VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -32,7 +32,7 @@ struct Args {
     /// cpu | gpu (CoreML on Apple, CUDA on NVIDIA)
     #[arg(long, default_value = "cpu")]
     device: String,
-    /// micro | realistic | all | scale
+    /// micro | realistic | all | scale | enhance
     #[arg(long, default_value = "micro")]
     suite: String,
     #[arg(long)]
@@ -44,6 +44,23 @@ struct Args {
     /// CPU: zoomed detector ROI + 112/224 landmark ladder. GPU: ROI detect only.
     #[arg(long, default_value_t = false)]
     adaptive: bool,
+    /// Gray-world WB + CLAHE/AHE before detect/landmarks. Off keeps Python tensor parity.
+    /// When set, uses per-frame auto policy (dark/backlight/overexp/noise/cast).
+    #[arg(long, default_value_t = false)]
+    enhance: bool,
+    /// Frames per lighting scene in `--suite enhance` (probes still use 8).
+    #[arg(long, default_value_t = 50)]
+    frames: usize,
+}
+
+impl Args {
+    fn enhance_cfg(&self) -> EnhanceCfg {
+        if self.enhance {
+            EnhanceCfg::auto()
+        } else {
+            EnhanceCfg::off()
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -150,6 +167,11 @@ fn main() -> Result<()> {
     if args.suite == "scale" {
         let path = args.out.clone().unwrap_or_else(default_scale_out);
         run_scale_suite(&args, spec, device, &path)?;
+        return Ok(());
+    }
+    if args.suite == "enhance" {
+        let path = args.out.clone().unwrap_or_else(default_enhance_out);
+        run_enhance_suite(&args, spec, device, &path)?;
         return Ok(());
     }
     let run_micro = args.suite == "micro" || args.suite == "all";
@@ -319,6 +341,13 @@ fn pipeline(args: &Args, frame: &BgrImage, spec: LmSpec, device: Device) -> Resu
 }
 
 fn cpu_pipeline(args: &Args, frame: &BgrImage, spec: LmSpec, device: Device) -> Result<Pipeline> {
+    let enhanced;
+    let frame = if args.enhance {
+        enhanced = enhance_bgr(frame, &args.enhance_cfg());
+        &enhanced
+    } else {
+        frame
+    };
     let mut det = OrtModel::open(
         model_path(&args.models_dir, "mnv3_detection_opt.onnx"),
         args.threads,
@@ -392,7 +421,13 @@ fn cpu_pipeline(args: &Args, frame: &BgrImage, spec: LmSpec, device: Device) -> 
 }
 
 fn gpu_pipeline(args: &Args, frame: &BgrImage, spec: LmSpec) -> Result<Pipeline> {
-    let mut tracker = GpuTracker::open(&args.models_dir, spec, args.threads, frame)?;
+    let mut tracker = GpuTracker::with_enhance(
+        &args.models_dir,
+        spec,
+        args.threads,
+        frame,
+        args.enhance_cfg(),
+    )?;
     let mut dets = tracker.detect(frame)?;
     if let Some(d) = dets.first() {
         let _ = tracker.landmarks(frame, d, spec, 0.1, 0.125)?;
@@ -566,7 +601,15 @@ fn one_frame(
     do_detect: bool,
     do_gaze: bool,
     adaptive: Option<(&AdaptiveCfg, &mut AdaptiveState)>,
+    enhance: EnhanceCfg,
 ) -> Result<Row> {
+    let enhanced;
+    let frame = if gpu.is_none() && !enhance.is_off() {
+        enhanced = enhance_bgr(frame, &enhance);
+        &enhanced
+    } else {
+        frame
+    };
     let t_all = Instant::now();
     let mut detect_ms = 0.0;
     let mut det_score = None;
@@ -865,8 +908,17 @@ fn run_scenario_dir(
         let scan_every = meta.scan_every.max(1);
         let do_gaze = meta.gaze && gaze.is_some();
         let mut gpu = (device == Device::Gpu)
-            .then(|| GpuTracker::open(&args.models_dir, spec, args.threads, &frames[0]))
+            .then(|| {
+                GpuTracker::with_enhance(
+                    &args.models_dir,
+                    spec,
+                    args.threads,
+                    &frames[0],
+                    args.enhance_cfg(),
+                )
+            })
             .transpose()?;
+        let enh = args.enhance_cfg();
         let mut state = cfg.map(AdaptiveState::new);
         let mut step = |box5: Option<[f32; 5]>,
                         frame: &BgrImage,
@@ -887,6 +939,7 @@ fn run_scenario_dir(
                     (Some(c), Some(s)) => Some((c, s)),
                     _ => None,
                 },
+                enh,
             )
         };
         for _ in 0..args.warmup.max(1) {
@@ -953,10 +1006,15 @@ fn default_scale_out() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../benchmarks/out/scale_sweep.json")
 }
 
+fn default_enhance_out() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../benchmarks/out/enhance_sweep.json")
+}
+
 const SCALE_FRACS: [f32; 7] = [0.10, 0.14, 0.20, 0.28, 0.36, 0.48, 0.60];
 const SCALE_W: u32 = 1280;
 const SCALE_H: u32 = 720;
 const SCALE_FRAMES: usize = 8;
+const ENHANCE_PROBE_FRAMES: usize = 8;
 
 #[derive(Clone, Serialize)]
 struct ScaleScore {
@@ -984,6 +1042,7 @@ struct ScaleReport {
     adaptive_per_frac: Vec<FracRow>,
 }
 
+#[derive(Clone)]
 struct ScaleSeq {
     face_frac: f32,
     frames: Vec<BgrImage>,
@@ -1036,16 +1095,25 @@ fn extract_face_tile(pipe: &mut CpuPipe, frame: &BgrImage) -> Result<(BgrImage, 
 }
 
 fn make_scale_seq(face: &BgrImage, face_h: f32, frac: f32) -> ScaleSeq {
+    make_scale_seq_n(face, face_h, frac, SCALE_FRAMES, false)
+}
+
+fn make_scale_seq_n(face: &BgrImage, face_h: f32, frac: f32, n: usize, wander: bool) -> ScaleSeq {
+    let n = n.max(1);
     let target = ((SCALE_H as f32 * frac) as u32).max(8);
     let scale = target as f32 / face_h.max(1.0);
     let fw = ((face.width as f32 * scale) as u32).max(8);
     let fh = ((face.height as f32 * scale) as u32).max(8);
     let resized = resize_bgr(face, fw, fh);
-    let mut frames = Vec::with_capacity(SCALE_FRAMES);
-    for t in 0..SCALE_FRAMES {
+    let mut frames = Vec::with_capacity(n);
+    for t in 0..n {
         let tf = t as f32;
-        let jx = (0.035 * fw as f32).max(4.0) * (tf * 0.7).sin();
-        let jy = (0.025 * fh as f32).max(3.0) * (tf * 0.5).cos();
+        let mut jx = (0.035 * fw as f32).max(4.0) * (tf * 0.7).sin();
+        let mut jy = (0.025 * fh as f32).max(3.0) * (tf * 0.5).cos();
+        if wander {
+            jx += (0.04 * fw as f32) * (tf * 0.13).sin();
+            jy += (0.03 * fh as f32) * (tf * 0.19).cos();
+        }
         let x = (SCALE_W as i32 - fw as i32) / 2 + jx as i32;
         let y = (SCALE_H as i32 - fh as i32) / 2 + jy as i32;
         let mut canvas = synth_canvas(SCALE_W, SCALE_H);
@@ -1069,6 +1137,7 @@ fn run_seq(
     spec: LmSpec,
     seq: &ScaleSeq,
     cfg: Option<&AdaptiveCfg>,
+    enhance: EnhanceCfg,
 ) -> Result<Vec<Row>> {
     let mut state = cfg.copied().map(AdaptiveState::new);
     let mut box5 = None;
@@ -1091,6 +1160,7 @@ fn run_seq(
             true,
             false,
             ad,
+            enhance,
         )?;
         box5 = row.box5;
         rows.push(row);
@@ -1187,24 +1257,31 @@ fn run_scale_suite(args: &Args, _spec: LmSpec, device: Device, out: &Path) -> Re
         device.as_str()
     );
 
+    let enh = args.enhance_cfg();
     let (base_rows, ad_rows) = if device == Device::Gpu {
-        let mut gpu = GpuTracker::open(&args.models_dir, spec, args.threads, &seqs[0].frames[0])?;
+        let mut gpu = GpuTracker::with_enhance(
+            &args.models_dir,
+            spec,
+            args.threads,
+            &seqs[0].frames[0],
+            enh,
+        )?;
         for _ in 0..args.warmup.max(2) {
-            let _ = run_seq(None, Some(&mut gpu), spec, &seqs[0], None)?;
+            let _ = run_seq(None, Some(&mut gpu), spec, &seqs[0], None, enh)?;
         }
         let mut base = Vec::new();
         let mut ad = Vec::new();
         for seq in &seqs {
-            base.push(run_seq(None, Some(&mut gpu), spec, seq, None)?);
-            ad.push(run_seq(None, Some(&mut gpu), spec, seq, Some(&cfg))?);
+            base.push(run_seq(None, Some(&mut gpu), spec, seq, None, enh)?);
+            ad.push(run_seq(None, Some(&mut gpu), spec, seq, Some(&cfg), enh)?);
         }
         (base, ad)
     } else {
         let mut base = Vec::new();
         let mut ad = Vec::new();
         for seq in &seqs {
-            base.push(run_seq(Some(&mut pipe), None, spec, seq, None)?);
-            ad.push(run_seq(Some(&mut pipe), None, spec, seq, Some(&cfg))?);
+            base.push(run_seq(Some(&mut pipe), None, spec, seq, None, enh)?);
+            ad.push(run_seq(Some(&mut pipe), None, spec, seq, Some(&cfg), enh)?);
         }
         (base, ad)
     };
@@ -1231,6 +1308,488 @@ fn run_scale_suite(args: &Args, _spec: LmSpec, device: Device, out: &Path) -> Re
         adaptive,
         baseline_per_frac,
         adaptive_per_frac,
+    };
+    if let Some(dir) = out.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    fs::write(out, serde_json::to_string_pretty(&report)?)?;
+    eprintln!("wrote {}", out.display());
+    Ok(())
+}
+
+fn degrade_gamma(src: &BgrImage, exposure: f32, gamma: f32) -> BgrImage {
+    let mut d = src.clone();
+    for p in &mut d.data {
+        let x = (*p as f32 / 255.0 * exposure).clamp(0.0, 1.0);
+        *p = (x.powf(gamma) * 255.0).round().clamp(0.0, 255.0) as u8;
+    }
+    d
+}
+
+fn degrade_contrast(src: &BgrImage, k: f32) -> BgrImage {
+    let mut d = src.clone();
+    for p in &mut d.data {
+        *p = ((*p as f32 - 128.0) * k + 128.0).round().clamp(0.0, 255.0) as u8;
+    }
+    d
+}
+
+fn degrade_cast(src: &BgrImage, gb: f32, gg: f32, gr: f32) -> BgrImage {
+    let mut d = src.clone();
+    for p in d.data.chunks_exact_mut(3) {
+        p[0] = ((p[0] as f32) * gb).round().clamp(0.0, 255.0) as u8;
+        p[1] = ((p[1] as f32) * gg).round().clamp(0.0, 255.0) as u8;
+        p[2] = ((p[2] as f32) * gr).round().clamp(0.0, 255.0) as u8;
+    }
+    d
+}
+
+fn degrade_backlight(src: &BgrImage, face_exp: f32, bg_gain: f32) -> BgrImage {
+    let mut d = src.clone();
+    let w = d.width as f32;
+    let h = d.height as f32;
+    let cx = w * 0.5;
+    let cy = h * 0.5;
+    let sig = 0.16 * w.min(h);
+    let inv = 1.0 / (2.0 * sig * sig);
+    for y in 0..d.height {
+        for x in 0..d.width {
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            let face = (-(dx * dx + dy * dy) * inv).exp();
+            let g = face * face_exp + (1.0 - face) * bg_gain;
+            let i = ((y * d.width + x) * 3) as usize;
+            for c in 0..3 {
+                d.data[i + c] = ((d.data[i + c] as f32) * g).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    d
+}
+
+fn degrade_noise(src: &BgrImage, sigma: f32, seed: u32) -> BgrImage {
+    let mut d = src.clone();
+    let mut s = seed | 1;
+    for p in &mut d.data {
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        let u = (s as f32 / 4_294_967_296.0).clamp(1e-6, 1.0);
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        let v = s as f32 / 4_294_967_296.0;
+        let n = (-2.0 * u.ln()).sqrt() * (std::f32::consts::TAU * v).cos() * sigma;
+        *p = (*p as f32 + n).round().clamp(0.0, 255.0) as u8;
+    }
+    d
+}
+
+fn map_seq(seq: &ScaleSeq, f: impl Fn(&BgrImage) -> BgrImage) -> ScaleSeq {
+    ScaleSeq {
+        face_frac: seq.face_frac,
+        frames: seq.frames.iter().map(f).collect(),
+    }
+}
+
+fn map_seq_i(seq: &ScaleSeq, f: impl Fn(usize, &BgrImage) -> BgrImage) -> ScaleSeq {
+    ScaleSeq {
+        face_frac: seq.face_frac,
+        frames: seq
+            .frames
+            .iter()
+            .enumerate()
+            .map(|(i, fr)| f(i, fr))
+            .collect(),
+    }
+}
+
+#[derive(Clone, Serialize)]
+struct SceneRow {
+    nme: f32,
+    recall: f32,
+}
+
+#[derive(Clone, Serialize)]
+struct EnhanceTrial {
+    name: String,
+    cfg: EnhanceCfg,
+    scenes: HashMap<String, SceneRow>,
+    e2e_p50_ms: f64,
+    score: f32,
+}
+
+#[derive(Serialize)]
+struct SceneProbe {
+    name: String,
+    detail: String,
+    off_recall: f32,
+}
+
+#[derive(Serialize)]
+struct EnhanceReport {
+    face_frac: f32,
+    frames: usize,
+    dark_exposure: f32,
+    dark_gamma: f32,
+    probes: Vec<SceneProbe>,
+    winner: EnhanceCfg,
+    winner_name: String,
+    baseline: EnhanceTrial,
+    trials: Vec<EnhanceTrial>,
+}
+
+fn trial_score(t: &EnhanceTrial, base: &EnhanceTrial) -> f32 {
+    let rec = |n: &str| t.scenes.get(n).map(|s| s.recall).unwrap_or(0.0);
+    let nme = |n: &str| t.scenes.get(n).map(|s| s.nme).unwrap_or(1.0);
+    let brec = |n: &str| base.scenes.get(n).map(|s| s.recall).unwrap_or(0.0);
+    if rec("clean") + 0.01 < brec("clean") {
+        return -1.0e9;
+    }
+    let hard = ["dark", "over", "back", "noise", "lowcon"];
+    let rec_gain: f32 = hard.iter().map(|n| rec(n) - brec(n)).sum();
+    rec_gain * 12.0 + hard.iter().map(|n| rec(n)).sum::<f32>() * 4.0 + rec("clean")
+        - [
+            "clean", "dark", "over", "back", "noise", "lowcon", "warm", "cool",
+        ]
+        .iter()
+        .map(|n| nme(n))
+        .sum::<f32>()
+}
+
+fn score_seq(
+    cpu: Option<&mut CpuPipe>,
+    gpu: Option<&mut GpuTracker>,
+    spec: LmSpec,
+    seq: &ScaleSeq,
+    teacher: &[Vec<TeachFrame>],
+    enhance: EnhanceCfg,
+) -> Result<(f32, f32, f64)> {
+    let rows = run_seq(cpu, gpu, spec, seq, None, enhance)?;
+    let (s, _) = score_against_teacher(
+        &[ScaleSeq {
+            face_frac: seq.face_frac,
+            frames: seq.frames.clone(),
+        }],
+        &[rows],
+        teacher,
+    );
+    Ok((s.nme, s.recall, s.e2e_p50_ms))
+}
+
+fn eval_cfg(
+    args: &Args,
+    spec: LmSpec,
+    device: Device,
+    pipe: &mut CpuPipe,
+    seqs: &[(&'static str, ScaleSeq)],
+    teacher: &[Vec<TeachFrame>],
+    name: &str,
+    cfg: EnhanceCfg,
+) -> Result<EnhanceTrial> {
+    let mut scenes = HashMap::new();
+    let mut e2e_p50_ms = 0.0;
+    if device == Device::Gpu {
+        let mut gpu = GpuTracker::with_enhance(
+            &args.models_dir,
+            spec,
+            args.threads,
+            &seqs[0].1.frames[0],
+            cfg,
+        )?;
+        for (i, (n, seq)) in seqs.iter().enumerate() {
+            let (nme, recall, e2e) = score_seq(None, Some(&mut gpu), spec, seq, teacher, cfg)?;
+            if i == 0 {
+                e2e_p50_ms = e2e;
+            }
+            scenes.insert((*n).to_string(), SceneRow { nme, recall });
+        }
+    } else {
+        for (i, (n, seq)) in seqs.iter().enumerate() {
+            let (nme, recall, e2e) = score_seq(Some(pipe), None, spec, seq, teacher, cfg)?;
+            if i == 0 {
+                e2e_p50_ms = e2e;
+            }
+            scenes.insert((*n).to_string(), SceneRow { nme, recall });
+        }
+    }
+    Ok(EnhanceTrial {
+        name: name.to_string(),
+        cfg,
+        scenes,
+        e2e_p50_ms,
+        score: 0.0,
+    })
+}
+
+fn seq_recall(
+    pipe: &mut CpuPipe,
+    spec: LmSpec,
+    seq: &ScaleSeq,
+    enhance: EnhanceCfg,
+) -> Result<f32> {
+    let rows = run_seq(Some(pipe), None, spec, seq, None, enhance)?;
+    let hits = rows.iter().filter(|r| r.faces > 0).count();
+    Ok(hits as f32 / rows.len().max(1) as f32)
+}
+
+#[derive(Clone, Copy)]
+struct DarkLight {
+    frac: f32,
+    exposure: f32,
+    gamma: f32,
+    off_recall: f32,
+}
+
+fn pick_dark_lighting(
+    pipe: &mut CpuPipe,
+    spec: LmSpec,
+    face: &BgrImage,
+    face_h: f32,
+    probe_n: usize,
+) -> Result<DarkLight> {
+    const GAMMA: f32 = 1.7;
+    let mut fallback: Option<DarkLight> = None;
+    for frac in [0.20f32, 0.14, 0.10] {
+        let clean = make_scale_seq_n(face, face_h, frac, probe_n, false);
+        for exp in [0.40f32, 0.32, 0.26, 0.22, 0.16, 0.12, 0.09, 0.06] {
+            let dark = map_seq(&clean, |f| degrade_gamma(f, exp, GAMMA));
+            let rec = seq_recall(pipe, spec, &dark, EnhanceCfg::off())?;
+            eprintln!("  probe frac={frac:.2} exp={exp:.2} γ={GAMMA} off_rec={rec:.3}");
+            let lit = DarkLight {
+                frac,
+                exposure: exp,
+                gamma: GAMMA,
+                off_recall: rec,
+            };
+            let worse = match &fallback {
+                None => true,
+                Some(b) => rec < b.off_recall - 1e-6,
+            };
+            if worse {
+                fallback = Some(lit);
+            }
+            if rec < 0.5 {
+                return Ok(lit);
+            }
+        }
+    }
+    fallback.ok_or_else(|| anyhow::anyhow!("no dark probe frames"))
+}
+
+fn probe_param<T: Copy>(
+    pipe: &mut CpuPipe,
+    spec: LmSpec,
+    clean: &ScaleSeq,
+    name: &'static str,
+    levels: &[T],
+    apply: impl Fn(&BgrImage, T) -> BgrImage,
+    label: impl Fn(T) -> String,
+) -> Result<(T, SceneProbe)> {
+    let mut fallback: Option<(T, SceneProbe)> = None;
+    for &lv in levels {
+        let seq = map_seq(clean, |f| apply(f, lv));
+        let rec = seq_recall(pipe, spec, &seq, EnhanceCfg::off())?;
+        let detail = label(lv);
+        eprintln!("  probe {name} {detail} off_rec={rec:.3}");
+        let probe = SceneProbe {
+            name: name.to_string(),
+            detail,
+            off_recall: rec,
+        };
+        let worse = match &fallback {
+            None => true,
+            Some((_, b)) => rec < b.off_recall - 1e-6,
+        };
+        if worse {
+            fallback = Some((lv, probe));
+        }
+        if rec < 0.5 {
+            return Ok(fallback.unwrap());
+        }
+    }
+    fallback.ok_or_else(|| anyhow::anyhow!("no {name} probe frames"))
+}
+
+fn fmt_row(t: &EnhanceTrial, name: &str) -> String {
+    t.scenes
+        .get(name)
+        .map(|s| format!("rec={:.3} nme={:.4}", s.recall, s.nme))
+        .unwrap_or_else(|| "-".into())
+}
+
+fn run_enhance_suite(args: &Args, _spec: LmSpec, device: Device, out: &Path) -> Result<()> {
+    let spec = LmSpec::from_type(3)?;
+    let mut pipe = open_cpu_pipe(args, spec, false)?;
+    let seed = BgrImage::load(&args.image)?;
+    let (tile, face_h) = extract_face_tile(&mut pipe, &seed)?;
+    let n = args.frames.max(1);
+    let probe_n = n.min(ENHANCE_PROBE_FRAMES);
+    eprintln!(
+        "enhance: seed face_h={face_h:.1}px, {n} frames/scene (probe {probe_n}) ({})",
+        device.as_str()
+    );
+    let lit = pick_dark_lighting(&mut pipe, spec, &tile, face_h, probe_n)?;
+    let clean = make_scale_seq_n(&tile, face_h, lit.frac, n, true);
+    let probe_clean = ScaleSeq {
+        face_frac: clean.face_frac,
+        frames: clean.frames[..probe_n.min(clean.frames.len())].to_vec(),
+    };
+    eprintln!(
+        "enhance: frac={:.2} dark exp={:.2} γ={:.1} (probe off rec={:.3})",
+        lit.frac, lit.exposure, lit.gamma, lit.off_recall
+    );
+
+    let (over_g, over_p) = probe_param(
+        &mut pipe,
+        spec,
+        &probe_clean,
+        "over",
+        &[1.35f32, 1.55, 1.75, 2.1, 2.6, 3.4],
+        |f, g| degrade_gamma(f, g, 0.85),
+        |g| format!("gain={g:.2} γ=0.85"),
+    )?;
+    let (back_lv, back_p) = probe_param(
+        &mut pipe,
+        spec,
+        &probe_clean,
+        "back",
+        &[
+            (0.55f32, 2.2f32),
+            (0.45, 2.8),
+            (0.36, 3.6),
+            (0.28, 4.6),
+            (0.20, 5.8),
+        ],
+        |f, (fe, bg)| degrade_backlight(f, fe, bg),
+        |(fe, bg)| format!("face={fe:.2} bg={bg:.1}"),
+    )?;
+    let (noise_s, noise_p) = probe_param(
+        &mut pipe,
+        spec,
+        &probe_clean,
+        "noise",
+        &[16.0f32, 24.0, 34.0, 46.0, 60.0, 78.0],
+        |f, s| degrade_noise(f, s, 0xC0FFEE),
+        |s| format!("σ={s:.0}"),
+    )?;
+
+    let teacher_rows = run_seq(Some(&mut pipe), None, spec, &clean, None, EnhanceCfg::off())?;
+    let teacher = vec![rows_to_teacher(teacher_rows)];
+    let seqs: Vec<(&'static str, ScaleSeq)> = vec![
+        ("clean", clean.clone()),
+        (
+            "dark",
+            map_seq(&clean, |f| degrade_gamma(f, lit.exposure, lit.gamma)),
+        ),
+        ("over", map_seq(&clean, |f| degrade_gamma(f, over_g, 0.85))),
+        (
+            "back",
+            map_seq(&clean, |f| degrade_backlight(f, back_lv.0, back_lv.1)),
+        ),
+        (
+            "noise",
+            map_seq_i(&clean, |i, f| {
+                degrade_noise(f, noise_s, 0xC0FFEE ^ (i as u32).wrapping_mul(0x9E3779B9))
+            }),
+        ),
+        (
+            "lowcon",
+            map_seq(&clean, |f| {
+                degrade_gamma(&degrade_contrast(f, 0.35), 0.45, 1.4)
+            }),
+        ),
+        (
+            "warm",
+            map_seq(&clean, |f| degrade_cast(f, 0.55, 0.75, 1.15)),
+        ),
+        (
+            "cool",
+            map_seq(&clean, |f| degrade_cast(f, 1.15, 0.75, 0.55)),
+        ),
+    ];
+
+    let policies: Vec<(&str, EnhanceCfg)> = vec![
+        ("off", EnhanceCfg::off()),
+        ("clahe", EnhanceCfg::clahe()),
+        ("auto", EnhanceCfg::auto()),
+    ];
+
+    let mut trials = Vec::new();
+    for (i, (name, cfg)) in policies.iter().enumerate() {
+        eprintln!(
+            "  [{}/{}] {name} he={} auto={}",
+            i + 1,
+            policies.len(),
+            cfg.he.as_str(),
+            cfg.auto
+        );
+        match eval_cfg(args, spec, device, &mut pipe, &seqs, &teacher, name, *cfg) {
+            Ok(t) => {
+                eprintln!(
+                    "      clean {}  dark {}  over {}  back {}  noise {}  lowcon {}",
+                    fmt_row(&t, "clean"),
+                    fmt_row(&t, "dark"),
+                    fmt_row(&t, "over"),
+                    fmt_row(&t, "back"),
+                    fmt_row(&t, "noise"),
+                    fmt_row(&t, "lowcon")
+                );
+                trials.push(t);
+            }
+            Err(e) => eprintln!("      skip: {e}"),
+        }
+    }
+    let baseline = trials
+        .iter()
+        .find(|t| t.name == "off")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("missing off trial"))?;
+    for t in &mut trials {
+        t.score = trial_score(t, &baseline);
+    }
+    let winner = trials
+        .iter()
+        .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap())
+        .cloned()
+        .unwrap();
+    eprintln!(
+        "winner: {} he={} auto={} score={:.3}",
+        winner.name,
+        winner.cfg.he.as_str(),
+        winner.cfg.auto,
+        winner.score
+    );
+    let rec_of = |t: &EnhanceTrial, n: &str| t.scenes.get(n).map(|s| s.recall).unwrap_or(0.0);
+    eprintln!(
+        "  vs off: dark {:.2}->{:.2}  over {:.2}->{:.2}  back {:.2}->{:.2}  noise {:.2}->{:.2}",
+        rec_of(&baseline, "dark"),
+        rec_of(&winner, "dark"),
+        rec_of(&baseline, "over"),
+        rec_of(&winner, "over"),
+        rec_of(&baseline, "back"),
+        rec_of(&winner, "back"),
+        rec_of(&baseline, "noise"),
+        rec_of(&winner, "noise")
+    );
+    let mut probes = vec![SceneProbe {
+        name: "dark".into(),
+        detail: format!("exp={:.2} γ={:.1}", lit.exposure, lit.gamma),
+        off_recall: lit.off_recall,
+    }];
+    probes.push(over_p);
+    probes.push(back_p);
+    probes.push(noise_p);
+    let report = EnhanceReport {
+        face_frac: lit.frac,
+        frames: n,
+        dark_exposure: lit.exposure,
+        dark_gamma: lit.gamma,
+        probes,
+        winner: winner.cfg,
+        winner_name: winner.name.clone(),
+        baseline,
+        trials,
     };
     if let Some(dir) = out.parent() {
         fs::create_dir_all(dir)?;

@@ -284,23 +284,41 @@ pub fn crop_box(frame: &BgrImage, d: &[f32; 5]) -> (i32, i32, i32, i32) {
     crop_box_pad(frame, d, 0.1, 0.125)
 }
 
-pub fn crop_img(im: &BgrImage, x1: i32, y1: i32, x2: i32, y2: i32) -> BgrImage {
+pub(crate) fn crop_slice(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    x1: i32,
+    y1: i32,
+    x2: i32,
+    y2: i32,
+) -> BgrImage {
     let x1 = x1.max(0) as u32;
     let y1 = y1.max(0) as u32;
-    let x2 = (x2.max(0) as u32).min(im.width);
-    let y2 = (y2.max(0) as u32).min(im.height);
+    let x2 = (x2.max(0) as u32).min(width);
+    let y2 = (y2.max(0) as u32).min(height);
     let w = x2.saturating_sub(x1);
     let h = y2.saturating_sub(y1);
-    let mut data = Vec::with_capacity((w * h * 3) as usize);
+    let mut out = Vec::with_capacity((w * h * 3) as usize);
     for y in y1..y2 {
-        let s = ((y * im.width + x1) * 3) as usize;
-        data.extend_from_slice(&im.data[s..s + (w * 3) as usize]);
+        if y >= height {
+            break;
+        }
+        let s = ((y * width + x1) * 3) as usize;
+        let n = (w * 3) as usize;
+        if s + n <= data.len() {
+            out.extend_from_slice(&data[s..s + n]);
+        }
     }
     BgrImage {
         width: w,
         height: h,
-        data,
+        data: out,
     }
+}
+
+pub fn crop_img(im: &BgrImage, x1: i32, y1: i32, x2: i32, y2: i32) -> BgrImage {
+    crop_slice(&im.data, im.width, im.height, x1, y1, x2, y2)
 }
 
 pub fn iou(a: &[f32; 5], b: &[f32; 4]) -> f32 {

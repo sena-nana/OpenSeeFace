@@ -22,3 +22,9 @@ half = "2"
 ort = { version = "2.0.0-rc.13", features = ["half"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = "0.31"
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+cudarc = { version = "0.13", default-features = false, features = ["std", "driver", "nvrtc"] }

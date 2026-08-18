@@ -14,11 +14,16 @@ use std::process::Command;
 use crate::decode::LmSpec;
 #[cfg(feature = "gpu")]
 use crate::decode::{decode_landmarks, detect_faces};
+use crate::enhance::EnhanceCfg;
+#[cfg(feature = "gpu")]
+use crate::enhance_gpu::GpuEnhance;
+#[cfg(feature = "gpu")]
+use crate::preprocess::crop_box_pad;
+#[cfg(all(feature = "gpu", target_os = "macos"))]
+use crate::preprocess::crop_slice;
 #[cfg(all(feature = "gpu", target_os = "macos"))]
 use crate::preprocess::resize_bgr;
 use crate::preprocess::BgrImage;
-#[cfg(feature = "gpu")]
-use crate::preprocess::{crop_box_pad, crop_img};
 #[cfg(feature = "gpu")]
 use crate::session::Device;
 #[cfg(feature = "gpu")]
@@ -97,23 +102,33 @@ pub struct GpuTracker {
 
 impl GpuTracker {
     pub fn open(models_dir: &Path, spec: LmSpec, threads: usize, frame: &BgrImage) -> Result<Self> {
+        Self::with_enhance(models_dir, spec, threads, frame, EnhanceCfg::off())
+    }
+
+    pub fn with_enhance(
+        models_dir: &Path,
+        spec: LmSpec,
+        threads: usize,
+        frame: &BgrImage,
+        enhance: EnhanceCfg,
+    ) -> Result<Self> {
         #[cfg(not(feature = "gpu"))]
         {
-            let _ = (models_dir, spec, threads, frame);
+            let _ = (models_dir, spec, threads, frame, enhance);
             bail!("GPU requested; rebuild with `--features gpu`");
         }
         #[cfg(all(feature = "gpu", target_os = "macos"))]
         {
             let pre = ensure_pre_models(models_dir)?;
             Ok(Self {
-                pipe: CoreMlPipe::open(&pre, spec, threads, frame)?,
+                pipe: CoreMlPipe::open(&pre, spec, threads, frame, enhance)?,
             })
         }
         #[cfg(all(feature = "gpu", not(target_os = "macos")))]
         {
             let pre = ensure_pre_models(models_dir)?;
             Ok(Self {
-                pipe: CudaPipe::open(models_dir, &pre, spec, threads, frame)?,
+                pipe: CudaPipe::open(models_dir, &pre, spec, threads, frame, enhance)?,
             })
         }
     }
@@ -152,11 +167,18 @@ struct CoreMlPipe {
     det_name: String,
     lm: Session,
     lm_name: String,
+    enhance: GpuEnhance,
 }
 
 #[cfg(all(feature = "gpu", target_os = "macos"))]
 impl CoreMlPipe {
-    fn open(pre: &Path, spec: LmSpec, threads: usize, frame: &BgrImage) -> Result<Self> {
+    fn open(
+        pre: &Path,
+        spec: LmSpec,
+        threads: usize,
+        frame: &BgrImage,
+        enhance: EnhanceCfg,
+    ) -> Result<Self> {
         let fused_det = pre.join("mnv3_detection_opt.onnx");
         let fused_lm = pre.join(spec.file);
         if !fused_det.is_file() || !fused_lm.is_file() {
@@ -184,12 +206,18 @@ impl CoreMlPipe {
             det,
             lm_name: in_name(&lm),
             lm,
+            enhance: GpuEnhance::new(frame.width, frame.height, enhance)?,
         })
     }
 
+    fn pixels<'a>(&'a mut self, frame: &'a BgrImage) -> Result<&'a [u8]> {
+        self.enhance.run(frame)
+    }
+
     fn detect(&mut self, frame: &BgrImage) -> Result<Vec<[f32; 5]>> {
+        let bytes = self.pixels(frame)?;
         let shape = [1i64, frame.height as i64, frame.width as i64, 3];
-        let t = Tensor::<u8>::from_array((shape.as_slice(), frame.data.clone())).map_err(oe)?;
+        let t = Tensor::<u8>::from_array((shape.as_slice(), bytes.to_vec())).map_err(oe)?;
         let outs = self
             .det
             .run(ort::inputs![self.det_name.as_str() => t])
@@ -213,7 +241,8 @@ impl CoreMlPipe {
         pad_y: f32,
     ) -> Result<(f32, Vec<[f32; 3]>)> {
         let (x1, y1, x2, y2) = crop_box_pad(frame, det, pad_x, pad_y);
-        let crop = crop_img(frame, x1, y1, x2, y2);
+        let bytes = self.pixels(frame)?;
+        let crop = crop_slice(bytes, frame.width, frame.height, x1, y1, x2, y2);
         if crop.width < 4 || crop.height < 4 {
             bail!("crop too small");
         }
@@ -256,6 +285,8 @@ struct CudaPipe {
     lm_in: String,
     cuda_info: ort::memory::MemoryInfo<'static>,
     pin_out: Allocator,
+    enhance: GpuEnhance,
+    enhanced: bool,
 }
 
 #[cfg(all(feature = "gpu", not(target_os = "macos")))]
@@ -266,6 +297,7 @@ impl CudaPipe {
         spec: LmSpec,
         threads: usize,
         frame: &BgrImage,
+        enhance: EnhanceCfg,
     ) -> Result<Self> {
         use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
 
@@ -362,6 +394,8 @@ impl CudaPipe {
             lm,
             cuda_info,
             pin_out,
+            enhance: GpuEnhance::new(frame.width, frame.height, enhance)?,
+            enhanced: false,
         })
     }
 
@@ -371,6 +405,22 @@ impl CudaPipe {
         }
         let (_, buf) = self.frame.extract_tensor_mut();
         buf.copy_from_slice(&frame.data);
+        self.enhanced = false;
+        Ok(())
+    }
+
+    fn ensure_enhanced(&mut self) -> Result<()> {
+        if self.enhanced || !self.enhance.enabled() {
+            return Ok(());
+        }
+        let (w, h) = (self.w, self.h);
+        let (ptr, len) = {
+            let (_, buf) = self.frame.extract_tensor_mut();
+            (buf.as_mut_ptr(), buf.len())
+        };
+        let buf = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+        self.enhance.run_in_place(buf, w, h)?;
+        self.enhanced = true;
         Ok(())
     }
 
@@ -394,6 +444,7 @@ impl CudaPipe {
 
     fn detect(&mut self, frame: &BgrImage) -> Result<Vec<[f32; 5]>> {
         self.upload_frame(frame)?;
+        self.ensure_enhanced()?;
         let mut pre_bind = self.pre_det.create_binding().map_err(oe)?;
         pre_bind
             .bind_input(self.pre_det_name.clone(), &self.frame)
@@ -429,6 +480,7 @@ impl CudaPipe {
         pad_y: f32,
     ) -> Result<(f32, Vec<[f32; 3]>)> {
         self.upload_frame(frame)?;
+        self.ensure_enhanced()?;
         let (x1, y1, x2, y2) = crop_box_pad(frame, det, pad_x, pad_y);
         if x2 - x1 < 4 || y2 - y1 < 4 {
             bail!("crop too small");
