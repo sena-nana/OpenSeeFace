@@ -7,9 +7,11 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use clap::Parser;
 use osf_ort::{
-    cosine, crop_box, crop_box_pad, crop_img, decode_landmarks, detect_faces, imagenet_nchw, iou,
-    landmark_bbox, max_abs, mean_abs, mean_conf, model_path, read_f32_le, retina_nchw, rss,
-    BgrImage, Device, GpuTracker, Latency, LmSpec, OrtModel, TensorF16, EYE_IDX, VERSION,
+    center_2x, cosine, crop_box, crop_box_pad, crop_img, decode_landmarks, det_window,
+    detect_faces, face_crop, imagenet_nchw, iou, landmark_bbox, max_abs, mean_abs, mean_conf,
+    model_path, nme, paste_bgr, pick_lm, read_f32_le, resize_bgr, retina_nchw, rss, synth_canvas,
+    AdaptiveCfg, AdaptiveState, BgrImage, DetWindow, Device, GpuTracker, Latency, LmSpec, OrtModel,
+    TensorF16, EYE_IDX, FAST_LM, VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +32,7 @@ struct Args {
     /// cpu | gpu (CoreML on Apple, CUDA on NVIDIA)
     #[arg(long, default_value = "cpu")]
     device: String,
+    /// micro | realistic | all | scale
     #[arg(long, default_value = "micro")]
     suite: String,
     #[arg(long)]
@@ -38,6 +41,9 @@ struct Args {
     ref_dir: Option<PathBuf>,
     #[arg(long)]
     scenario_dir: Option<PathBuf>,
+    /// CPU: zoomed detector ROI + 112/224 landmark ladder. GPU: ROI detect only.
+    #[arg(long, default_value_t = false)]
+    adaptive: bool,
 }
 
 #[derive(Serialize)]
@@ -141,6 +147,11 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let device = Device::from_str(&args.device)?;
     let spec = LmSpec::from_type(args.model)?;
+    if args.suite == "scale" {
+        let path = args.out.clone().unwrap_or_else(default_scale_out);
+        run_scale_suite(&args, spec, device, &path)?;
+        return Ok(());
+    }
     let run_micro = args.suite == "micro" || args.suite == "all";
     let run_real = args.suite == "realistic" || args.suite == "all";
     let mut models = HashMap::new();
@@ -466,6 +477,7 @@ fn finish_pipeline(
     }
 }
 
+#[derive(Clone)]
 struct Row {
     detect_ms: f64,
     crop_ms: f64,
@@ -519,8 +531,31 @@ fn mean_opt(vals: impl Iterator<Item = Option<f32>>) -> Option<f32> {
     (n > 0).then(|| s / n as f32)
 }
 
+struct LmBank {
+    hi: OrtModel,
+    hi_spec: LmSpec,
+    lo: Option<OrtModel>,
+    lo_spec: LmSpec,
+}
+
+impl LmBank {
+    fn pair(&mut self, model_type: i32) -> (&mut OrtModel, LmSpec) {
+        if model_type == self.lo_spec.model_type {
+            if let Some(lo) = self.lo.as_mut() {
+                return (lo, self.lo_spec);
+            }
+        }
+        (&mut self.hi, self.hi_spec)
+    }
+}
+
+struct CpuPipe {
+    det: OrtModel,
+    lm: LmBank,
+}
+
 fn one_frame(
-    mut cpu: Option<&mut (OrtModel, OrtModel)>,
+    mut cpu: Option<&mut CpuPipe>,
     mut gpu: Option<&mut GpuTracker>,
     gaze: &mut Option<OrtModel>,
     frame: &BgrImage,
@@ -530,20 +565,24 @@ fn one_frame(
     pad_y: f32,
     do_detect: bool,
     do_gaze: bool,
+    adaptive: Option<(&AdaptiveCfg, &mut AdaptiveState)>,
 ) -> Result<Row> {
     let t_all = Instant::now();
     let mut detect_ms = 0.0;
     let mut det_score = None;
     if do_detect {
         let t = Instant::now();
-        let dets = if let Some((det, _)) = cpu.as_mut() {
-            let dout = det.run(&imagenet_nchw(frame, 224))?;
-            detect_faces(&dout[0], &dout[1], frame.width, frame.height, 0.6)
-        } else if let Some(tr) = gpu.as_mut() {
-            tr.detect(frame)?
+        let last = box5.as_ref();
+        let mut window = if let Some((cfg, _)) = adaptive.as_ref() {
+            det_window(frame.width, frame.height, last, cfg)
         } else {
-            Vec::new()
+            DetWindow::Full
         };
+        let mut dets = detect_window(cpu.as_deref_mut(), gpu.as_deref_mut(), frame, window)?;
+        if dets.is_empty() && adaptive.is_some() && last.is_none() {
+            window = center_2x(frame.width, frame.height);
+            dets = detect_window(cpu.as_deref_mut(), gpu.as_deref_mut(), frame, window)?;
+        }
         detect_ms = t.elapsed().as_secs_f64() * 1000.0;
         det_score = dets.first().map(|d| d[4]);
         box5 = dets.first().copied();
@@ -570,6 +609,16 @@ fn one_frame(
     let Some(d) = box5 else {
         return Ok(miss());
     };
+    let face_h = d[3];
+    let lm_type = if let Some((cfg, st)) = adaptive {
+        if gpu.is_some() {
+            spec.model_type
+        } else {
+            pick_lm(st, face_h, cfg)
+        }
+    } else {
+        spec.model_type
+    };
     let t = Instant::now();
     let (x1, y1, x2, y2) = crop_box_pad(frame, &d, pad_x, pad_y);
     let (crop_w, crop_h) = ((x2 - x1).max(0) as u32, (y2 - y1).max(0) as u32);
@@ -578,30 +627,12 @@ fn one_frame(
     }
     let crop_ms = t.elapsed().as_secs_f64() * 1000.0;
     let t = Instant::now();
-    let (conf, pts, pre_ms, lm_ms, decode_ms) = if let Some((_, lm)) = cpu.as_mut() {
-        let lin = imagenet_nchw(&crop_img(frame, x1, y1, x2, y2), spec.size);
-        let pre_ms = t.elapsed().as_secs_f64() * 1000.0;
-        let t = Instant::now();
-        let out = lm.run(&lin)?;
-        let lm_ms = t.elapsed().as_secs_f64() * 1000.0;
-        let t = Instant::now();
-        let decoded = decode_landmarks(
-            &out[0],
-            [
-                x1 as f32,
-                y1 as f32,
-                (x2 - x1) as f32 / spec.size as f32,
-                (y2 - y1) as f32 / spec.size as f32,
-            ],
-            spec,
-        );
-        (
-            decoded.0,
-            decoded.1,
-            pre_ms,
-            lm_ms,
-            t.elapsed().as_secs_f64() * 1000.0,
-        )
+    let (conf, pts, pre_ms, lm_ms, decode_ms) = if let Some(pipe) = cpu.as_mut() {
+        let (lm, run_spec) = pipe.lm.pair(lm_type);
+        match run_landmarks(lm, frame, &d, run_spec, pad_x, pad_y) {
+            Ok(v) => v,
+            Err(_) => return Ok(miss()),
+        }
     } else if let Some(tr) = gpu.as_mut() {
         let decoded = tr.landmarks(frame, &d, spec, pad_x, pad_y)?;
         (
@@ -652,6 +683,108 @@ fn one_frame(
     })
 }
 
+fn detect_window(
+    cpu: Option<&mut CpuPipe>,
+    gpu: Option<&mut GpuTracker>,
+    frame: &BgrImage,
+    window: DetWindow,
+) -> Result<Vec<[f32; 5]>> {
+    let (view, fallback_full) = match window {
+        DetWindow::Full => (None, false),
+        DetWindow::Roi { x1, y1, x2, y2 } => {
+            let crop = crop_img(frame, x1, y1, x2, y2);
+            if crop.width < 8 || crop.height < 8 {
+                (None, true)
+            } else {
+                (Some(crop), false)
+            }
+        }
+    };
+    if fallback_full {
+        return detect_window(cpu, gpu, frame, DetWindow::Full);
+    }
+    if let Some(pipe) = cpu {
+        let src = view.as_ref().unwrap_or(frame);
+        let dout = pipe.det.run(&imagenet_nchw(src, 224))?;
+        let mut dets = detect_faces(&dout[0], &dout[1], src.width, src.height, 0.6);
+        if view.is_some() {
+            window.apply_offset(&mut dets);
+        }
+        return Ok(dets);
+    }
+    let Some(tr) = gpu else {
+        return Ok(Vec::new());
+    };
+    // CoreML/CUDA sessions are bound to the full-frame size. Stretch the ROI
+    // to that size so the fused graph still runs, then map boxes back.
+    if let Some(crop) = view.as_ref() {
+        let stretched = resize_bgr(crop, frame.width, frame.height);
+        match tr.detect(&stretched) {
+            Ok(mut dets) => {
+                remap_stretched_roi(&mut dets, window, frame);
+                return Ok(dets);
+            }
+            Err(_) => return tr.detect(frame),
+        }
+    }
+    tr.detect(frame)
+}
+
+fn remap_stretched_roi(dets: &mut [[f32; 5]], window: DetWindow, frame: &BgrImage) {
+    let DetWindow::Roi { x1, y1, x2, y2 } = window else {
+        return;
+    };
+    let rw = (x2 - x1).max(1) as f32;
+    let rh = (y2 - y1).max(1) as f32;
+    let fw = frame.width as f32;
+    let fh = frame.height as f32;
+    for d in dets {
+        d[0] = x1 as f32 + d[0] * rw / fw;
+        d[1] = y1 as f32 + d[1] * rh / fh;
+        d[2] *= rw / fw;
+        d[3] *= rh / fh;
+    }
+}
+
+fn run_landmarks(
+    lm: &mut OrtModel,
+    frame: &BgrImage,
+    d: &[f32; 5],
+    spec: LmSpec,
+    pad_x: f32,
+    pad_y: f32,
+) -> Result<(f32, Vec<[f32; 3]>, f64, f64, f64)> {
+    let t = Instant::now();
+    let (x1, y1, x2, y2) = crop_box_pad(frame, d, pad_x, pad_y);
+    if x2 - x1 < 4 || y2 - y1 < 4 {
+        anyhow::bail!("crop too small");
+    }
+    let crop = crop_img(frame, x1, y1, x2, y2);
+    let lin = imagenet_nchw(&crop, spec.size);
+    let pre_ms = t.elapsed().as_secs_f64() * 1000.0;
+    let t = Instant::now();
+    let out = lm.run(&lin)?;
+    let lm_ms = t.elapsed().as_secs_f64() * 1000.0;
+    let t = Instant::now();
+    let decoded = decode_landmarks(
+        &out[0],
+        [
+            x1 as f32,
+            y1 as f32,
+            (x2 - x1) as f32 / spec.size as f32,
+            (y2 - y1) as f32 / spec.size as f32,
+        ],
+        spec,
+    );
+    Ok((
+        decoded.0,
+        decoded.1,
+        pre_ms,
+        lm_ms,
+        t.elapsed().as_secs_f64() * 1000.0,
+    ))
+}
+
 fn lat(warmup: u32, rows: &[Row], f: impl Fn(&Row) -> f64) -> Latency {
     Latency::from_samples(warmup, &rows.iter().map(f).collect::<Vec<_>>())
 }
@@ -681,23 +814,44 @@ fn run_scenario_dir(
         })
         .transpose()?;
     let mut cpu = if device == Device::Cpu {
-        Some((
-            OrtModel::open(
-                model_path(&args.models_dir, "mnv3_detection_opt.onnx"),
-                args.threads,
-                device,
-                1,
-            )?,
-            OrtModel::open(
-                model_path(&args.models_dir, spec.file),
-                args.threads,
-                device,
-                1,
-            )?,
-        ))
+        let det = OrtModel::open(
+            model_path(&args.models_dir, "mnv3_detection_opt.onnx"),
+            args.threads,
+            device,
+            1,
+        )?;
+        let hi = OrtModel::open(
+            model_path(&args.models_dir, spec.file),
+            args.threads,
+            device,
+            1,
+        )?;
+        let lo_spec = LmSpec::from_type(FAST_LM)?;
+        let lo = (args.adaptive && spec.model_type >= 0)
+            .then(|| {
+                OrtModel::open(
+                    model_path(&args.models_dir, lo_spec.file),
+                    args.threads,
+                    device,
+                    1,
+                )
+            })
+            .transpose()?;
+        Some(CpuPipe {
+            det,
+            lm: LmBank {
+                hi,
+                hi_spec: spec,
+                lo,
+                lo_spec,
+            },
+        })
     } else {
         None
     };
+    let cfg = args
+        .adaptive
+        .then(|| AdaptiveCfg::default().with_ceiling(spec.model_type));
     for dir in dirs {
         let meta: ScenarioMeta = serde_json::from_str(&fs::read_to_string(dir.join("meta.json"))?)?;
         let frames: Vec<BgrImage> = meta
@@ -713,7 +867,11 @@ fn run_scenario_dir(
         let mut gpu = (device == Device::Gpu)
             .then(|| GpuTracker::open(&args.models_dir, spec, args.threads, &frames[0]))
             .transpose()?;
-        let mut step = |box5: Option<[f32; 5]>, frame: &BgrImage, scanned: bool| {
+        let mut state = cfg.map(AdaptiveState::new);
+        let mut step = |box5: Option<[f32; 5]>,
+                        frame: &BgrImage,
+                        scanned: bool,
+                        st: Option<&mut AdaptiveState>| {
             one_frame(
                 cpu.as_mut(),
                 gpu.as_mut(),
@@ -725,16 +883,21 @@ fn run_scenario_dir(
                 meta.pad_y,
                 scanned,
                 do_gaze,
+                match (cfg.as_ref(), st) {
+                    (Some(c), Some(s)) => Some((c, s)),
+                    _ => None,
+                },
             )
         };
         for _ in 0..args.warmup.max(1) {
-            let _ = step(None, &frames[0], true)?;
+            let mut warm = state;
+            let _ = step(None, &frames[0], true, warm.as_mut())?;
         }
         let mut box5 = None;
         let mut rows = Vec::with_capacity(frames.len());
         for (i, frame) in frames.iter().enumerate() {
             let scanned = box5.is_none() || (i as u32 % scan_every == 0);
-            let row = step(if scanned { None } else { box5 }, frame, scanned)?;
+            let row = step(box5, frame, scanned, state.as_mut())?;
             box5 = row.box5;
             rows.push(row);
         }
@@ -784,4 +947,295 @@ fn run_scenario_dir(
         );
     }
     Ok(out)
+}
+
+fn default_scale_out() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../benchmarks/out/scale_sweep.json")
+}
+
+const SCALE_FRACS: [f32; 7] = [0.10, 0.14, 0.20, 0.28, 0.36, 0.48, 0.60];
+const SCALE_W: u32 = 1280;
+const SCALE_H: u32 = 720;
+const SCALE_FRAMES: usize = 8;
+
+#[derive(Clone, Serialize)]
+struct ScaleScore {
+    nme: f32,
+    recall: f32,
+    e2e_p50_ms: f64,
+    far_nme: f32,
+    hits: usize,
+    frames: usize,
+}
+
+#[derive(Clone, Serialize)]
+struct FracRow {
+    face_frac: f32,
+    nme: Option<f32>,
+    recall: f32,
+    e2e_p50_ms: f64,
+}
+
+#[derive(Serialize)]
+struct ScaleReport {
+    baseline: ScaleScore,
+    adaptive: ScaleScore,
+    baseline_per_frac: Vec<FracRow>,
+    adaptive_per_frac: Vec<FracRow>,
+}
+
+struct ScaleSeq {
+    face_frac: f32,
+    frames: Vec<BgrImage>,
+}
+
+fn open_cpu_pipe(args: &Args, spec: LmSpec, with_fast: bool) -> Result<CpuPipe> {
+    let det = OrtModel::open(
+        model_path(&args.models_dir, "mnv3_detection_opt.onnx"),
+        args.threads,
+        Device::Cpu,
+        1,
+    )?;
+    let hi = OrtModel::open(
+        model_path(&args.models_dir, spec.file),
+        args.threads,
+        Device::Cpu,
+        1,
+    )?;
+    let lo_spec = LmSpec::from_type(FAST_LM)?;
+    let lo = with_fast
+        .then(|| {
+            OrtModel::open(
+                model_path(&args.models_dir, lo_spec.file),
+                args.threads,
+                Device::Cpu,
+                1,
+            )
+        })
+        .transpose()?;
+    Ok(CpuPipe {
+        det,
+        lm: LmBank {
+            hi,
+            hi_spec: spec,
+            lo,
+            lo_spec,
+        },
+    })
+}
+
+fn extract_face_tile(pipe: &mut CpuPipe, frame: &BgrImage) -> Result<(BgrImage, f32)> {
+    let dout = pipe.det.run(&imagenet_nchw(frame, 224))?;
+    let dets = detect_faces(&dout[0], &dout[1], frame.width, frame.height, 0.6);
+    let d = dets
+        .first()
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("no face in seed image"))?;
+    let (tile, _, face_h) = face_crop(frame, &d, 0.25);
+    Ok((tile, face_h))
+}
+
+fn make_scale_seq(face: &BgrImage, face_h: f32, frac: f32) -> ScaleSeq {
+    let target = ((SCALE_H as f32 * frac) as u32).max(8);
+    let scale = target as f32 / face_h.max(1.0);
+    let fw = ((face.width as f32 * scale) as u32).max(8);
+    let fh = ((face.height as f32 * scale) as u32).max(8);
+    let resized = resize_bgr(face, fw, fh);
+    let mut frames = Vec::with_capacity(SCALE_FRAMES);
+    for t in 0..SCALE_FRAMES {
+        let tf = t as f32;
+        let jx = (0.035 * fw as f32).max(4.0) * (tf * 0.7).sin();
+        let jy = (0.025 * fh as f32).max(3.0) * (tf * 0.5).cos();
+        let x = (SCALE_W as i32 - fw as i32) / 2 + jx as i32;
+        let y = (SCALE_H as i32 - fh as i32) / 2 + jy as i32;
+        let mut canvas = synth_canvas(SCALE_W, SCALE_H);
+        paste_bgr(&mut canvas, &resized, x, y);
+        frames.push(canvas);
+    }
+    ScaleSeq {
+        face_frac: frac,
+        frames,
+    }
+}
+
+struct TeachFrame {
+    pts: Vec<[f32; 3]>,
+    hit: bool,
+}
+
+fn run_seq(
+    mut cpu: Option<&mut CpuPipe>,
+    mut gpu: Option<&mut GpuTracker>,
+    spec: LmSpec,
+    seq: &ScaleSeq,
+    cfg: Option<&AdaptiveCfg>,
+) -> Result<Vec<Row>> {
+    let mut state = cfg.copied().map(AdaptiveState::new);
+    let mut box5 = None;
+    let mut rows = Vec::with_capacity(seq.frames.len());
+    let mut gaze = None;
+    for frame in &seq.frames {
+        let ad = match (cfg, state.as_mut()) {
+            (Some(c), Some(s)) => Some((c, s)),
+            _ => None,
+        };
+        let row = one_frame(
+            cpu.as_deref_mut(),
+            gpu.as_deref_mut(),
+            &mut gaze,
+            frame,
+            spec,
+            box5,
+            0.1,
+            0.125,
+            true,
+            false,
+            ad,
+        )?;
+        box5 = row.box5;
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+fn mean_f32(v: &[f32]) -> Option<f32> {
+    (!v.is_empty()).then(|| v.iter().sum::<f32>() / v.len() as f32)
+}
+
+fn score_against_teacher(
+    seqs: &[ScaleSeq],
+    rows: &[Vec<Row>],
+    teacher: &[Vec<TeachFrame>],
+) -> (ScaleScore, Vec<FracRow>) {
+    let mut nmes = Vec::new();
+    let mut far_nmes = Vec::new();
+    let mut e2e = Vec::new();
+    let mut hits = 0usize;
+    let mut frames = 0usize;
+    let mut per = Vec::new();
+    for (seq, (rs, ts)) in seqs.iter().zip(rows.iter().zip(teacher.iter())) {
+        let mut local_nme = Vec::new();
+        let mut local_e2e = Vec::new();
+        let mut local_hits = 0usize;
+        for (r, t) in rs.iter().zip(ts.iter()) {
+            frames += 1;
+            e2e.push(r.e2e_ms);
+            local_e2e.push(r.e2e_ms);
+            if r.faces > 0 {
+                hits += 1;
+                local_hits += 1;
+            }
+            if r.faces > 0 && t.hit {
+                if let Some(v) = nme(&r.pts, &t.pts) {
+                    local_nme.push(v);
+                    nmes.push(v);
+                    if seq.face_frac <= 0.14 {
+                        far_nmes.push(v);
+                    }
+                }
+            }
+        }
+        per.push(FracRow {
+            face_frac: seq.face_frac,
+            nme: mean_f32(&local_nme),
+            recall: local_hits as f32 / seq.frames.len().max(1) as f32,
+            e2e_p50_ms: Latency::from_samples(0, &local_e2e).p50_ms,
+        });
+    }
+    (
+        ScaleScore {
+            nme: mean_f32(&nmes).unwrap_or(0.0),
+            recall: hits as f32 / frames.max(1) as f32,
+            e2e_p50_ms: Latency::from_samples(0, &e2e).p50_ms,
+            far_nme: mean_f32(&far_nmes).unwrap_or(0.0),
+            hits,
+            frames,
+        },
+        per,
+    )
+}
+
+fn rows_to_teacher(rows: Vec<Row>) -> Vec<TeachFrame> {
+    rows.into_iter()
+        .map(|r| TeachFrame {
+            hit: r.faces > 0,
+            pts: r.pts,
+        })
+        .collect()
+}
+
+fn print_score(tag: &str, s: &ScaleScore) {
+    eprintln!(
+        "{tag}: rec={:.3} nme={:.4} p50={:.2}ms far_nme={:.4}",
+        s.recall, s.nme, s.e2e_p50_ms, s.far_nme
+    );
+}
+
+fn run_scale_suite(args: &Args, _spec: LmSpec, device: Device, out: &Path) -> Result<()> {
+    let spec = LmSpec::from_type(3)?;
+    let cfg = AdaptiveCfg::default().with_ceiling(spec.model_type);
+    let mut pipe = open_cpu_pipe(args, spec, device == Device::Cpu)?;
+    let seed = BgrImage::load(&args.image)?;
+    let (tile, face_h) = extract_face_tile(&mut pipe, &seed)?;
+    let seqs: Vec<ScaleSeq> = SCALE_FRACS
+        .iter()
+        .map(|&f| make_scale_seq(&tile, face_h, f))
+        .collect();
+    eprintln!(
+        "scale: seed face_h={face_h:.1}px, {} fracs × {SCALE_FRAMES} frames ({})",
+        seqs.len(),
+        device.as_str()
+    );
+
+    let (base_rows, ad_rows) = if device == Device::Gpu {
+        let mut gpu = GpuTracker::open(&args.models_dir, spec, args.threads, &seqs[0].frames[0])?;
+        for _ in 0..args.warmup.max(2) {
+            let _ = run_seq(None, Some(&mut gpu), spec, &seqs[0], None)?;
+        }
+        let mut base = Vec::new();
+        let mut ad = Vec::new();
+        for seq in &seqs {
+            base.push(run_seq(None, Some(&mut gpu), spec, seq, None)?);
+            ad.push(run_seq(None, Some(&mut gpu), spec, seq, Some(&cfg))?);
+        }
+        (base, ad)
+    } else {
+        let mut base = Vec::new();
+        let mut ad = Vec::new();
+        for seq in &seqs {
+            base.push(run_seq(Some(&mut pipe), None, spec, seq, None)?);
+            ad.push(run_seq(Some(&mut pipe), None, spec, seq, Some(&cfg))?);
+        }
+        (base, ad)
+    };
+
+    let teacher: Vec<Vec<TeachFrame>> = base_rows.iter().cloned().map(rows_to_teacher).collect();
+    let (baseline, baseline_per_frac) = score_against_teacher(&seqs, &base_rows, &teacher);
+    let (adaptive, adaptive_per_frac) = score_against_teacher(&seqs, &ad_rows, &teacher);
+    print_score("baseline", &baseline);
+    print_score("adaptive", &adaptive);
+    eprintln!(
+        "Δ rec={:+.3}  nme={:.4}  p50={:+.2}ms",
+        adaptive.recall - baseline.recall,
+        adaptive.nme,
+        adaptive.e2e_p50_ms - baseline.e2e_p50_ms
+    );
+    for (b, a) in baseline_per_frac.iter().zip(adaptive_per_frac.iter()) {
+        eprintln!(
+            "  frac={:.2} rec {:.3}->{:.3} p50 {:.2}->{:.2}",
+            b.face_frac, b.recall, a.recall, b.e2e_p50_ms, a.e2e_p50_ms
+        );
+    }
+    let report = ScaleReport {
+        baseline,
+        adaptive,
+        baseline_per_frac,
+        adaptive_per_frac,
+    };
+    if let Some(dir) = out.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    fs::write(out, serde_json::to_string_pretty(&report)?)?;
+    eprintln!("wrote {}", out.display());
+    Ok(())
 }

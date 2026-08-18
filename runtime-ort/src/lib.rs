@@ -1,18 +1,24 @@
 //! ort inference for the same ONNX files used by the Python tracker.
 
+mod adaptive;
 mod decode;
 mod gpu_pre;
 mod metrics;
 mod preprocess;
 mod session;
 
+pub use adaptive::{
+    center_2x, det_window, face_on_224, nme, pick_lm, AdaptiveCfg, AdaptiveState, DetWindow,
+    FAST_LM,
+};
 pub use decode::{
     decode_landmarks, detect_faces, landmark_bbox, mean_conf, LmSpec, TensorF16, EYE_IDX,
 };
 pub use gpu_pre::GpuTracker;
 pub use metrics::{cosine, max_abs, mean_abs, model_path, read_f32_le, rss, Latency, Rss};
 pub use preprocess::{
-    crop_box, crop_box_pad, crop_img, imagenet_nchw, iou, nchw, retina_nchw, BgrImage, ColorNorm,
+    crop_box, crop_box_pad, crop_img, face_crop, imagenet_nchw, iou, nchw, paste_bgr, resize_bgr,
+    retina_nchw, synth_canvas, BgrImage, ColorNorm,
 };
 pub use session::{Device, OrtModel};
 
@@ -64,5 +70,13 @@ mod tests {
         assert!((blue.data[0].to_f32() - (200.0 - 104.0)).abs() < 2e-3);
         assert!((blue.data[640 * 640].to_f32() - (10.0 - 117.0)).abs() < 2e-3);
         assert!((blue.data[2 * 640 * 640].to_f32() - (3.0 - 123.0)).abs() < 2e-3);
+    }
+
+    #[test]
+    fn resize_bgr_identity() {
+        let im = solid(9, 10, 11);
+        let got = resize_bgr(&im, 2, 2);
+        assert_eq!(got.width, 2);
+        assert_eq!(got.data, im.data);
     }
 }

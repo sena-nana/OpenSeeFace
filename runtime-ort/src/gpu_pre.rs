@@ -14,6 +14,8 @@ use std::process::Command;
 use crate::decode::LmSpec;
 #[cfg(feature = "gpu")]
 use crate::decode::{decode_landmarks, detect_faces};
+#[cfg(all(feature = "gpu", target_os = "macos"))]
+use crate::preprocess::resize_bgr;
 use crate::preprocess::BgrImage;
 #[cfg(feature = "gpu")]
 use crate::preprocess::{crop_box_pad, crop_img};
@@ -218,7 +220,7 @@ impl CoreMlPipe {
         let sized = if crop.width == spec.size && crop.height == spec.size {
             crop
         } else {
-            cpu_resize_u8(&crop, spec.size, spec.size)
+            resize_bgr(&crop, spec.size, spec.size)
         };
         let shape = [1i64, sized.height as i64, sized.width as i64, 3];
         let t = Tensor::<u8>::from_array((shape.as_slice(), sized.data)).map_err(oe)?;
@@ -234,45 +236,6 @@ impl CoreMlPipe {
             [x1 as f32, y1 as f32, scale_x, scale_y],
             spec,
         ))
-    }
-}
-
-#[cfg(all(feature = "gpu", target_os = "macos"))]
-fn cpu_resize_u8(bgr: &BgrImage, dw: u32, dh: u32) -> BgrImage {
-    if dw == bgr.width && dh == bgr.height {
-        return bgr.clone();
-    }
-    let fx = bgr.width as f32 / dw as f32;
-    let fy = bgr.height as f32 / dh as f32;
-    let mut data = vec![0u8; dw as usize * dh as usize * 3];
-    for y in 0..dh {
-        let sy = (y as f32 + 0.5) * fy - 0.5;
-        let y0 = sy.floor().clamp(0.0, (bgr.height - 1) as f32) as u32;
-        let y1 = (y0 + 1).min(bgr.height - 1);
-        let wy = (sy - y0 as f32).clamp(0.0, 1.0);
-        for x in 0..dw {
-            let sx = (x as f32 + 0.5) * fx - 0.5;
-            let x0 = sx.floor().clamp(0.0, (bgr.width - 1) as f32) as u32;
-            let x1 = (x0 + 1).min(bgr.width - 1);
-            let wx = (sx - x0 as f32).clamp(0.0, 1.0);
-            let i00 = ((y0 * bgr.width + x0) * 3) as usize;
-            let i10 = ((y0 * bgr.width + x1) * 3) as usize;
-            let i01 = ((y1 * bgr.width + x0) * 3) as usize;
-            let i11 = ((y1 * bgr.width + x1) * 3) as usize;
-            let o = ((y * dw + x) * 3) as usize;
-            for c in 0..3 {
-                let v = bgr.data[i00 + c] as f32 * (1.0 - wx) * (1.0 - wy)
-                    + bgr.data[i10 + c] as f32 * wx * (1.0 - wy)
-                    + bgr.data[i01 + c] as f32 * (1.0 - wx) * wy
-                    + bgr.data[i11 + c] as f32 * wx * wy;
-                data[o + c] = v.round().clamp(0.0, 255.0) as u8;
-            }
-        }
-    }
-    BgrImage {
-        width: dw,
-        height: dh,
-        data,
     }
 }
 

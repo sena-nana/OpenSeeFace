@@ -167,6 +167,10 @@ Realistic crop / glasses scenarios (synthetic webcam canvases, tracking loop, op
 
 `--scenarios` selects a subset (`track_scan3,glasses_synth,gaze_glasses`). Photos land in `benchmarks/fixtures/cache/` via `uv run python benchmarks/fetch_fixtures.py` and are skipped if offline. Optional `--wflw-root` adds extra stills from a local WFLW tree. JSON: `benchmarks/out/scenarios.json`.
 
+Face-size adaptive tracking: CPU zooms the 224 detector on small faces and switches to the 112px landmark model on large ones; GPU only zooms detect. `--adaptive` on `osf-bench` enables it for the realistic suite. `--suite scale` A/Bs default thresholds against a fixed model-3 baseline:
+
+    cargo run --release --manifest-path runtime-ort/Cargo.toml --bin osf-bench -- --suite scale
+    cargo run --release --features gpu --manifest-path runtime-ort/Cargo.toml --bin osf-bench -- --suite scale --device gpu
 # References
 
 ## Training dataset
