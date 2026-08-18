@@ -7,8 +7,9 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use clap::Parser;
 use osf_ort::{
-    cosine, detect_faces, imagenet_nchw, max_abs, mean_abs, model_path, read_f32_le, retina_nchw,
-    rss, BgrImage, Device, Latency, LmSpec, OrtModel, TensorF16, VERSION,
+    cosine, crop_box, crop_img, detect_faces, imagenet_nchw, iou, max_abs, mean_abs, model_path,
+    read_f32_le, retina_nchw, rss, BgrImage, Device, GpuTracker, Latency, LmSpec, OrtModel,
+    TensorF16, VERSION,
 };
 use serde::Serialize;
 
@@ -108,7 +109,11 @@ fn main() -> Result<()> {
     go(
         "detection",
         "mnv3_detection_opt.onnx",
-        &load("detection_input.bin", vec![1, 3, 224, 224], imagenet_nchw(&frame, 224))?,
+        &load(
+            "detection_input.bin",
+            vec![1, 3, 224, 224],
+            imagenet_nchw(&frame, 224),
+        )?,
         "detection_output_0.bin",
     )?;
     go(
@@ -125,7 +130,11 @@ fn main() -> Result<()> {
         go(
             "gaze",
             "mnv3_gaze32_split_opt.onnx",
-            &load("gaze_input.bin", vec![2, 3, 32, 32], TensorF16::zeros(vec![2, 3, 32, 32]))?,
+            &load(
+                "gaze_input.bin",
+                vec![2, 3, 32, 32],
+                TensorF16::zeros(vec![2, 3, 32, 32]),
+            )?,
             "gaze_output.bin",
         )?;
     }
@@ -133,7 +142,11 @@ fn main() -> Result<()> {
         go(
             "retinaface",
             "retinaface_640x640_opt.onnx",
-            &load("retinaface_input.bin", vec![1, 3, 640, 640], retina_nchw(&frame))?,
+            &load(
+                "retinaface_input.bin",
+                vec![1, 3, 640, 640],
+                retina_nchw(&frame),
+            )?,
             "retinaface_output_0.bin",
         )?;
     }
@@ -169,8 +182,8 @@ fn bench(
     ref_out: Option<PathBuf>,
 ) -> Result<ModelReport> {
     let batch = input.shape.first().copied().unwrap_or(1).max(1);
-    let mut m = OrtModel::open(path, threads, device, batch)
-        .with_context(|| path.display().to_string())?;
+    let mut m =
+        OrtModel::open(path, threads, device, batch).with_context(|| path.display().to_string())?;
     let t0 = Instant::now();
     let first = m.run(input)?;
     let first_infer_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -208,144 +221,167 @@ fn bench(
 }
 
 fn pipeline(args: &Args, frame: &BgrImage, spec: LmSpec, device: Device) -> Result<Pipeline> {
+    if device == Device::Gpu {
+        return gpu_pipeline(args, frame, spec);
+    }
+    cpu_pipeline(args, frame, spec, device)
+}
+
+fn cpu_pipeline(args: &Args, frame: &BgrImage, spec: LmSpec, device: Device) -> Result<Pipeline> {
     let mut det = OrtModel::open(
         model_path(&args.models_dir, "mnv3_detection_opt.onnx"),
         args.threads,
         device,
         1,
     )?;
-    let t0 = Instant::now();
+    let mut lm = OrtModel::open(
+        model_path(&args.models_dir, spec.file),
+        args.threads,
+        device,
+        1,
+    )?;
     let din = imagenet_nchw(frame, 224);
+    let mut crop_lin = None;
+    let dout = det.run(&din)?;
+    let dets = detect_faces(&dout[0], &dout[1], frame.width, frame.height, 0.6);
+    if let Some(d) = dets.first() {
+        let (x1, y1, x2, y2) = crop_box(frame, d);
+        if x2 - x1 >= 4 && y2 - y1 >= 4 {
+            let crop = crop_img(frame, x1, y1, x2, y2);
+            crop_lin = Some((x1, y1, x2, y2, imagenet_nchw(&crop, spec.size)));
+            let _ = lm.run(&crop_lin.as_ref().unwrap().4)?;
+        }
+    }
+    for _ in 0..args.warmup.max(1) {
+        let _ = det.run(&din)?;
+        if let Some((_, _, _, _, lin)) = &crop_lin {
+            let _ = lm.run(lin)?;
+        }
+    }
+
+    let t0 = Instant::now();
     let dout = det.run(&din)?;
     let dets = detect_faces(&dout[0], &dout[1], frame.width, frame.height, 0.6);
     let detect_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     let mut landmarks_ms = 0.0;
     let mut faces = 0;
-    let mut det_iou = None;
-    let mut landmark_mae_px = None;
+    let mut pts = None;
     if let Some(d) = dets.first() {
         faces = 1;
         let (x1, y1, x2, y2) = crop_box(frame, d);
         if x2 - x1 >= 4 && y2 - y1 >= 4 {
-            let mut lm = OrtModel::open(
-                model_path(&args.models_dir, spec.file),
-                args.threads,
-                device,
-                1,
-            )?;
             let t1 = Instant::now();
             let crop = crop_img(frame, x1, y1, x2, y2);
             let lin = imagenet_nchw(&crop, spec.size);
-            let _ = lm.run(&lin)?;
+            let out = lm.run(&lin)?;
             landmarks_ms = t1.elapsed().as_secs_f64() * 1000.0;
+            if args.ref_dir.is_some() {
+                let scale_x = (x2 - x1) as f32 / spec.size as f32;
+                let scale_y = (y2 - y1) as f32 / spec.size as f32;
+                pts = Some(
+                    osf_ort::decode_landmarks(
+                        &out[0],
+                        [x1 as f32, y1 as f32, scale_x, scale_y],
+                        spec,
+                    )
+                    .1,
+                );
+            }
         }
-        if let Some(dir) = &args.ref_dir {
-            if let Ok(meta) = fs::read_to_string(dir.join("meta.json")) {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&meta) {
-                    if let Some(rd) = v["detections"].as_array().and_then(|a| a.first()) {
-                        let b = [
-                            rd["x"].as_f64().unwrap_or(0.0) as f32,
-                            rd["y"].as_f64().unwrap_or(0.0) as f32,
-                            rd["w"].as_f64().unwrap_or(0.0) as f32,
-                            rd["h"].as_f64().unwrap_or(0.0) as f32,
-                        ];
-                        det_iou = Some(iou(d, &b));
-                    }
-                    if let Some(lms) = v["landmarks"].as_array() {
-                        if !lms.is_empty() {
-                            let (x1, y1, x2, y2) = crop_box(frame, d);
-                            let crop = crop_img(frame, x1, y1, x2, y2);
-                            let mut lm = OrtModel::open(
-                                model_path(&args.models_dir, spec.file),
-                                args.threads,
-                                device,
-                                1,
-                            )?;
-                            let lin = imagenet_nchw(&crop, spec.size);
-                            let out = lm.run(&lin)?;
-                            let scale_x = (x2 - x1) as f32 / spec.size as f32;
-                            let scale_y = (y2 - y1) as f32 / spec.size as f32;
-                            let (_, pts) = osf_ort::decode_landmarks(
-                                &out[0],
-                                [x1 as f32, y1 as f32, scale_x, scale_y],
-                                spec,
-                            );
-                            let n = pts.len().min(lms.len());
-                            if n > 0 {
-                                let s: f32 = pts
-                                    .iter()
-                                    .zip(lms)
-                                    .take(n)
-                                    .map(|(p, q)| {
-                                        let qx = q["x"].as_f64().unwrap_or(0.0) as f32;
-                                        let qy = q["y"].as_f64().unwrap_or(0.0) as f32;
-                                        (p[0] - qx).hypot(p[1] - qy)
-                                    })
-                                    .sum();
-                                landmark_mae_px = Some(s / n as f32);
-                            }
-                        }
+    }
+    Ok(finish_pipeline(
+        args,
+        dets.first(),
+        pts.as_deref(),
+        faces,
+        detect_ms,
+        landmarks_ms,
+    ))
+}
+
+fn gpu_pipeline(args: &Args, frame: &BgrImage, spec: LmSpec) -> Result<Pipeline> {
+    let mut tracker = GpuTracker::open(&args.models_dir, spec, args.threads, frame)?;
+    let mut dets = tracker.detect(frame)?;
+    if let Some(d) = dets.first() {
+        let _ = tracker.landmarks(frame, d, spec)?;
+    }
+    for _ in 0..args.warmup.max(1) {
+        dets = tracker.detect(frame)?;
+        if let Some(d) = dets.first() {
+            let _ = tracker.landmarks(frame, d, spec)?;
+        }
+    }
+    let t0 = Instant::now();
+    let dets = tracker.detect(frame)?;
+    let detect_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let mut landmarks_ms = 0.0;
+    let mut faces = 0;
+    let mut pts = None;
+    if let Some(d) = dets.first() {
+        faces = 1;
+        let t1 = Instant::now();
+        let decoded = tracker.landmarks(frame, d, spec)?;
+        landmarks_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        pts = Some(decoded.1);
+    }
+    Ok(finish_pipeline(
+        args,
+        dets.first(),
+        pts.as_deref(),
+        faces,
+        detect_ms,
+        landmarks_ms,
+    ))
+}
+
+fn finish_pipeline(
+    args: &Args,
+    det: Option<&[f32; 5]>,
+    pts: Option<&[[f32; 3]]>,
+    faces: usize,
+    detect_ms: f64,
+    landmarks_ms: f64,
+) -> Pipeline {
+    let mut det_iou = None;
+    let mut landmark_mae_px = None;
+    if let (Some(d), Some(dir)) = (det, &args.ref_dir) {
+        if let Ok(meta) = fs::read_to_string(dir.join("meta.json")) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&meta) {
+                if let Some(rd) = v["detections"].as_array().and_then(|a| a.first()) {
+                    let b = [
+                        rd["x"].as_f64().unwrap_or(0.0) as f32,
+                        rd["y"].as_f64().unwrap_or(0.0) as f32,
+                        rd["w"].as_f64().unwrap_or(0.0) as f32,
+                        rd["h"].as_f64().unwrap_or(0.0) as f32,
+                    ];
+                    det_iou = Some(iou(d, &b));
+                }
+                if let (Some(pts), Some(lms)) = (pts, v["landmarks"].as_array()) {
+                    let n = pts.len().min(lms.len());
+                    if n > 0 {
+                        let s: f32 = pts
+                            .iter()
+                            .zip(lms)
+                            .take(n)
+                            .map(|(p, q)| {
+                                let qx = q["x"].as_f64().unwrap_or(0.0) as f32;
+                                let qy = q["y"].as_f64().unwrap_or(0.0) as f32;
+                                (p[0] - qx).hypot(p[1] - qy)
+                            })
+                            .sum();
+                        landmark_mae_px = Some(s / n as f32);
                     }
                 }
             }
         }
     }
-    Ok(Pipeline {
+    Pipeline {
         faces,
         detect_ms,
         landmarks_ms,
         e2e_ms: detect_ms + landmarks_ms,
         det_iou,
         landmark_mae_px,
-    })
-}
-
-fn crop_box(frame: &BgrImage, d: &[f32; 5]) -> (i32, i32, i32, i32) {
-    let (x, y, w, h) = (d[0], d[1], d[2], d[3]);
-    let x1 = x - (w * 0.1) as i32 as f32;
-    let y1 = y - (h * 0.125) as i32 as f32;
-    let x2 = x + w + (w * 0.1) as i32 as f32;
-    let y2 = y + h + (h * 0.125) as i32 as f32;
-    let clamp = |px: f32, py: f32| {
-        let px = px.clamp(0.0, frame.width as f32 - 1.0) as i32;
-        let py = py.clamp(0.0, frame.height as f32 - 1.0) as i32 + 1;
-        (px, py)
-    };
-    let (x1, y1) = clamp(x1, y1);
-    let (x2, y2) = clamp(x2, y2);
-    (x1, y1, x2, y2)
-}
-
-fn crop_img(im: &BgrImage, x1: i32, y1: i32, x2: i32, y2: i32) -> BgrImage {
-    let x1 = x1.max(0) as u32;
-    let y1 = y1.max(0) as u32;
-    let x2 = (x2.max(0) as u32).min(im.width);
-    let y2 = (y2.max(0) as u32).min(im.height);
-    let w = x2.saturating_sub(x1);
-    let h = y2.saturating_sub(y1);
-    let mut data = Vec::with_capacity((w * h * 3) as usize);
-    for y in y1..y2 {
-        let s = ((y * im.width + x1) * 3) as usize;
-        data.extend_from_slice(&im.data[s..s + (w * 3) as usize]);
     }
-    BgrImage {
-        width: w,
-        height: h,
-        data,
-    }
-}
-
-fn iou(a: &[f32; 5], b: &[f32; 4]) -> f32 {
-    let (ax2, ay2) = (a[0] + a[2], a[1] + a[3]);
-    let (bx2, by2) = (b[0] + b[2], b[1] + b[3]);
-    let l = a[0].max(b[0]);
-    let t = a[1].max(b[1]);
-    let r = ax2.min(bx2);
-    let bot = ay2.min(by2);
-    if r <= l || bot <= t {
-        return 0.0;
-    }
-    let inter = (r - l) * (bot - t);
-    inter / (a[2] * a[3] + b[2] * b[3] - inter)
 }

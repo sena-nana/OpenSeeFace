@@ -207,29 +207,36 @@ def python_bench(args, dump: Path) -> dict:
 
     det_sess = session(md / "mnv3_detection_opt.onnx", args.threads)
     lm_sess = session(md / lm_name, args.threads)
-    t0 = time.perf_counter()
-    dout = as_f32(det_sess.run(None, adapt_feed(det_sess, {"input": imagenet_nchw(frame, 224)})))
-    dets = detect_faces(dout[0], dout[1], frame)
-    detect_ms = (time.perf_counter() - t0) * 1000
-    detections, landmarks, faces, landmarks_ms = [], [], 0, 0.0
-    if len(dets):
-        x, y, w, h, score = dets[0]
-        detections.append({"x": float(x), "y": float(y), "w": float(w), "h": float(h), "score": float(score)})
-        h_img, w_img = frame.shape[:2]
 
-        def clamp(px, py):
-            return int(min(max(px, 0), w_img - 1)), int(min(max(py, 0), h_img - 1)) + 1
+    def run_pipeline():
+        t0 = time.perf_counter()
+        dout = as_f32(det_sess.run(None, adapt_feed(det_sess, {"input": imagenet_nchw(frame, 224)})))
+        dets = detect_faces(dout[0], dout[1], frame)
+        detect_ms = (time.perf_counter() - t0) * 1000
+        detections, landmarks, faces, landmarks_ms = [], [], 0, 0.0
+        if len(dets):
+            x, y, w, h, score = dets[0]
+            detections.append({"x": float(x), "y": float(y), "w": float(w), "h": float(h), "score": float(score)})
+            h_img, w_img = frame.shape[:2]
 
-        x1, y1 = clamp(x - int(w * 0.1), y - int(h * 0.125))
-        x2, y2 = clamp(x + w + int(w * 0.1), y + h + int(h * 0.125))
-        if x2 - x1 >= 4 and y2 - y1 >= 4:
-            t1 = time.perf_counter()
-            crop = imagenet_nchw(frame[y1:y2, x1:x2], lm_size)
-            out = as_f32(lm_sess.run(None, adapt_feed(lm_sess, {"input": crop})))[0]
-            landmarks_ms = (time.perf_counter() - t1) * 1000
-            _, lms = decode_lms(out[0], (x1, y1, (x2 - x1) / lm_size, (y2 - y1) / lm_size), args.model)
-            faces = 1
-            landmarks = [{"x": float(a), "y": float(b), "conf": float(c)} for a, b, c in lms]
+            def clamp(px, py):
+                return int(min(max(px, 0), w_img - 1)), int(min(max(py, 0), h_img - 1)) + 1
+
+            x1, y1 = clamp(x - int(w * 0.1), y - int(h * 0.125))
+            x2, y2 = clamp(x + w + int(w * 0.1), y + h + int(h * 0.125))
+            if x2 - x1 >= 4 and y2 - y1 >= 4:
+                t1 = time.perf_counter()
+                crop = imagenet_nchw(frame[y1:y2, x1:x2], lm_size)
+                out = as_f32(lm_sess.run(None, adapt_feed(lm_sess, {"input": crop})))[0]
+                landmarks_ms = (time.perf_counter() - t1) * 1000
+                _, lms = decode_lms(out[0], (x1, y1, (x2 - x1) / lm_size, (y2 - y1) / lm_size), args.model)
+                faces = 1
+                landmarks = [{"x": float(a), "y": float(b), "conf": float(c)} for a, b, c in lms]
+        return detect_ms, landmarks_ms, faces, detections, landmarks
+
+    for _ in range(max(args.warmup, 1)):
+        run_pipeline()
+    detect_ms, landmarks_ms, faces, detections, landmarks = run_pipeline()
 
     dump.mkdir(parents=True, exist_ok=True)
     meta = {"tensors": {}, "detections": detections, "landmarks": landmarks}
@@ -308,6 +315,19 @@ def main() -> int:
 
     py = python_bench(args, dump)
     (out / "python.json").write_text(json.dumps(py, indent=2))
+
+    if args.device == "gpu":
+        subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "runtime-ort" / "scripts" / "wrap_preprocess.py"),
+                "--models-dir",
+                args.models_dir,
+                "--out-dir",
+                str(Path(args.models_dir) / "pre"),
+            ],
+            check=False,
+        )
 
     crate = ROOT / "runtime-ort"
     rust_bin = crate / "target" / "release" / "osf-bench"

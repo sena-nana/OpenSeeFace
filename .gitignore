@@ -12,3 +12,4 @@ VSeeFace/*
 target/
 runtime-ort/target/
 benchmarks/out/
+models/pre/

@@ -154,7 +154,9 @@ Then run the tracker through uv:
 
     uv run python benchmarks/ab.py --model 3 --threads 4
 
-GPU (CoreML on Apple, CUDA on NVIDIA):
+GPU (CoreML on Apple, CUDA on NVIDIA). Per-model `bench()` times bound inference only.
+The GPU *pipeline* runs Resize+Normalize on the EP (fused MLProgram on CoreML; device tensors on CUDA)
+so the CPU does not build f16 NCHW or read back full heatmaps between detect and landmarks:
 
     uv run python benchmarks/ab.py --model 3 --threads 4 --device gpu
 
