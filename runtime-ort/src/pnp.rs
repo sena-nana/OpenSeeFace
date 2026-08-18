@@ -152,12 +152,7 @@ pub fn project_points(
         .collect()
 }
 
-fn residuals(
-    params: &[f64; 6],
-    obj: &[[f32; 3]],
-    img: &[[f32; 2]],
-    cam: &Camera,
-) -> Vec<f64> {
+fn residuals(params: &[f64; 6], obj: &[[f32; 3]], img: &[[f32; 2]], cam: &Camera) -> Vec<f64> {
     let rvec = [params[0] as f32, params[1] as f32, params[2] as f32];
     let tvec = [params[3] as f32, params[4] as f32, params[5] as f32];
     let proj = project_points(obj, rvec, tvec, cam);
@@ -280,7 +275,9 @@ fn solve6(a: &[[f64; 6]; 6], b: &[f64; 6]) -> Option<[f64; 6]> {
             m[(i, j)] = a[i][j];
         }
     }
-    m.lu().solve(&v).map(|x| [x[0], x[1], x[2], x[3], x[4], x[5]])
+    m.lu()
+        .solve(&v)
+        .map(|x| [x[0], x[1], x[2], x[3], x[4], x[5]])
 }
 
 pub fn euler_from_rmat(r: &Matrix3<f32>) -> [f32; 3] {
@@ -560,13 +557,7 @@ pub fn adjust_3d(
 ) {
     if conf < 0.4 || pnp_error > 300.0 {
         normalize_pts3d(pts_3d, face_3d);
-        apply_features(
-            pts_3d,
-            feature_level,
-            features,
-            current_features,
-            eye_blink,
-        );
+        apply_features(pts_3d, feature_level, features, current_features, eye_blink);
         return;
     }
     if model_type != -1 && !static_model {
@@ -610,7 +601,11 @@ pub fn adjust_3d(
             }
         }
         if !skip {
-            let ut = if update_type < 0 { 0 } else { update_type as usize };
+            let ut = if update_type < 0 {
+                0
+            } else {
+                update_type as usize
+            };
             let other = 1 - ut;
             eligible.retain(|&i| update_counts[i][ut] < update_counts[i][other] + 75.0);
             if !eligible.is_empty() {
@@ -655,13 +650,7 @@ pub fn adjust_3d(
         }
     }
     normalize_pts3d(pts_3d, face_3d);
-    apply_features(
-        pts_3d,
-        feature_level,
-        features,
-        current_features,
-        eye_blink,
-    );
+    apply_features(pts_3d, feature_level, features, current_features, eye_blink);
 }
 
 fn apply_features(

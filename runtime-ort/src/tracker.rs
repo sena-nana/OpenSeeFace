@@ -4,13 +4,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
+use crate::crop::{stable_landmark_bbox, CropSmoothState};
 use crate::decode::{decode_landmarks, detect_faces_n, LmSpec};
 use crate::features::FeatureExtractor;
 use crate::gaze::get_eye_state;
 use crate::geom::{clamp_to_im, group_rects};
-use crate::pnp::{
-    adjust_3d, estimate_depth, Camera, CONTOUR_PTS, CONTOUR_PTS_T, FACE_3D,
-};
+use crate::pnp::{adjust_3d, estimate_depth, Camera, CONTOUR_PTS, CONTOUR_PTS_T, FACE_3D};
 use crate::preprocess::{crop_img, imagenet_nchw, BgrImage};
 use crate::retinaface::RetinaFace;
 use crate::session::OrtModel;
@@ -65,6 +64,7 @@ pub struct FaceInfo {
     fail_count: i32,
     update_counts: [[f32; 2]; 66],
     features: FeatureExtractor,
+    crop_smooth: CropSmoothState,
 }
 
 impl FaceInfo {
@@ -92,6 +92,7 @@ impl FaceInfo {
             fail_count: 0,
             update_counts: [[0.0; 2]; 66],
             features: FeatureExtractor::new(max_feature_updates),
+            crop_smooth: CropSmoothState::default(),
         };
         s.update_contour(model_type);
         s
@@ -133,6 +134,7 @@ impl FaceInfo {
         self.update_contour(model_type);
         self.fail_count = 0;
         self.coord = None;
+        self.crop_smooth.reset();
     }
 
     fn update_det(
@@ -320,7 +322,10 @@ impl Tracker {
         if self.spec.model_type != -1 {
             return (conf, lms);
         }
-        let mapped: Vec<[f32; 3]> = MAP30.iter().map(|&i| lms.get(i).copied().unwrap_or([0.0; 3])).collect();
+        let mapped: Vec<[f32; 3]> = MAP30
+            .iter()
+            .map(|&i| lms.get(i).copied().unwrap_or([0.0; 3]))
+            .collect();
         lms = mapped;
         let mut cs: Vec<f32> = lms.iter().map(|p| p[2]).collect();
         cs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -580,13 +585,17 @@ impl Tracker {
                 fi.fail_count += 1;
                 if fi.fail_count > 5 {
                     if !self.silent {
-                        eprintln!("Detected anomaly when 3D fitting face {}. Resetting.", fi.id);
+                        eprintln!(
+                            "Detected anomaly when 3D fitting face {}. Resetting.",
+                            fi.id
+                        );
                     }
                     fi.face_3d = FACE_3D.to_vec();
                     fi.rotation = None;
                     fi.translation = [0.0; 3];
                     fi.update_counts = [[0.0; 2]; 66];
                     fi.update_contour(model_type);
+                    fi.crop_smooth.reset();
                 }
             } else {
                 fi.fail_count = 0;
@@ -621,7 +630,12 @@ impl Tracker {
                 y2 = y2.max(p[1]);
             }
             fi.bbox = [y1, x1, y2 - y1, x2 - x1];
-            detected.push(fi.bbox);
+            fi.crop_smooth.seed_size(fi.bbox);
+            let next = stable_landmark_bbox(&fi.lms, Some(&mut fi.crop_smooth))
+                .map(|b| [b[0], b[1], b[2], b[3]])
+                .or_else(|| fi.crop_smooth.last_box())
+                .unwrap_or([0.0, 0.0, 1.0, 1.0]);
+            detected.push(next);
             results.push(fi.clone());
             let _ = max_fu;
         }

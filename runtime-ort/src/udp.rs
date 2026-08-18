@@ -92,7 +92,17 @@ mod tests {
         assert_eq!(encode_face(&f).len(), PACKET_FRAME_SIZE);
         assert_eq!(
             PACKET_FRAME_SIZE,
-            8 + 4 + 2 * 4 + 2 * 4 + 1 + 4 + 3 * 4 + 3 * 4 + 4 * 4 + 4 * 68 + 4 * 2 * 68 + 4 * 3 * 70
+            8 + 4
+                + 2 * 4
+                + 2 * 4
+                + 1
+                + 4
+                + 3 * 4
+                + 3 * 4
+                + 4 * 4
+                + 4 * 68
+                + 4 * 2 * 68
+                + 4 * 3 * 70
                 + 4 * 14
         );
     }

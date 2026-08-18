@@ -22,7 +22,12 @@ fn extract_face(frame: &BgrImage, lms: &[[f32; 3]]) -> (BgrImage, Vec<[f32; 2]>,
     let radius_y = 1.2 * (y2 - y1) / 2.0;
     let cx = (x1 + x2) / 2.0;
     let cy = (y1 + y2) / 2.0;
-    let (x1, y1) = clamp_to_im(cx - radius_x, cy - radius_y, frame.height as f32, frame.width as f32);
+    let (x1, y1) = clamp_to_im(
+        cx - radius_x,
+        cy - radius_y,
+        frame.height as f32,
+        frame.width as f32,
+    );
     let (x2, y2) = clamp_to_im(
         cx + radius_x + 1.0,
         cy + radius_y + 1.0,
@@ -47,11 +52,7 @@ struct EyePrep {
     angle: f32,
 }
 
-fn prepare_eye(
-    face: &BgrImage,
-    corners: [[f32; 2]; 2],
-    flip: bool,
-) -> Option<EyePrep> {
+fn prepare_eye(face: &BgrImage, corners: [[f32; 2]; 2], flip: bool) -> Option<EyePrep> {
     let c1 = corners[0];
     let (c2, a) = compensate(c1, corners[1]);
     let center = [(c1[0] + c2.0) / 2.0, (c1[1] + c2.1) / 2.0];
@@ -147,11 +148,7 @@ pub fn get_eye_state(
             eye_x = p.x1 + p.scale[0] * (32.0 - eye_x);
         }
         eye_y = p.y1 + p.scale[1] * eye_y;
-        let (eye_x, eye_y) = rotate(
-            (p.reference[0], p.reference[1]),
-            (eye_x, eye_y),
-            -p.angle,
-        );
+        let (eye_x, eye_y) = rotate((p.reference[0], p.reference[1]), (eye_x, eye_y), -p.angle);
         let eye_x = eye_x + offset[0];
         let eye_y = eye_y + offset[1];
         state[i] = [1.0, eye_y, eye_x, *conf];

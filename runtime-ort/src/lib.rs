@@ -2,6 +2,7 @@
 
 mod adaptive;
 mod capture;
+mod crop;
 mod decode;
 mod enhance;
 mod enhance_gpu;
@@ -23,12 +24,14 @@ pub use adaptive::{
     FAST_LM,
 };
 pub use capture::{list_cameras, mirror_bgr, InputSource, VideoOut};
+pub use crop::{stable_landmark_bbox, CropSmoothState, CropTrack};
 pub use decode::{
     decode_landmarks, detect_faces, detect_faces_n, landmark_bbox, mean_conf, LmSpec, TensorF16,
     EYE_IDX,
 };
 pub use enhance::{enhance_bgr, enhance_bgr_in_place, EnhanceCfg, HeMode};
 pub use features::FEATURE_NAMES;
+pub use geom::xywh_iou;
 pub use gpu_pre::GpuTracker;
 pub use metrics::{cosine, max_abs, mean_abs, model_path, read_f32_le, rss, Latency, Rss};
 pub use pnp::Camera;

@@ -123,6 +123,10 @@ Face-size adaptive tracking: CPU zooms the 224 detector on small faces and switc
     cargo run --release --manifest-path runtime-ort/Cargo.toml --bin osf-bench -- --suite scale
     cargo run --release --features gpu --manifest-path runtime-ort/Cargo.toml --bin osf-bench -- --suite scale --device gpu
 
+Next-frame crop uses an eyes+nose similarity fit (jitter / hold report):
+
+    cargo run --release --manifest-path runtime-ort/Cargo.toml --bin osf-bench -- --suite crop --model 3 --threads 4
+
 # References
 
 ## Training dataset

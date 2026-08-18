@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use clap::Parser;
 use osf_ort::{
-    dump_symmetric_points, draw_tracking, encode_faces, list_cameras, mirror_bgr, model_base_path,
+    draw_tracking, dump_symmetric_points, encode_faces, list_cameras, mirror_bgr, model_base_path,
     FacePacket, InputSource, Tracker, TrackerConfig, VideoOut, VizWindow, PACKET_FRAME_SIZE,
 };
 
@@ -108,7 +108,8 @@ fn main() -> Result<()> {
     )?;
     let sock = UdpSocket::bind("0.0.0.0:0").context("udp bind")?;
     let dest = format!("{}:{}", args.ip, args.port);
-    let pace = (args.fps > 0 && !input.is_video).then(|| Duration::from_secs_f64(1.0 / args.fps as f64));
+    let pace =
+        (args.fps > 0 && !input.is_video).then(|| Duration::from_secs_f64(1.0 / args.fps as f64));
 
     let mut tracker = None;
     let mut viz = None;
@@ -160,6 +161,7 @@ fn main() -> Result<()> {
                 max_feature_updates: args.max_feature_updates,
                 static_model: args.no_3d_adapt == 1,
                 try_hard: args.try_hard == 1,
+                ..TrackerConfig::default()
             })?);
             if args.visualize != 0 {
                 viz = VizWindow::open(frame.width, frame.height).ok();

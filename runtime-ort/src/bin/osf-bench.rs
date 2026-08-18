@@ -8,10 +8,10 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use osf_ort::{
     center_2x, cosine, crop_box, crop_box_pad, crop_img, decode_landmarks, det_window,
-    detect_faces, enhance_bgr, face_crop, imagenet_nchw, iou, landmark_bbox, max_abs, mean_abs,
-    mean_conf, model_path, nme, paste_bgr, pick_lm, read_f32_le, resize_bgr, retina_nchw, rss,
-    synth_canvas, AdaptiveCfg, AdaptiveState, BgrImage, DetWindow, Device, EnhanceCfg, GpuTracker,
-    Latency, LmSpec, OrtModel, TensorF16, EYE_IDX, FAST_LM, VERSION,
+    detect_faces, enhance_bgr, face_crop, imagenet_nchw, iou, max_abs, mean_abs, mean_conf,
+    model_path, nme, paste_bgr, pick_lm, read_f32_le, resize_bgr, retina_nchw, rss, synth_canvas,
+    xywh_iou, AdaptiveCfg, AdaptiveState, BgrImage, CropTrack, DetWindow, Device, EnhanceCfg,
+    GpuTracker, Latency, LmSpec, OrtModel, TensorF16, EYE_IDX, FAST_LM, VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -32,7 +32,7 @@ struct Args {
     /// cpu | gpu (CoreML on Apple, CUDA on NVIDIA)
     #[arg(long, default_value = "cpu")]
     device: String,
-    /// micro | realistic | all | scale | enhance
+    /// micro | realistic | all | scale | enhance | crop
     #[arg(long, default_value = "micro")]
     suite: String,
     #[arg(long)]
@@ -172,6 +172,11 @@ fn main() -> Result<()> {
     if args.suite == "enhance" {
         let path = args.out.clone().unwrap_or_else(default_enhance_out);
         run_enhance_suite(&args, spec, device, &path)?;
+        return Ok(());
+    }
+    if args.suite == "crop" {
+        let path = args.out.clone().unwrap_or_else(default_crop_out);
+        run_crop_suite(&args, spec, device, &path)?;
         return Ok(());
     }
     let run_micro = args.suite == "micro" || args.suite == "all";
@@ -516,6 +521,7 @@ fn finish_pipeline(
 struct Row {
     detect_ms: f64,
     crop_ms: f64,
+    box_ms: f64,
     pre_ms: f64,
     lm_ms: f64,
     decode_ms: f64,
@@ -602,6 +608,7 @@ fn one_frame(
     do_gaze: bool,
     adaptive: Option<(&AdaptiveCfg, &mut AdaptiveState)>,
     enhance: EnhanceCfg,
+    crop: &mut CropTrack,
 ) -> Result<Row> {
     let enhanced;
     let frame = if gpu.is_none() && !enhance.is_off() {
@@ -633,6 +640,7 @@ fn one_frame(
     let miss = || Row {
         detect_ms,
         crop_ms: 0.0,
+        box_ms: 0.0,
         pre_ms: 0.0,
         lm_ms: 0.0,
         decode_ms: 0.0,
@@ -650,6 +658,7 @@ fn one_frame(
         pts: Vec::new(),
     };
     let Some(d) = box5 else {
+        crop.reset();
         return Ok(miss());
     };
     let face_h = d[3];
@@ -666,6 +675,7 @@ fn one_frame(
     let (x1, y1, x2, y2) = crop_box_pad(frame, &d, pad_x, pad_y);
     let (crop_w, crop_h) = ((x2 - x1).max(0) as u32, (y2 - y1).max(0) as u32);
     if crop_w < 4 || crop_h < 4 {
+        crop.reset();
         return Ok(miss());
     }
     let crop_ms = t.elapsed().as_secs_f64() * 1000.0;
@@ -674,7 +684,10 @@ fn one_frame(
         let (lm, run_spec) = pipe.lm.pair(lm_type);
         match run_landmarks(lm, frame, &d, run_spec, pad_x, pad_y) {
             Ok(v) => v,
-            Err(_) => return Ok(miss()),
+            Err(_) => {
+                crop.reset();
+                return Ok(miss());
+            }
         }
     } else if let Some(tr) = gpu.as_mut() {
         let decoded = tr.landmarks(frame, &d, spec, pad_x, pad_y)?;
@@ -686,9 +699,13 @@ fn one_frame(
             0.0,
         )
     } else {
+        crop.reset();
         return Ok(miss());
     };
-    let mut next = landmark_bbox(&pts).unwrap_or(d);
+    let t_box = Instant::now();
+    crop.seed_size([d[0], d[1], d[2], d[3]]);
+    let mut next = crop.next_box(&pts, conf).unwrap_or(d);
+    let box_ms = t_box.elapsed().as_secs_f64() * 1000.0;
     next[4] = conf;
     let mut gconf = None;
     let mut gaze_ms = 0.0;
@@ -708,6 +725,7 @@ fn one_frame(
     Ok(Row {
         detect_ms,
         crop_ms,
+        box_ms,
         pre_ms,
         lm_ms,
         decode_ms,
@@ -920,6 +938,7 @@ fn run_scenario_dir(
             .transpose()?;
         let enh = args.enhance_cfg();
         let mut state = cfg.map(AdaptiveState::new);
+        let mut crop = CropTrack::new();
         let mut step = |box5: Option<[f32; 5]>,
                         frame: &BgrImage,
                         scanned: bool,
@@ -940,6 +959,7 @@ fn run_scenario_dir(
                     _ => None,
                 },
                 enh,
+                &mut crop,
             )
         };
         for _ in 0..args.warmup.max(1) {
@@ -1008,6 +1028,10 @@ fn default_scale_out() -> PathBuf {
 
 fn default_enhance_out() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../benchmarks/out/enhance_sweep.json")
+}
+
+fn default_crop_out() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../benchmarks/out/crop_sweep.json")
 }
 
 const SCALE_FRACS: [f32; 7] = [0.10, 0.14, 0.20, 0.28, 0.36, 0.48, 0.60];
@@ -1126,6 +1150,7 @@ fn make_scale_seq_n(face: &BgrImage, face_h: f32, frac: f32, n: usize, wander: b
     }
 }
 
+#[derive(Clone)]
 struct TeachFrame {
     pts: Vec<[f32; 3]>,
     hit: bool,
@@ -1138,15 +1163,21 @@ fn run_seq(
     seq: &ScaleSeq,
     cfg: Option<&AdaptiveCfg>,
     enhance: EnhanceCfg,
+    scan_every: u32,
 ) -> Result<Vec<Row>> {
     let mut state = cfg.copied().map(AdaptiveState::new);
     let mut box5 = None;
     let mut rows = Vec::with_capacity(seq.frames.len());
     let mut gaze = None;
-    for frame in &seq.frames {
+    let mut crop = CropTrack::new();
+    for (i, frame) in seq.frames.iter().enumerate() {
         let ad = match (cfg, state.as_mut()) {
             (Some(c), Some(s)) => Some((c, s)),
             _ => None,
+        };
+        let do_detect = match scan_every {
+            0 => box5.is_none(),
+            n => box5.is_none() || (i as u32 % n == 0),
         };
         let row = one_frame(
             cpu.as_deref_mut(),
@@ -1157,10 +1188,11 @@ fn run_seq(
             box5,
             0.1,
             0.125,
-            true,
+            do_detect,
             false,
             ad,
             enhance,
+            &mut crop,
         )?;
         box5 = row.box5;
         rows.push(row);
@@ -1267,21 +1299,37 @@ fn run_scale_suite(args: &Args, _spec: LmSpec, device: Device, out: &Path) -> Re
             enh,
         )?;
         for _ in 0..args.warmup.max(2) {
-            let _ = run_seq(None, Some(&mut gpu), spec, &seqs[0], None, enh)?;
+            let _ = run_seq(None, Some(&mut gpu), spec, &seqs[0], None, enh, 1)?;
         }
         let mut base = Vec::new();
         let mut ad = Vec::new();
         for seq in &seqs {
-            base.push(run_seq(None, Some(&mut gpu), spec, seq, None, enh)?);
-            ad.push(run_seq(None, Some(&mut gpu), spec, seq, Some(&cfg), enh)?);
+            base.push(run_seq(None, Some(&mut gpu), spec, seq, None, enh, 1)?);
+            ad.push(run_seq(
+                None,
+                Some(&mut gpu),
+                spec,
+                seq,
+                Some(&cfg),
+                enh,
+                1,
+            )?);
         }
         (base, ad)
     } else {
         let mut base = Vec::new();
         let mut ad = Vec::new();
         for seq in &seqs {
-            base.push(run_seq(Some(&mut pipe), None, spec, seq, None, enh)?);
-            ad.push(run_seq(Some(&mut pipe), None, spec, seq, Some(&cfg), enh)?);
+            base.push(run_seq(Some(&mut pipe), None, spec, seq, None, enh, 1)?);
+            ad.push(run_seq(
+                Some(&mut pipe),
+                None,
+                spec,
+                seq,
+                Some(&cfg),
+                enh,
+                1,
+            )?);
         }
         (base, ad)
     };
@@ -1465,7 +1513,7 @@ fn score_seq(
     teacher: &[Vec<TeachFrame>],
     enhance: EnhanceCfg,
 ) -> Result<(f32, f32, f64)> {
-    let rows = run_seq(cpu, gpu, spec, seq, None, enhance)?;
+    let rows = run_seq(cpu, gpu, spec, seq, None, enhance, 1)?;
     let (s, _) = score_against_teacher(
         &[ScaleSeq {
             face_frac: seq.face_frac,
@@ -1528,7 +1576,7 @@ fn seq_recall(
     seq: &ScaleSeq,
     enhance: EnhanceCfg,
 ) -> Result<f32> {
-    let rows = run_seq(Some(pipe), None, spec, seq, None, enhance)?;
+    let rows = run_seq(Some(pipe), None, spec, seq, None, enhance, 1)?;
     let hits = rows.iter().filter(|r| r.faces > 0).count();
     Ok(hits as f32 / rows.len().max(1) as f32)
 }
@@ -1674,7 +1722,15 @@ fn run_enhance_suite(args: &Args, _spec: LmSpec, device: Device, out: &Path) -> 
         |s| format!("σ={s:.0}"),
     )?;
 
-    let teacher_rows = run_seq(Some(&mut pipe), None, spec, &clean, None, EnhanceCfg::off())?;
+    let teacher_rows = run_seq(
+        Some(&mut pipe),
+        None,
+        spec,
+        &clean,
+        None,
+        EnhanceCfg::off(),
+        1,
+    )?;
     let teacher = vec![rows_to_teacher(teacher_rows)];
     let seqs: Vec<(&'static str, ScaleSeq)> = vec![
         ("clean", clean.clone()),
@@ -1790,6 +1846,204 @@ fn run_enhance_suite(args: &Args, _spec: LmSpec, device: Device, out: &Path) -> 
         winner_name: winner.name.clone(),
         baseline,
         trials,
+    };
+    if let Some(dir) = out.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    fs::write(out, serde_json::to_string_pretty(&report)?)?;
+    eprintln!("wrote {}", out.display());
+    Ok(())
+}
+
+#[derive(Clone, Serialize)]
+struct CropSceneScore {
+    scene: String,
+    center_rmse: f32,
+    scale_cv: f32,
+    iou_mean: f32,
+    mean_h: f32,
+    lm_conf: Option<f32>,
+    eye_conf: Option<f32>,
+    recall: f32,
+    max_streak: usize,
+    drops: usize,
+    e2e_p50_ms: f64,
+    lm_p50_ms: f64,
+    box_p50_ms: f64,
+    hits: usize,
+    frames: usize,
+}
+
+#[derive(Serialize)]
+struct CropReport {
+    frames: usize,
+    scenes: Vec<CropSceneScore>,
+}
+
+fn crop_score(rows: &[Row]) -> CropSceneScore {
+    let mut cx = Vec::new();
+    let mut cy = Vec::new();
+    let mut hs = Vec::new();
+    let mut ious = Vec::new();
+    let mut prev: Option<[f32; 4]> = None;
+    let mut hits = 0usize;
+    let mut streak = 0usize;
+    let mut max_streak = 0usize;
+    let mut drops = 0usize;
+    let mut was_hit = false;
+    let mut e2e = Vec::new();
+    let mut lm_ms = Vec::new();
+    let mut box_ms = Vec::new();
+    let mut lm = Vec::new();
+    let mut eye = Vec::new();
+    for r in rows {
+        e2e.push(r.e2e_ms);
+        lm_ms.push(r.lm_ms);
+        box_ms.push(r.box_ms);
+        let hit = r.faces > 0;
+        if hit {
+            hits += 1;
+            streak += 1;
+            max_streak = max_streak.max(streak);
+            if let Some(b) = r.box5 {
+                cx.push(b[0] + b[2] * 0.5);
+                cy.push(b[1] + b[3] * 0.5);
+                hs.push(b[3]);
+                if let Some(p) = prev {
+                    ious.push(xywh_iou(p, [b[0], b[1], b[2], b[3]]));
+                }
+                prev = Some([b[0], b[1], b[2], b[3]]);
+            }
+            if let Some(c) = r.lm_conf {
+                lm.push(c);
+            }
+            if let Some(c) = r.eye_conf {
+                eye.push(c);
+            }
+        } else {
+            if was_hit {
+                drops += 1;
+            }
+            streak = 0;
+            prev = None;
+        }
+        was_hit = hit;
+    }
+    let n = cx.len() as f32;
+    let mx = mean_f32(&cx).unwrap_or(0.0);
+    let my = mean_f32(&cy).unwrap_or(0.0);
+    let rmse = if n > 0.0 {
+        (cx.iter()
+            .zip(&cy)
+            .map(|(x, y)| (x - mx) * (x - mx) + (y - my) * (y - my))
+            .sum::<f32>()
+            / n)
+            .sqrt()
+    } else {
+        0.0
+    };
+    let mh = mean_f32(&hs).unwrap_or(0.0);
+    let var_h = if n > 0.0 && mh > 1e-3 {
+        hs.iter().map(|h| (h - mh) * (h - mh)).sum::<f32>() / n
+    } else {
+        0.0
+    };
+    CropSceneScore {
+        scene: String::new(),
+        center_rmse: rmse,
+        scale_cv: if mh > 1e-3 { var_h.sqrt() / mh } else { 0.0 },
+        iou_mean: mean_f32(&ious).unwrap_or(0.0),
+        mean_h: mh,
+        lm_conf: mean_f32(&lm),
+        eye_conf: mean_f32(&eye),
+        recall: hits as f32 / rows.len().max(1) as f32,
+        max_streak,
+        drops,
+        e2e_p50_ms: Latency::from_samples(0, &e2e).p50_ms,
+        lm_p50_ms: Latency::from_samples(0, &lm_ms).p50_ms,
+        box_p50_ms: Latency::from_samples(0, &box_ms).p50_ms,
+        hits,
+        frames: rows.len(),
+    }
+}
+
+fn print_crop_scene(tag: &str, s: &CropSceneScore) {
+    eprintln!(
+        "  {tag:16} rmse={:.3} cv={:.4} iou={:.3} h={:.1} rec={:.3} lm={:.3} e2e={:.2}ms infer={:.2}ms box={:.3}ms",
+        s.center_rmse,
+        s.scale_cv,
+        s.iou_mean,
+        s.mean_h,
+        s.recall,
+        s.lm_conf.unwrap_or(0.0),
+        s.e2e_p50_ms,
+        s.lm_p50_ms,
+        s.box_p50_ms
+    );
+}
+
+fn run_crop_suite(args: &Args, _spec: LmSpec, device: Device, out: &Path) -> Result<()> {
+    let spec = LmSpec::from_type(3)?;
+    let mut pipe = open_cpu_pipe(args, spec, false)?;
+    let seed = BgrImage::load(&args.image)?;
+    let (tile, face_h) = extract_face_tile(&mut pipe, &seed)?;
+    let n = args.frames.max(30);
+    eprintln!(
+        "crop: seed face_h={face_h:.1}px, {n} frames/scene ({})",
+        device.as_str()
+    );
+    let mut static_seq = make_scale_seq_n(&tile, face_h, 0.20, n, false);
+    if let Some(first) = static_seq.frames.first().cloned() {
+        static_seq.frames = vec![first; n];
+    }
+    let wander = make_scale_seq_n(&tile, face_h, 0.20, n, true);
+    let far = make_scale_seq_n(&tile, face_h, 0.08, n, true);
+    let noisy = {
+        let s = make_scale_seq_n(&tile, face_h, 0.20, n, true);
+        ScaleSeq {
+            face_frac: s.face_frac,
+            frames: s
+                .frames
+                .iter()
+                .enumerate()
+                .map(|(i, f)| degrade_noise(f, 34.0, 0xC0FFEE ^ (i as u32 * 997)))
+                .collect(),
+        }
+    };
+    let scenes: [(&str, ScaleSeq); 4] = [
+        ("static", static_seq),
+        ("wander", wander),
+        ("far", far),
+        ("noisy", noisy),
+    ];
+
+    let mut gpu = (device == Device::Gpu)
+        .then(|| {
+            GpuTracker::with_enhance(
+                &args.models_dir,
+                spec,
+                args.threads,
+                &scenes[0].1.frames[0],
+                EnhanceCfg::off(),
+            )
+        })
+        .transpose()?;
+
+    let mut scores = Vec::new();
+    for (scene_name, seq) in &scenes {
+        let rows = if let Some(g) = gpu.as_mut() {
+            run_seq(None, Some(g), spec, seq, None, EnhanceCfg::off(), 0)?
+        } else {
+            run_seq(Some(&mut pipe), None, spec, seq, None, EnhanceCfg::off(), 0)?
+        };
+        let mut sc = crop_score(&rows);
+        sc.scene = (*scene_name).into();
+        print_crop_scene(*scene_name, &sc);
+        scores.push(sc);
+    }
+    let report = CropReport {
+        frames: n,
+        scenes: scores,
     };
     if let Some(dir) = out.parent() {
         fs::create_dir_all(dir)?;

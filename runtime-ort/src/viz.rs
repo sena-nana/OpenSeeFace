@@ -16,7 +16,13 @@ pub fn draw_tracking(
 ) {
     for f in faces {
         if visualize > 1 {
-            put_text(frame, &f.id.to_string(), f.bbox[0] as i32, f.bbox[1] as i32, [255, 0, 255]);
+            put_text(
+                frame,
+                &f.id.to_string(),
+                f.bbox[0] as i32,
+                f.bbox[1] as i32,
+                [255, 0, 255],
+            );
         }
         if visualize > 2 {
             put_text(
@@ -39,7 +45,11 @@ pub fn draw_tracking(
             if visualize > 3 {
                 put_text(frame, &pt_num.to_string(), y, x, [0, 255, 255]);
             }
-            let color = if pt_num >= 66 { [0, 255, 255] } else { [0, 255, 0] };
+            let color = if pt_num >= 66 {
+                [0, 255, 255]
+            } else {
+                [0, 255, 0]
+            };
             if x >= 0 && y >= 0 && x < frame.height as i32 && y < frame.width as i32 {
                 frame.set(y, x, color);
             }
@@ -47,7 +57,12 @@ pub fn draw_tracking(
         if pnp_points != 0 {
             if let Some(rvec) = f.rotation {
                 let pts = if pnp_points > 1 {
-                    project_points(&f.face_3d[..66.min(f.face_3d.len())], rvec, f.translation, cam)
+                    project_points(
+                        &f.face_3d[..66.min(f.face_3d.len())],
+                        rvec,
+                        f.translation,
+                        cam,
+                    )
                 } else {
                     project_points(&f.contour, rvec, f.translation, cam)
                 };
@@ -87,19 +102,41 @@ fn draw_char(frame: &mut BgrImage, ch: char, x: i32, y: i32, color: [u8; 3]) {
 
 fn glyph(ch: char) -> [u8; 7] {
     match ch {
-        '0' => [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
-        '1' => [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
-        '2' => [0b01110, 0b10001, 0b00001, 0b00110, 0b01000, 0b10000, 0b11111],
-        '3' => [0b01110, 0b10001, 0b00001, 0b00110, 0b00001, 0b10001, 0b01110],
-        '4' => [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010],
-        '5' => [0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110],
-        '6' => [0b01110, 0b10000, 0b11110, 0b10001, 0b10001, 0b10001, 0b01110],
-        '7' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000],
-        '8' => [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
-        '9' => [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110],
+        '0' => [
+            0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110,
+        ],
+        '1' => [
+            0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+        ],
+        '2' => [
+            0b01110, 0b10001, 0b00001, 0b00110, 0b01000, 0b10000, 0b11111,
+        ],
+        '3' => [
+            0b01110, 0b10001, 0b00001, 0b00110, 0b00001, 0b10001, 0b01110,
+        ],
+        '4' => [
+            0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
+        ],
+        '5' => [
+            0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110,
+        ],
+        '6' => [
+            0b01110, 0b10000, 0b11110, 0b10001, 0b10001, 0b10001, 0b01110,
+        ],
+        '7' => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000,
+        ],
+        '8' => [
+            0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
+        ],
+        '9' => [
+            0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110,
+        ],
         '.' => [0, 0, 0, 0, 0, 0b00100, 0b00100],
         '-' => [0, 0, 0, 0b11111, 0, 0, 0],
-        _ => [0b11111, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11111],
+        _ => [
+            0b11111, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11111,
+        ],
     }
 }
 
@@ -132,8 +169,7 @@ impl VizWindow {
         for y in 0..self.h.min(sh) {
             for x in 0..self.w.min(sw) {
                 let c = frame.get(x as i32, y as i32);
-                buf[y * self.w + x] =
-                    (c[2] as u32) << 16 | (c[1] as u32) << 8 | c[0] as u32;
+                buf[y * self.w + x] = (c[2] as u32) << 16 | (c[1] as u32) << 8 | c[0] as u32;
             }
         }
         let _ = self.win.update_with_buffer(&buf, self.w, self.h);

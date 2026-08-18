@@ -123,7 +123,8 @@ impl Feature {
 
     fn update_state(&mut self, x: f32, now: f32) -> f32 {
         let updating = self.updating
-            && (self.max_feature_updates == 0.0 || now - self.first_seen < self.max_feature_updates);
+            && (self.max_feature_updates == 0.0
+                || now - self.first_seen < self.max_feature_updates);
         if updating {
             self.median.add(x);
             self.current_median = self.median.median();
@@ -283,8 +284,7 @@ impl FeatureExtractor {
             let (a4, _) = Self::align_points(p(31), p(35), &[]);
             let norm_angle =
                 (a1.to_degrees() + a2.to_degrees() + a3.to_degrees() + a4.to_degrees()) / 4.0;
-            let (a, f_pts) =
-                Self::align_points(p(22), p(26), &[p(22), p(23), p(24), p(25), p(26)]);
+            let (a, f_pts) = Self::align_points(p(22), p(26), &[p(22), p(23), p(24), p(25), p(26)]);
             let steep_l = self
                 .eyebrow_steepness_l
                 .update(-a.to_degrees() - norm_angle, now);
@@ -295,8 +295,7 @@ impl FeatureExtractor {
                 / ny;
             let quirk_l = self.eyebrow_quirk_l.update(f, now);
 
-            let (a, f_pts) =
-                Self::align_points(p(17), p(21), &[p(17), p(18), p(19), p(20), p(21)]);
+            let (a, f_pts) = Self::align_points(p(17), p(21), &[p(17), p(18), p(19), p(20), p(21)]);
             let steep_r = self
                 .eyebrow_steepness_r
                 .update(a.to_degrees() - norm_angle, now);

@@ -18,9 +18,21 @@ pub struct InputSource {
 }
 
 enum Inner {
-    Raw { width: u32, height: u32, stdin: std::io::Stdin },
-    Still { frame: BgrImage, done: bool, repeat: bool },
-    Ffmpeg { child: Child, width: u32, height: u32 },
+    Raw {
+        width: u32,
+        height: u32,
+        stdin: std::io::Stdin,
+    },
+    Still {
+        frame: BgrImage,
+        done: bool,
+        repeat: bool,
+    },
+    Ffmpeg {
+        child: Child,
+        width: u32,
+        height: u32,
+    },
     Camera(CameraCap),
 }
 
@@ -97,7 +109,11 @@ impl InputSource {
 
     pub fn read(&mut self) -> Result<Option<BgrImage>> {
         match &mut self.inner {
-            Inner::Raw { width, height, stdin } => {
+            Inner::Raw {
+                width,
+                height,
+                stdin,
+            } => {
                 let n = (*width as usize) * (*height as usize) * 3;
                 let mut buf = vec![0u8; n];
                 if stdin.read_exact(&mut buf).is_err() {
@@ -109,7 +125,11 @@ impl InputSource {
                     data: buf,
                 }))
             }
-            Inner::Still { frame, done, repeat } => {
+            Inner::Still {
+                frame,
+                done,
+                repeat,
+            } => {
                 if *done && !*repeat {
                     return Ok(None);
                 }
