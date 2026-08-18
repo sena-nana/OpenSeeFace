@@ -16,7 +16,7 @@ use crate::decode::LmSpec;
 use crate::decode::{decode_landmarks, detect_faces};
 use crate::preprocess::BgrImage;
 #[cfg(feature = "gpu")]
-use crate::preprocess::{crop_box, crop_img};
+use crate::preprocess::{crop_box_pad, crop_img};
 #[cfg(feature = "gpu")]
 use crate::session::Device;
 #[cfg(feature = "gpu")]
@@ -131,14 +131,16 @@ impl GpuTracker {
         frame: &BgrImage,
         det: &[f32; 5],
         spec: LmSpec,
+        pad_x: f32,
+        pad_y: f32,
     ) -> Result<(f32, Vec<[f32; 3]>)> {
         #[cfg(not(feature = "gpu"))]
         {
-            let _ = (frame, det, spec);
+            let _ = (frame, det, spec, pad_x, pad_y);
             bail!("GPU requested; rebuild with `--features gpu`");
         }
         #[cfg(feature = "gpu")]
-        self.pipe.landmarks(frame, det, spec)
+        self.pipe.landmarks(frame, det, spec, pad_x, pad_y)
     }
 }
 
@@ -205,8 +207,10 @@ impl CoreMlPipe {
         frame: &BgrImage,
         det: &[f32; 5],
         spec: LmSpec,
+        pad_x: f32,
+        pad_y: f32,
     ) -> Result<(f32, Vec<[f32; 3]>)> {
-        let (x1, y1, x2, y2) = crop_box(frame, det);
+        let (x1, y1, x2, y2) = crop_box_pad(frame, det, pad_x, pad_y);
         let crop = crop_img(frame, x1, y1, x2, y2);
         if crop.width < 4 || crop.height < 4 {
             bail!("crop too small");
@@ -458,9 +462,11 @@ impl CudaPipe {
         frame: &BgrImage,
         det: &[f32; 5],
         spec: LmSpec,
+        pad_x: f32,
+        pad_y: f32,
     ) -> Result<(f32, Vec<[f32; 3]>)> {
         self.upload_frame(frame)?;
-        let (x1, y1, x2, y2) = crop_box(frame, det);
+        let (x1, y1, x2, y2) = crop_box_pad(frame, det, pad_x, pad_y);
         if x2 - x1 < 4 || y2 - y1 < 4 {
             bail!("crop too small");
         }

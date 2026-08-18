@@ -1,0 +1,29 @@
+{
+  "photos": [
+    {
+      "id": "yu_hwang_wu",
+      "file": "YU HWANG WU.jpg",
+      "license": "CC BY-SA 2.0",
+      "artist": "Yu Hwang-Wu",
+      "page": "https://commons.wikimedia.org/wiki/File:YU_HWANG_WU.jpg",
+      "tags": ["glasses"]
+    },
+    {
+      "id": "banasiewicz",
+      "file": "0006RP7JBDVECJOS-C122-F4.jpg",
+      "license": "CC BY-SA 4.0",
+      "artist": "Maya.Jachim",
+      "page": "https://commons.wikimedia.org/wiki/File:0006RP7JBDVECJOS-C122-F4.jpg",
+      "tags": ["glasses"]
+    },
+    {
+      "id": "casola",
+      "file": "Christian Casola of Salerno.jpg",
+      "title": "File:\"Christian Casola of Salerno from Radio Castelluccio - Oct 2020.jpg\".jpg",
+      "license": "CC BY-SA 4.0",
+      "artist": "Teddysheen",
+      "page": "https://commons.wikimedia.org/wiki/File:%22Christian_Casola_of_Salerno_from_Radio_Castelluccio_-_Oct_2020.jpg%22.jpg",
+      "tags": ["glasses"]
+    }
+  ]
+}

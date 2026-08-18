@@ -160,6 +160,13 @@ so the CPU does not build f16 NCHW or read back full heatmaps between detect and
 
     uv run python benchmarks/ab.py --model 3 --threads 4 --device gpu
 
+Realistic crop / glasses scenarios (synthetic webcam canvases, tracking loop, optional Wikimedia glasses photos). Default `--suite micro` is unchanged:
+
+    uv run python benchmarks/ab.py --suite realistic --model 3 --threads 4
+    uv run python benchmarks/ab.py --suite realistic --device gpu --frames 8
+
+`--scenarios` selects a subset (`track_scan3,glasses_synth,gaze_glasses`). Photos land in `benchmarks/fixtures/cache/` via `uv run python benchmarks/fetch_fixtures.py` and are skipped if offline. Optional `--wflw-root` adds extra stills from a local WFLW tree. JSON: `benchmarks/out/scenarios.json`.
+
 # References
 
 ## Training dataset

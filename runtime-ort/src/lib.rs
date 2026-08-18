@@ -6,11 +6,13 @@ mod metrics;
 mod preprocess;
 mod session;
 
-pub use decode::{decode_landmarks, detect_faces, LmSpec, TensorF16};
+pub use decode::{
+    decode_landmarks, detect_faces, landmark_bbox, mean_conf, LmSpec, TensorF16, EYE_IDX,
+};
 pub use gpu_pre::GpuTracker;
 pub use metrics::{cosine, max_abs, mean_abs, model_path, read_f32_le, rss, Latency, Rss};
 pub use preprocess::{
-    crop_box, crop_img, imagenet_nchw, iou, nchw, retina_nchw, BgrImage, ColorNorm,
+    crop_box, crop_box_pad, crop_img, imagenet_nchw, iou, nchw, retina_nchw, BgrImage, ColorNorm,
 };
 pub use session::{Device, OrtModel};
 

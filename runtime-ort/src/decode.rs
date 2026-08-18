@@ -153,6 +153,40 @@ pub fn decode_landmarks(t: &TensorF16, crop: [f32; 4], spec: LmSpec) -> (f32, Ve
     (sum / c0 as f32, pts)
 }
 
+/// Image-space xywh from OpenSeeFace landmarks stored as (row, col, conf).
+pub fn landmark_bbox(pts: &[[f32; 3]]) -> Option<[f32; 5]> {
+    if pts.is_empty() {
+        return None;
+    }
+    let mut min_r = f32::MAX;
+    let mut max_r = f32::MIN;
+    let mut min_c = f32::MAX;
+    let mut max_c = f32::MIN;
+    for p in pts {
+        min_r = min_r.min(p[0]);
+        max_r = max_r.max(p[0]);
+        min_c = min_c.min(p[1]);
+        max_c = max_c.max(p[1]);
+    }
+    Some([
+        min_c,
+        min_r,
+        (max_c - min_c).max(1.0),
+        (max_r - min_r).max(1.0),
+        1.0,
+    ])
+}
+
+pub const EYE_IDX: [usize; 12] = [36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47];
+
+pub fn mean_conf(pts: &[[f32; 3]], idx: &[usize]) -> Option<f32> {
+    let v: Vec<f32> = idx
+        .iter()
+        .filter_map(|&i| pts.get(i).map(|p| p[2]))
+        .collect();
+    (!v.is_empty()).then(|| v.iter().sum::<f32>() / v.len() as f32)
+}
+
 fn logit(p: f32, factor: f32) -> f32 {
     let p = p.clamp(1e-7, 1.0 - 1e-7);
     (p / (1.0 - p)).ln() / factor

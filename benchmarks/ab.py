@@ -24,6 +24,20 @@ if str(ROOT) not in sys.path:
 
 from preprocess import imagenet_nchw, retina_nchw  # noqa: E402
 
+BENCH = Path(__file__).resolve().parent
+if str(BENCH) not in sys.path:
+    sys.path.insert(0, str(BENCH))
+
+from fetch_fixtures import cached_photos, fetch_all  # noqa: E402
+from scenarios import (  # noqa: E402
+    EYE_IDX,
+    REALISTIC,
+    face_crop,
+    generate_scenarios,
+    list_scenario_dirs,
+    load_scenario,
+)
+
 
 def _ort_dylib() -> Path | None:
     capi = Path(ort.__file__).resolve().parent / "capi"
@@ -167,6 +181,304 @@ def decode_lms(tensor, crop, model):
     return float(conf.mean()), np.stack([tx, ty, conf], 1)
 
 
+def crop_xyxy(frame, box, pad_x=0.1, pad_y=0.125):
+    x, y, w, h = [float(v) for v in box[:4]]
+    h_img, w_img = frame.shape[:2]
+
+    def clamp(px, py):
+        return int(min(max(px, 0), w_img - 1)), int(min(max(py, 0), h_img - 1)) + 1
+
+    x1, y1 = clamp(x - int(w * pad_x), y - int(h * pad_y))
+    x2, y2 = clamp(x + w + int(w * pad_x), y + h + int(h * pad_y))
+    return x1, y1, x2, y2
+
+
+def lms_bbox(lms: np.ndarray) -> np.ndarray:
+    rows, cols = lms[:, 0], lms[:, 1]
+    x, y = float(cols.min()), float(rows.min())
+    return np.array([x, y, max(float(cols.max() - x), 1.0), max(float(rows.max() - y), 1.0), 1.0], np.float32)
+
+
+def eye_conf(lms: np.ndarray) -> float | None:
+    if lms is None or len(lms) < 48:
+        return None
+    return float(lms[list(EYE_IDX), 2].mean())
+
+
+def gaze_input(frame: np.ndarray, lms: np.ndarray) -> np.ndarray | None:
+    if lms is None or len(lms) < 46:
+        return None
+    eyes = []
+    for a, b, flip in ((36, 39, False), (42, 45, True)):
+        cx = (float(lms[a, 1]) + float(lms[b, 1])) / 2.0
+        cy = (float(lms[a, 0]) + float(lms[b, 0])) / 2.0
+        rad = math.hypot(float(lms[b, 1]) - float(lms[a, 1]), float(lms[b, 0]) - float(lms[a, 0])) / 2.0
+        rad = max(rad * 1.4, 4.0)
+        x1, y1 = int(cx - rad), int(cy - rad * 0.86)
+        x2, y2 = int(cx + rad), int(cy + rad * 0.86)
+        x1, y1 = max(x1, 0), max(y1, 0)
+        x2, y2 = min(x2, frame.shape[1]), min(y2, frame.shape[0])
+        if x2 - x1 < 4 or y2 - y1 < 4:
+            return None
+        crop = frame[y1:y2, x1:x2]
+        if flip:
+            crop = cv2.flip(crop, 1)
+        eyes.append(imagenet_nchw(crop, 32)[0])
+    return np.stack(eyes, 0)
+
+
+def decode_gaze_conf(out0: np.ndarray) -> float:
+    arr = np.asarray(out0, np.float32)
+    return float(arr.max()) if arr.size else 0.0
+
+
+def _xy(p) -> tuple[float, float]:
+    return (p["x"], p["y"]) if isinstance(p, dict) else (float(p[0]), float(p[1]))
+
+
+def seed_landmarks(frame, det_sess, lm_sess, lm_size, model):
+    dout = as_f32(det_sess.run(None, adapt_feed(det_sess, {"input": imagenet_nchw(frame, 224)})))
+    dets = detect_faces(dout[0], dout[1], frame)
+    if not len(dets):
+        raise SystemExit("seed image has no face (detection empty)")
+    box = dets[0]
+    x1, y1, x2, y2 = crop_xyxy(frame, box)
+    if x2 - x1 < 4 or y2 - y1 < 4:
+        raise SystemExit("seed face crop too small")
+    crop = imagenet_nchw(frame[y1:y2, x1:x2], lm_size)
+    out = as_f32(lm_sess.run(None, adapt_feed(lm_sess, {"input": crop})))[0]
+    _, lms = decode_lms(out[0], (x1, y1, (x2 - x1) / lm_size, (y2 - y1) / lm_size), model)
+    return box, lms
+
+
+def run_frame(frame, det_sess, lm_sess, gaze_sess, lm_size, model, box, pad_x, pad_y, do_detect, do_gaze):
+    detect_ms = crop_ms = pre_ms = lm_ms = decode_ms = gaze_ms = 0.0
+    dets, lms, gconf = [], None, None
+    crop_w = crop_h = 0
+    t_all = time.perf_counter()
+    if do_detect:
+        t = time.perf_counter()
+        dout = as_f32(det_sess.run(None, adapt_feed(det_sess, {"input": imagenet_nchw(frame, 224)})))
+        detect_ms = (time.perf_counter() - t) * 1000
+        dets = detect_faces(dout[0], dout[1], frame)
+        if len(dets):
+            box = dets[0]
+    if box is None:
+        return {
+            "detect_ms": detect_ms,
+            "crop_ms": 0.0,
+            "pre_ms": 0.0,
+            "lm_ms": 0.0,
+            "decode_ms": 0.0,
+            "gaze_ms": 0.0,
+            "e2e_ms": (time.perf_counter() - t_all) * 1000,
+            "scanned": do_detect,
+            "faces": 0,
+            "det_score": None,
+            "lm_conf": None,
+            "eye_conf": None,
+            "gaze_conf": None,
+            "crop_w": 0,
+            "crop_h": 0,
+            "box": None,
+            "lms": None,
+        }
+    t = time.perf_counter()
+    x1, y1, x2, y2 = crop_xyxy(frame, box, pad_x, pad_y)
+    crop_w, crop_h = max(x2 - x1, 0), max(y2 - y1, 0)
+    patch = frame[y1:y2, x1:x2] if crop_w >= 4 and crop_h >= 4 else None
+    crop_ms = (time.perf_counter() - t) * 1000
+    if patch is None:
+        box = None
+        lms = None
+    else:
+        t = time.perf_counter()
+        lin = imagenet_nchw(patch, lm_size)
+        pre_ms = (time.perf_counter() - t) * 1000
+        t = time.perf_counter()
+        out = as_f32(lm_sess.run(None, adapt_feed(lm_sess, {"input": lin})))[0]
+        lm_ms = (time.perf_counter() - t) * 1000
+        t = time.perf_counter()
+        conf, lms = decode_lms(out[0], (x1, y1, (x2 - x1) / lm_size, (y2 - y1) / lm_size), model)
+        decode_ms = (time.perf_counter() - t) * 1000
+        box = lms_bbox(lms)
+        box[4] = conf
+        if do_gaze and gaze_sess is not None:
+            t = time.perf_counter()
+            gin = gaze_input(frame, lms)
+            if gin is not None:
+                gout = as_f32(gaze_sess.run(None, adapt_feed(gaze_sess, {"input": gin})))
+                gconf = decode_gaze_conf(gout[0])
+            gaze_ms = (time.perf_counter() - t) * 1000
+    e2e_ms = (time.perf_counter() - t_all) * 1000
+    faces = 1 if lms is not None else 0
+    det_score = float(dets[0][4]) if len(dets) else (float(box[4]) if box is not None else None)
+    return {
+        "detect_ms": detect_ms,
+        "crop_ms": crop_ms,
+        "pre_ms": pre_ms,
+        "lm_ms": lm_ms,
+        "decode_ms": decode_ms,
+        "gaze_ms": gaze_ms,
+        "e2e_ms": e2e_ms,
+        "scanned": do_detect,
+        "faces": faces,
+        "det_score": det_score,
+        "lm_conf": float(box[4]) if box is not None else None,
+        "eye_conf": eye_conf(lms) if lms is not None else None,
+        "gaze_conf": gconf,
+        "crop_w": int(crop_w),
+        "crop_h": int(crop_h),
+        "box": box,
+        "lms": lms,
+    }
+
+
+def mean_or_none(vals):
+    vals = [v for v in vals if v is not None]
+    return float(statistics.fmean(vals)) if vals else None
+
+
+def run_scenario(meta, frames, det_sess, lm_sess, gaze_sess, lm_size, model, warmup: int) -> dict:
+    pad_x, pad_y = float(meta.get("pad_x", 0.1)), float(meta.get("pad_y", 0.125))
+    scan_every = max(int(meta.get("scan_every", 1)), 1)
+    do_gaze = bool(meta.get("gaze")) and gaze_sess is not None
+    box = None
+    for _ in range(max(warmup, 1)):
+        run_frame(frames[0], det_sess, lm_sess, gaze_sess, lm_size, model, None, pad_x, pad_y, True, do_gaze)
+    rows = []
+    for i, frame in enumerate(frames):
+        scanned = box is None or (i % scan_every == 0)
+        row = run_frame(
+            frame, det_sess, lm_sess, gaze_sess, lm_size, model, None if scanned else box, pad_x, pad_y, scanned, do_gaze
+        )
+        box = row["box"]
+        rows.append(row)
+    last = rows[-1] if rows else {}
+    lms = last.get("lms")
+    stage = {}
+    for key in ("crop_ms", "pre_ms", "lm_ms", "decode_ms", "gaze_ms", "e2e_ms"):
+        stage[key] = latency(warmup, [r[key] for r in rows])
+    stage["detect_ms"] = latency(warmup, [r["detect_ms"] for r in rows if r["scanned"] or r["detect_ms"] > 0])
+    scan = [r["e2e_ms"] for r in rows if r["scanned"]]
+    track = [r["e2e_ms"] for r in rows if not r["scanned"]]
+    return {
+        "name": meta["name"],
+        "tags": meta.get("tags", []),
+        "frames": len(frames),
+        "scan_every": scan_every,
+        "gaze": do_gaze,
+        "glasses": bool(meta.get("glasses")),
+        "detect_ms": stage["detect_ms"],
+        "crop_ms": stage["crop_ms"],
+        "pre_ms": stage["pre_ms"],
+        "lm_ms": stage["lm_ms"],
+        "decode_ms": stage["decode_ms"],
+        "gaze_ms": stage["gaze_ms"],
+        "e2e_ms": stage["e2e_ms"],
+        "scan_p50_ms": pct(sorted(scan), 50) if scan else None,
+        "track_p50_ms": pct(sorted(track), 50) if track else None,
+        "crop_w": last.get("crop_w", 0),
+        "crop_h": last.get("crop_h", 0),
+        "faces": last.get("faces", 0),
+        "det_score": mean_or_none([r["det_score"] for r in rows]),
+        "lm_conf": mean_or_none([r["lm_conf"] for r in rows]),
+        "eye_conf": mean_or_none([r["eye_conf"] for r in rows]),
+        "gaze_conf": mean_or_none([r["gaze_conf"] for r in rows]),
+        "landmarks": lms.tolist() if lms is not None else [],
+    }
+
+
+def glasses_delta(scenarios: dict) -> dict:
+    bases = {s.name: s.baseline for s in REALISTIC if s.baseline}
+    out = {}
+    for name, sc in scenarios.items():
+        base_name = bases.get(name)
+        if not base_name or base_name not in scenarios:
+            continue
+        base = scenarios[base_name]
+        a, b = base.get("landmarks") or [], sc.get("landmarks") or []
+        n = min(len(a), len(b))
+        eye_mae = None
+        if n >= 48:
+            dists = [
+                math.hypot(_xy(a[i])[0] - _xy(b[i])[0], _xy(a[i])[1] - _xy(b[i])[1]) for i in EYE_IDX
+            ]
+            eye_mae = float(sum(dists) / len(dists))
+        ae, be = base.get("eye_conf"), sc.get("eye_conf")
+        out[name] = {
+            "baseline": base_name,
+            "eye_conf_delta": (be - ae) if ae is not None and be is not None else None,
+            "eye_mae_px": eye_mae,
+        }
+    return out
+
+
+def python_scenarios(args, seed, dump: Path) -> dict:
+    md = Path(args.models_dir)
+    lm_name, lm_size = lm_meta(args.model)
+    det_sess = session(md / "mnv3_detection_opt.onnx", args.threads)
+    lm_sess = session(md / lm_name, args.threads)
+    gaze_path = md / "mnv3_gaze32_split_opt.onnx"
+    gaze_sess = session(gaze_path, args.threads) if gaze_path.is_file() else None
+    box, lms = seed_landmarks(seed, det_sess, lm_sess, lm_size, args.model)
+    face, origin, face_h = face_crop(seed, box)
+    names = set(args.scenarios.split(",")) if args.scenarios else None
+    if names:
+        for spec in REALISTIC:
+            if spec.name in names and spec.baseline:
+                names.add(spec.baseline)
+    photos = []
+    want_photo = names is None or "glasses_photo" in names or any(n.startswith("glasses_photo") for n in (names or []))
+    if want_photo:
+        photos = cached_photos()
+        if not photos:
+            try:
+                photos = fetch_all()
+            except Exception as e:
+                print(f"glasses_photo skipped: {e}", file=sys.stderr)
+                photos = []
+    extra = []
+    if args.wflw_root:
+        root = Path(args.wflw_root)
+        extra = [p for p in list(root.rglob("*.jpg"))[:4] + list(root.rglob("*.png"))[:4] if p.is_file()]
+        photos = list(photos) + extra
+    dirs = generate_scenarios(
+        dump,
+        face,
+        lms,
+        origin,
+        face_h,
+        names=names,
+        n_frames_override=args.frames,
+        photos=photos,
+    )
+    if args.scan_every is not None:
+        for d in dirs:
+            meta_p = d / "meta.json"
+            meta = json.loads(meta_p.read_text())
+            meta["scan_every"] = args.scan_every
+            meta_p.write_text(json.dumps(meta, indent=2) + "\n")
+    scenarios = {}
+    for d in list_scenario_dirs(dump):
+        if names and d.name not in names and not (
+            "glasses_photo" in names and d.name.startswith("glasses_photo")
+        ):
+            continue
+        meta, frames = load_scenario(d)
+        scenarios[meta["name"]] = run_scenario(
+            meta, frames, det_sess, lm_sess, gaze_sess, lm_size, args.model, args.warmup
+        )
+    return {
+        "backend": "onnxruntime-python",
+        "runtime_version": ort.__version__,
+        "python_version": sys.version.split()[0],
+        "threads": args.threads,
+        "scenarios": scenarios,
+        "glasses_delta": glasses_delta(scenarios),
+    }
+
+
 def python_bench(args, dump: Path) -> dict:
     frame = cv2.imread(args.image, cv2.IMREAD_COLOR)
     if frame is None:
@@ -217,13 +529,7 @@ def python_bench(args, dump: Path) -> dict:
         if len(dets):
             x, y, w, h, score = dets[0]
             detections.append({"x": float(x), "y": float(y), "w": float(w), "h": float(h), "score": float(score)})
-            h_img, w_img = frame.shape[:2]
-
-            def clamp(px, py):
-                return int(min(max(px, 0), w_img - 1)), int(min(max(py, 0), h_img - 1)) + 1
-
-            x1, y1 = clamp(x - int(w * 0.1), y - int(h * 0.125))
-            x2, y2 = clamp(x + w + int(w * 0.1), y + h + int(h * 0.125))
+            x1, y1, x2, y2 = crop_xyxy(frame, dets[0])
             if x2 - x1 >= 4 and y2 - y1 >= 4:
                 t1 = time.perf_counter()
                 crop = imagenet_nchw(frame[y1:y2, x1:x2], lm_size)
@@ -260,6 +566,65 @@ def python_bench(args, dump: Path) -> dict:
     }
 
 
+def _stage_p50(sc: dict, key: str) -> float:
+    v = sc.get(key)
+    if isinstance(v, dict):
+        return float(v.get("p50_ms") or 0.0)
+    return float(v or 0.0)
+
+
+def compare_scenarios(py: dict, rs: dict) -> None:
+    pa, pb = py.get("scenarios") or {}, rs.get("scenarios") or {}
+    if not pa:
+        return
+    print()
+    header = (
+        f"{'scenario':<22} {'e2e_p50':>9} {'crop_p50':>9} {'lm_p50':>8} "
+        f"{'eye_cf':>8} {'crop':>11} {'rust/py':>8}"
+    )
+    print(header)
+    print("-" * len(header))
+    for name in sorted(set(pa) | set(pb)):
+        a, b = pa.get(name), pb.get(name)
+        if not a:
+            continue
+        e2e = _stage_p50(a, "e2e_ms")
+        crop = _stage_p50(a, "crop_ms")
+        lm = _stage_p50(a, "lm_ms")
+        eye = a.get("eye_conf")
+        eye_s = f"{eye:.3f}" if eye is not None else "-"
+        geom = f"{a.get('crop_w', 0)}x{a.get('crop_h', 0)}"
+        ratio = "-"
+        if b:
+            be = _stage_p50(b, "e2e_ms")
+            ratio = f"{be / e2e:.2f}x" if e2e else "-"
+        print(f"{name:<22} {e2e:9.3f} {crop:9.3f} {lm:8.3f} {eye_s:>8} {geom:>11} {ratio:>8}")
+        if b and a.get("landmarks") and b.get("landmarks"):
+            al, bl = a["landmarks"], b["landmarks"]
+            n = min(len(al), len(bl))
+            if n:
+                mae = sum(
+                    math.hypot(_xy(al[i])[0] - _xy(bl[i])[0], _xy(al[i])[1] - _xy(bl[i])[1])
+                    for i in range(n)
+                ) / n
+                print(f"{'':<22} {'lms_mae_px':<9} {mae:.4f}")
+        scan, track = a.get("scan_p50_ms"), a.get("track_p50_ms")
+        if scan is not None or track is not None:
+            ss = f"{scan:.3f}" if scan is not None else "-"
+            ts = f"{track:.3f}" if track is not None else "-"
+            print(f"{'':<22} scan_p50={ss}  track_p50={ts}")
+    delta = py.get("glasses_delta") or {}
+    if delta:
+        print()
+        print(f"{'glasses':<22} {'eye_dconf':>10} {'eye_mae_px':>12}")
+        for name, d in delta.items():
+            dc = d.get("eye_conf_delta")
+            mae = d.get("eye_mae_px")
+            dc_s = f"{dc:.4f}" if isinstance(dc, (int, float)) else "-"
+            mae_s = f"{mae:.4f}" if isinstance(mae, (int, float)) else "-"
+            print(f"{name:<22} {dc_s:>10} {mae_s:>12}")
+
+
 def compare(py: dict, rs: dict) -> None:
     print("A/B  Python onnxruntime  vs  Rust ort")
     dylib = rs.get("ort_dylib") or "static"
@@ -267,34 +632,37 @@ def compare(py: dict, rs: dict) -> None:
         f"  python {py.get('runtime_version')}  rust crate {rs.get('crate_version')}  "
         f"device={rs.get('device', 'cpu')}  ort={Path(str(dylib)).name}"
     )
-    header = f"{'model':<18} {'metric':<16} {'python':>10} {'ort-rust':>10} {'rust/py':>8}"
-    print(header)
-    print("-" * len(header))
+    if py.get("models") and rs.get("models"):
+        header = f"{'model':<18} {'metric':<16} {'python':>10} {'ort-rust':>10} {'rust/py':>8}"
+        print(header)
+        print("-" * len(header))
 
-    def line(model, metric, a, b, kind="ms"):
-        if kind == "mib":
-            pa, pb = f"{a/1024/1024:.1f}", f"{b/1024/1024:.1f}"
-        else:
-            pa, pb = f"{a:.3f}", f"{b:.3f}"
-        ratio = f"{b/a:.2f}x" if a else "-"
-        print(f"{model:<18} {metric:<16} {pa:>10} {pb:>10} {ratio:>8}")
+        def line(model, metric, a, b, kind="ms"):
+            if kind == "mib":
+                pa, pb = f"{a/1024/1024:.1f}", f"{b/1024/1024:.1f}"
+            else:
+                pa, pb = f"{a:.3f}", f"{b:.3f}"
+            ratio = f"{b/a:.2f}x" if a else "-"
+            print(f"{model:<18} {metric:<16} {pa:>10} {pb:>10} {ratio:>8}")
 
-    for key in sorted(set(py["models"]) & set(rs["models"])):
-        a, b = py["models"][key], rs["models"][key]
-        line(key, "startup_ms", a["startup_ms"], b["startup_ms"])
-        line(key, "first_ms", a["first_infer_ms"], b["first_infer_ms"])
-        line(key, "p50_ms", a["latency"]["p50_ms"], b["latency"]["p50_ms"])
-        line(key, "rss_mib", a["resources_after_infer"]["rss_bytes"], b["resources_after_infer"]["rss_bytes"], "mib")
-        acc = b.get("accuracy")
-        if acc:
-            print(f"{key:<18} {'max_abs':<16} {'0':>10} {acc['max_abs']:<10.3g} {'-':>8}")
-            print(f"{key:<18} {'cosine':<16} {'1':>10} {acc['cosine']:<10.6f} {'-':>8}")
-    pa, pb = py["pipeline"], rs["pipeline"]
-    line("pipeline", "e2e_ms", pa["e2e_ms"], pb["e2e_ms"])
-    if pb.get("det_iou") is not None:
-        print(f"{'pipeline':<18} {'det_iou':<16} {'1':>10} {pb['det_iou']:<10.4f} {'-':>8}")
-    if pb.get("landmark_mae_px") is not None:
-        print(f"{'pipeline':<18} {'lms_mae_px':<16} {'0':>10} {pb['landmark_mae_px']:<10.4f} {'-':>8}")
+        for key in sorted(set(py["models"]) & set(rs["models"])):
+            a, b = py["models"][key], rs["models"][key]
+            line(key, "startup_ms", a["startup_ms"], b["startup_ms"])
+            line(key, "first_ms", a["first_infer_ms"], b["first_infer_ms"])
+            line(key, "p50_ms", a["latency"]["p50_ms"], b["latency"]["p50_ms"])
+            line(key, "rss_mib", a["resources_after_infer"]["rss_bytes"], b["resources_after_infer"]["rss_bytes"], "mib")
+            acc = b.get("accuracy")
+            if acc:
+                print(f"{key:<18} {'max_abs':<16} {'0':>10} {acc['max_abs']:<10.3g} {'-':>8}")
+                print(f"{key:<18} {'cosine':<16} {'1':>10} {acc['cosine']:<10.6f} {'-':>8}")
+        if py.get("pipeline") and rs.get("pipeline"):
+            pa, pb = py["pipeline"], rs["pipeline"]
+            line("pipeline", "e2e_ms", pa["e2e_ms"], pb["e2e_ms"])
+            if pb.get("det_iou") is not None:
+                print(f"{'pipeline':<18} {'det_iou':<16} {'1':>10} {pb['det_iou']:<10.4f} {'-':>8}")
+            if pb.get("landmark_mae_px") is not None:
+                print(f"{'pipeline':<18} {'lms_mae_px':<16} {'0':>10} {pb['landmark_mae_px']:<10.4f} {'-':>8}")
+    compare_scenarios(py, rs)
 
 
 def main() -> int:
@@ -307,13 +675,38 @@ def main() -> int:
     p.add_argument("--iters", type=int, default=30)
     p.add_argument("--device", default="cpu", choices=["cpu", "gpu"])
     p.add_argument("--out-dir", default=str(ROOT / "benchmarks" / "out"))
+    p.add_argument("--suite", default="micro", choices=["micro", "realistic", "all"])
+    p.add_argument("--scenarios", default=None, help="comma-separated scenario names")
+    p.add_argument("--frames", type=int, default=None, help="override synthetic frame count")
+    p.add_argument("--scan-every", type=int, default=None)
+    p.add_argument("--wflw-root", default=None, help="optional WFLW image root")
     args = p.parse_args()
 
     out = Path(args.out_dir)
     dump = out / "dump"
+    scen_dir = out / "scenarios"
     out.mkdir(parents=True, exist_ok=True)
 
-    py = python_bench(args, dump)
+    run_micro = args.suite in ("micro", "all")
+    run_real = args.suite in ("realistic", "all")
+    py: dict = {
+        "backend": "onnxruntime-python",
+        "runtime_version": ort.__version__,
+        "python_version": sys.version.split()[0],
+        "threads": args.threads,
+        "suite": args.suite,
+    }
+    if run_micro:
+        micro = python_bench(args, dump)
+        py.update({k: v for k, v in micro.items() if k not in ("backend", "runtime_version", "python_version", "threads")})
+    if run_real:
+        seed = cv2.imread(args.image, cv2.IMREAD_COLOR)
+        if seed is None:
+            raise SystemExit(f"cannot read {args.image}")
+        real = python_scenarios(args, seed, scen_dir)
+        py["scenarios"] = real["scenarios"]
+        py["glasses_delta"] = real["glasses_delta"]
+        (out / "scenarios.json").write_text(json.dumps({"scenarios": real["scenarios"], "glasses_delta": real["glasses_delta"]}, indent=2))
     (out / "python.json").write_text(json.dumps(py, indent=2))
 
     if args.device == "gpu":
@@ -347,13 +740,14 @@ def main() -> int:
     common = [
         "--models-dir", args.models_dir, "--image", args.image, "--model", str(args.model),
         "--threads", str(args.threads), "--warmup", str(args.warmup), "--iters", str(args.iters),
-        "--device", args.device,
+        "--device", args.device, "--suite", args.suite,
     ]
-    subprocess.run(
-        [str(rust_bin), *common, "--out", str(out / "rust.json"), "--ref-dir", str(dump)],
-        env=env,
-        check=True,
-    )
+    rust_cmd = [str(rust_bin), *common, "--out", str(out / "rust.json")]
+    if run_micro:
+        rust_cmd += ["--ref-dir", str(dump)]
+    if run_real:
+        rust_cmd += ["--scenario-dir", str(scen_dir)]
+    subprocess.run(rust_cmd, env=env, check=True)
     rs = json.loads((out / "rust.json").read_text())
     compare(py, rs)
     return 0

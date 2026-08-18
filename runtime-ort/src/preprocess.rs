@@ -162,12 +162,17 @@ pub fn retina_nchw(bgr: &BgrImage) -> TensorF16 {
 }
 
 /// Padded face crop in image coordinates, matching the Python tracker.
-pub fn crop_box(frame: &BgrImage, d: &[f32; 5]) -> (i32, i32, i32, i32) {
+pub fn crop_box_pad(
+    frame: &BgrImage,
+    d: &[f32; 5],
+    pad_x: f32,
+    pad_y: f32,
+) -> (i32, i32, i32, i32) {
     let (x, y, w, h) = (d[0], d[1], d[2], d[3]);
-    let x1 = x - (w * 0.1) as i32 as f32;
-    let y1 = y - (h * 0.125) as i32 as f32;
-    let x2 = x + w + (w * 0.1) as i32 as f32;
-    let y2 = y + h + (h * 0.125) as i32 as f32;
+    let x1 = x - (w * pad_x) as i32 as f32;
+    let y1 = y - (h * pad_y) as i32 as f32;
+    let x2 = x + w + (w * pad_x) as i32 as f32;
+    let y2 = y + h + (h * pad_y) as i32 as f32;
     let clamp = |px: f32, py: f32| {
         let px = px.clamp(0.0, frame.width as f32 - 1.0) as i32;
         let py = py.clamp(0.0, frame.height as f32 - 1.0) as i32 + 1;
@@ -176,6 +181,10 @@ pub fn crop_box(frame: &BgrImage, d: &[f32; 5]) -> (i32, i32, i32, i32) {
     let (x1, y1) = clamp(x1, y1);
     let (x2, y2) = clamp(x2, y2);
     (x1, y1, x2, y2)
+}
+
+pub fn crop_box(frame: &BgrImage, d: &[f32; 5]) -> (i32, i32, i32, i32) {
+    crop_box_pad(frame, d, 0.1, 0.125)
 }
 
 pub fn crop_img(im: &BgrImage, x1: i32, y1: i32, x2: i32, y2: i32) -> BgrImage {
