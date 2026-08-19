@@ -5,7 +5,7 @@
 
 use crate::geom::{angle, rotate};
 
-pub const FEATURE_COUNT: usize = 17;
+pub const FEATURE_COUNT: usize = 19;
 pub type FeatureVec = [f32; FEATURE_COUNT];
 
 pub const FEATURE_NAMES: [&str; FEATURE_COUNT] = [
@@ -26,12 +26,16 @@ pub const FEATURE_NAMES: [&str; FEATURE_COUNT] = [
     "mouth_pucker",
     "mouth_offset_x",
     "cheek_puff",
+    "jaw_open",
+    "mouth_funnel",
 ];
 
-/// Official UDP feature slots 14–16.
+/// Official UDP feature slots 14–18.
 pub const FEAT_MOUTH_PUCKER: usize = 14;
 pub const FEAT_MOUTH_OFFSET_X: usize = 15;
 pub const FEAT_CHEEK_PUFF: usize = 16;
+pub const FEAT_JAW_OPEN: usize = 17;
+pub const FEAT_MOUTH_FUNNEL: usize = 18;
 
 /// Bias so [`Feature`] median stays away from 0 (signed offset around rest).
 const OFFSET_BIAS: f32 = 1.0;
@@ -39,6 +43,8 @@ const PUCKER_Z_WEIGHT: f32 = 0.5;
 const CHEEK_Z_WEIGHT: f32 = 0.5;
 const CHEEK_SMILE_GATE: f32 = 0.3;
 const CHEEK_OPEN_GATE: f32 = 0.5;
+const FUNNEL_NARROW_FRAC: f32 = 0.92;
+const FUNNEL_GAP_MIN: f32 = 0.2;
 
 struct Remedian {
     k: usize,
@@ -110,10 +116,19 @@ struct Feature {
     max_feature_updates: f32,
     first_seen: f32,
     updating: bool,
+    one_sided: bool,
 }
 
 impl Feature {
     fn new(threshold: f32, max_feature_updates: f32) -> Self {
+        Self::new_ex(threshold, max_feature_updates, false)
+    }
+
+    fn new_positive(threshold: f32, max_feature_updates: f32) -> Self {
+        Self::new_ex(threshold, max_feature_updates, true)
+    }
+
+    fn new_ex(threshold: f32, max_feature_updates: f32, one_sided: bool) -> Self {
         Self {
             median: Remedian::new(),
             min: None,
@@ -129,6 +144,7 @@ impl Feature {
             max_feature_updates,
             first_seen: -1.0,
             updating: true,
+            one_sided,
         }
     }
 
@@ -142,6 +158,10 @@ impl Feature {
         filtered
     }
 
+    fn raw_median(&self) -> f32 {
+        self.current_median
+    }
+
     fn update_state(&mut self, x: f32, now: f32) -> f32 {
         let updating = self.updating
             && (self.max_feature_updates == 0.0
@@ -153,6 +173,9 @@ impl Feature {
             self.updating = false;
         }
         let median = self.current_median;
+        if self.one_sided {
+            return self.update_positive(x, median, updating);
+        }
 
         if self.min.is_none() {
             if x < median && median != 0.0 && (median - x) / median > self.threshold {
@@ -218,6 +241,43 @@ impl Feature {
             }
         } else {
             0.0
+        }
+    }
+
+    /// Rest is 0; only values above the median count.
+    fn update_positive(&mut self, x: f32, median: f32, updating: bool) -> f32 {
+        if median == 0.0 || x <= median {
+            return 0.0;
+        }
+        if self.max.is_none() {
+            if (x - median) / median > self.threshold {
+                if updating {
+                    self.max = Some(x);
+                    self.hard_max = Some(x - self.hard_factor * (x - median));
+                }
+                return 1.0;
+            }
+            return 0.0;
+        }
+        if x > self.max.unwrap() {
+            if updating {
+                self.max = Some(x);
+                self.hard_max = Some(x - self.hard_factor * (x - median));
+            }
+            return 1.0;
+        }
+        if updating {
+            if let (Some(max), Some(hard_max)) = (self.max, self.hard_max) {
+                if max > hard_max {
+                    self.max = Some(hard_max * self.decay + max * (1.0 - self.decay));
+                }
+            }
+        }
+        let max = self.max.unwrap();
+        if (max - median).abs() < 1e-8 {
+            0.0
+        } else {
+            (x - median) / (max - median)
         }
     }
 }
@@ -331,6 +391,8 @@ pub struct FeatureExtractor {
     mouth_pucker: Feature,
     mouth_offset_x: Feature,
     cheek_puff: Feature,
+    jaw_open: Feature,
+    mouth_funnel: Feature,
 }
 
 impl FeatureExtractor {
@@ -353,6 +415,8 @@ impl FeatureExtractor {
             mouth_pucker: Feature::new(0.02, max_feature_updates),
             mouth_offset_x: Feature::new(0.02, max_feature_updates),
             cheek_puff: Feature::new(0.02, max_feature_updates),
+            jaw_open: Feature::new_positive(0.15, max_feature_updates),
+            mouth_funnel: Feature::new_positive(0.05, max_feature_updates),
         }
     }
 
@@ -456,11 +520,11 @@ impl FeatureExtractor {
             0.0
         };
 
-        let f = ((pts[59][1] + pts[60][1] + pts[61][1]) / 3.0
+        let inner_gap = ((pts[59][1] + pts[60][1] + pts[61][1]) / 3.0
             - (pts[63][1] + pts[64][1] + pts[65][1]) / 3.0)
             .abs()
             / ny;
-        let mouth_open = self.mouth_open.update(f, now);
+        let mouth_open = self.mouth_open.update(inner_gap, now);
         let mouth_w = (pts[58][0] - pts[62][0]).abs() / nx;
         let mouth_wide = self.mouth_wide.update(mouth_w, now);
 
@@ -468,6 +532,15 @@ impl FeatureExtractor {
         let mouth_pucker = self
             .mouth_pucker
             .update(1.0 - mouth_w + PUCKER_Z_WEIGHT * lip_z, now);
+
+        let jaw_span = (pts[30][1] - pts[8][1]).abs() / ny;
+        let jaw_open = self.jaw_open.update(jaw_span, now);
+
+        let mut mouth_funnel = self.mouth_funnel.update(inner_gap * (1.0 - mouth_w), now);
+        let rest_w = self.mouth_wide.raw_median();
+        if rest_w <= 1e-6 || mouth_w >= rest_w * FUNNEL_NARROW_FRAC || inner_gap < FUNNEL_GAP_MIN {
+            mouth_funnel = 0.0;
+        }
 
         let mouth_cx =
             (pts[50][0] + pts[55][0] + pts[58][0] + pts[60][0] + pts[62][0] + pts[64][0]) / 6.0;
@@ -504,6 +577,8 @@ impl FeatureExtractor {
             mouth_pucker,
             mouth_offset_x,
             cheek_puff,
+            jaw_open,
+            mouth_funnel,
         ]
     }
 }
@@ -776,6 +851,26 @@ mod tests {
         p
     }
 
+    fn drop_chin(pts: &[[f32; 3]], dy: f32) -> Vec<[f32; 3]> {
+        let mut p = pts.to_vec();
+        for i in [6, 7, 8, 9, 10] {
+            let w = 1.0 - (i as f32 - 8.0).abs() / 3.0;
+            p[i][1] -= dy * w;
+        }
+        p
+    }
+
+    fn funnel_mouth(pts: &[[f32; 3]], corner_scale: f32, gap_scale: f32) -> Vec<[f32; 3]> {
+        let mut p = pucker_lips(pts, corner_scale, 0.04);
+        for i in [59, 60, 61] {
+            p[i][1] += 0.04 * (gap_scale - 1.0);
+        }
+        for i in [63, 64, 65, 53, 54, 55, 56, 57] {
+            p[i][1] -= 0.05 * (gap_scale - 1.0);
+        }
+        p
+    }
+
     fn apply_label(rest: &[[f32; 3]], label: MouthLabel, intensity: f32) -> Vec<[f32; 3]> {
         let t = intensity.clamp(0.0, 1.0);
         let target = match label {
@@ -800,6 +895,8 @@ mod tests {
         last_after(ext, &scale_cheeks(rest, 1.25, 0.08), 12);
         last_after(ext, &pucker_lips(rest, 0.7, 0.0), 12);
         last_after(ext, &open_mouth(rest, 3.0), 12);
+        last_after(ext, &drop_chin(rest, 0.14), 12);
+        last_after(ext, &funnel_mouth(rest, 0.55, 2.8), 12);
         last_after(ext, rest, 16);
     }
 
@@ -989,5 +1086,184 @@ mod tests {
         assert!(!pucker, "rest pucker {}", f[FEAT_MOUTH_PUCKER]);
         assert_eq!(offset, 0, "rest offset {}", f[FEAT_MOUTH_OFFSET_X]);
         assert!(!puff, "rest puff {}", f[FEAT_CHEEK_PUFF]);
+        assert!(
+            f[FEAT_JAW_OPEN] < DETECT_TH,
+            "rest jaw {}",
+            f[FEAT_JAW_OPEN]
+        );
+        assert!(
+            f[FEAT_MOUTH_FUNNEL] < DETECT_TH,
+            "rest funnel {}",
+            f[FEAT_MOUTH_FUNNEL]
+        );
+    }
+
+    #[test]
+    fn jaw_open_tracks_chin_not_lip_gap() {
+        let rest = canonical_face();
+        let mut ext = FeatureExtractor::new(0.0);
+        calibrate_mouth(&mut ext, &rest);
+        let mut seed = 11u32;
+
+        let lip = read_noisy(&mut ext, &open_mouth(&rest, 3.0), 16, &mut seed, 0.0035);
+        last_after(&mut ext, &rest, 10);
+        let jaw = read_noisy(&mut ext, &drop_chin(&rest, 0.14), 16, &mut seed, 0.0035);
+
+        assert!(
+            lip[FEAT_JAW_OPEN] < DETECT_TH,
+            "lip-only open fired jaw {}",
+            lip[FEAT_JAW_OPEN]
+        );
+        assert!(
+            jaw[FEAT_JAW_OPEN] > DETECT_TH,
+            "chin drop missed jaw {}",
+            jaw[FEAT_JAW_OPEN]
+        );
+    }
+
+    #[test]
+    fn mouth_funnel_fires_on_round_open_not_pucker_or_smile() {
+        const N_ID: u32 = 24;
+        const SIGMA: f32 = 0.0035;
+        let rest0 = canonical_face();
+        let mut funnel_c = Conf::default();
+        let mut funnel_on_pucker = 0u32;
+        let mut funnel_on_smile = 0u32;
+        let mut funnel_on_open = 0u32;
+        let mut n_ctrl = 0u32;
+        let mut seed: u32 = 0xF00D;
+
+        for _ in 0..N_ID {
+            let identity = jitter(&rest0, &mut seed, 0.006);
+            let mut ext = FeatureExtractor::new(0.0);
+            calibrate_mouth(&mut ext, &identity);
+            let intensity = 0.85 + 0.15 * lcg(&mut seed);
+
+            let funnel_pose = lerp_pts(&identity, &funnel_mouth(&identity, 0.55, 2.8), intensity);
+            let f = read_noisy(&mut ext, &funnel_pose, 16, &mut seed, SIGMA);
+            funnel_c.add(f[FEAT_MOUTH_FUNNEL] > DETECT_TH, true);
+            last_after(&mut ext, &identity, 10);
+
+            let f = read_noisy(
+                &mut ext,
+                &lerp_pts(&identity, &pucker_lips(&identity, 0.45, 0.10), intensity),
+                16,
+                &mut seed,
+                SIGMA,
+            );
+            n_ctrl += 1;
+            if f[FEAT_MOUTH_FUNNEL] > DETECT_TH {
+                funnel_on_pucker += 1;
+            }
+            funnel_c.add(f[FEAT_MOUTH_FUNNEL] > DETECT_TH, false);
+            last_after(&mut ext, &identity, 10);
+
+            let f = read_noisy(
+                &mut ext,
+                &lerp_pts(&identity, &smile_mouth(&identity, 1.6), intensity),
+                16,
+                &mut seed,
+                SIGMA,
+            );
+            n_ctrl += 1;
+            if f[FEAT_MOUTH_FUNNEL] > DETECT_TH {
+                funnel_on_smile += 1;
+            }
+            funnel_c.add(f[FEAT_MOUTH_FUNNEL] > DETECT_TH, false);
+            last_after(&mut ext, &identity, 10);
+
+            let f = read_noisy(
+                &mut ext,
+                &lerp_pts(&identity, &open_mouth(&identity, 3.0), intensity),
+                16,
+                &mut seed,
+                SIGMA,
+            );
+            n_ctrl += 1;
+            if f[FEAT_MOUTH_FUNNEL] > DETECT_TH {
+                funnel_on_open += 1;
+            }
+            funnel_c.add(f[FEAT_MOUTH_FUNNEL] > DETECT_TH, false);
+            last_after(&mut ext, &identity, 10);
+        }
+
+        let pucker_fpr = funnel_on_pucker as f32 / N_ID as f32;
+        let smile_fpr = funnel_on_smile as f32 / N_ID as f32;
+        let open_fpr = funnel_on_open as f32 / N_ID as f32;
+        eprintln!(
+            "funnel recall={:.3} prec={:.3} fpr={:.3} acc={:.3} \
+             pucker_fpr={pucker_fpr:.3} smile_fpr={smile_fpr:.3} open_fpr={open_fpr:.3} n_ctrl={n_ctrl}",
+            funnel_c.recall(),
+            funnel_c.precision(),
+            funnel_c.fpr(),
+            funnel_c.accuracy()
+        );
+        assert!(
+            funnel_c.recall() >= 0.85 && funnel_c.fpr() <= 0.15 && funnel_c.accuracy() >= 0.85,
+            "funnel recall={} fpr={} acc={}",
+            funnel_c.recall(),
+            funnel_c.fpr(),
+            funnel_c.accuracy()
+        );
+        assert!(pucker_fpr <= 0.15, "funnel on pucker fpr={pucker_fpr}");
+        assert!(smile_fpr <= 0.10, "funnel on smile fpr={smile_fpr}");
+        assert!(open_fpr <= 0.15, "funnel on lip-open fpr={open_fpr}");
+    }
+
+    fn series_mean_std(
+        ext: &mut FeatureExtractor,
+        pose: &[[f32; 3]],
+        slot: usize,
+        seed: &mut u32,
+    ) -> (f32, f32) {
+        let mut vals = Vec::new();
+        for i in 0..40 {
+            let f = ext.update(&jitter(pose, seed, 0.0035), true);
+            if i >= 8 {
+                vals.push(f[slot]);
+            }
+        }
+        let n = vals.len() as f32;
+        let mean = vals.iter().sum::<f32>() / n;
+        let var = vals.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n;
+        (mean, var.sqrt())
+    }
+
+    #[test]
+    fn jaw_and_funnel_hold_stable() {
+        let rest = canonical_face();
+        let mut ext = FeatureExtractor::new(0.0);
+        calibrate_mouth(&mut ext, &rest);
+        let mut seed = 0x51ABu32;
+        let (rj, sj) = series_mean_std(&mut ext, &rest, FEAT_JAW_OPEN, &mut seed);
+        let (rf, sf) = series_mean_std(&mut ext, &rest, FEAT_MOUTH_FUNNEL, &mut seed);
+        last_after(&mut ext, &rest, 8);
+        let (hj, hjs) =
+            series_mean_std(&mut ext, &drop_chin(&rest, 0.14), FEAT_JAW_OPEN, &mut seed);
+        last_after(&mut ext, &rest, 8);
+        let (hf, hfs) = series_mean_std(
+            &mut ext,
+            &funnel_mouth(&rest, 0.55, 2.8),
+            FEAT_MOUTH_FUNNEL,
+            &mut seed,
+        );
+        last_after(&mut ext, &rest, 8);
+        let lip = read_noisy(&mut ext, &open_mouth(&rest, 3.0), 16, &mut seed, 0.0035);
+        last_after(&mut ext, &rest, 8);
+        let puck = read_noisy(
+            &mut ext,
+            &pucker_lips(&rest, 0.45, 0.10),
+            16,
+            &mut seed,
+            0.0035,
+        );
+        last_after(&mut ext, &rest, 8);
+        let smile = read_noisy(&mut ext, &smile_mouth(&rest, 1.6), 16, &mut seed, 0.0035);
+        assert!(rj < DETECT_TH && sj < 0.08, "rest jaw {rj} std {sj}");
+        assert!(rf < DETECT_TH && sf < 0.08, "rest funnel {rf} std {sf}");
+        assert!(hj > 0.5 && hjs < 0.15, "hold jaw {hj} std {hjs}");
+        assert!(hf > 0.5 && hfs < 0.15, "hold funnel {hf} std {hfs}");
+        assert!(lip[FEAT_JAW_OPEN] < DETECT_TH && lip[FEAT_MOUTH_FUNNEL] < DETECT_TH);
+        assert!(puck[FEAT_MOUTH_FUNNEL] < DETECT_TH && smile[FEAT_MOUTH_FUNNEL] < DETECT_TH);
     }
 }

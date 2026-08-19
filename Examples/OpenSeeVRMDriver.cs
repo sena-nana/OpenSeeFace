@@ -887,16 +887,20 @@ public class OpenSeeVRMDriver : MonoBehaviour {
                 else
                     proxy.SetPerfectSync("MOUTHPUCKER", 0, lastPerfectSync);
                 
-                if (openSeeData.features.MouthOpen > 0.0f) {
-                    proxy.SetPerfectSync("JAWOPEN", openSeeData.features.MouthOpen, lastPerfectSync);
-                    proxy.SetPerfectSync("MOUTHCLOSE", 0, lastPerfectSync);
-                } else if (openSeeData.features.MouthOpen < -0.0f) {
+                if (openSeeData.features.JawOpen > 0.0f)
+                    proxy.SetPerfectSync("JAWOPEN", openSeeData.features.JawOpen, lastPerfectSync);
+                else
+                    proxy.SetPerfectSync("JAWOPEN", 0, lastPerfectSync);
+
+                if (openSeeData.features.MouthOpen < -0.0f)
                     proxy.SetPerfectSync("MOUTHCLOSE", openSeeData.features.MouthOpen, lastPerfectSync);
-                    proxy.SetPerfectSync("JAWOPEN", 0, lastPerfectSync);
-                } else {
-                    proxy.SetPerfectSync("JAWOPEN", 0, lastPerfectSync);
+                else
                     proxy.SetPerfectSync("MOUTHCLOSE", 0, lastPerfectSync);
-                }
+
+                if (openSeeData.features.MouthFunnel > 0.0f)
+                    proxy.SetPerfectSync("MOUTHFUNNEL", openSeeData.features.MouthFunnel, lastPerfectSync);
+                else
+                    proxy.SetPerfectSync("MOUTHFUNNEL", 0, lastPerfectSync);
                 
                 if (openSeeData.features.MouthOffsetX < -0.3f)
                     proxy.SetPerfectSync("MOUTHLEFT", -openSeeData.features.MouthOffsetX * 0.5f, lastPerfectSync);
