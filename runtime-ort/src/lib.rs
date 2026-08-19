@@ -10,6 +10,7 @@ mod features;
 mod filter;
 mod gaze;
 mod geom;
+mod glasses;
 mod gpu_pre;
 mod metrics;
 mod pnp;
@@ -26,6 +27,7 @@ pub use adaptive::{
 };
 pub use capture::{list_cameras, mirror_bgr, InputSource, PipedInput, VideoOut};
 pub use crop::{stable_landmark_bbox, CropSmoothState, CropTrack};
+pub use glasses::{ear_2d, paint_synthetic_glasses};
 pub use decode::{
     decode_landmarks, decode_landmarks_data, detect_faces, detect_faces_n, landmark_bbox,
     mean_conf, LmSpec, TensorF16, EYE_IDX,

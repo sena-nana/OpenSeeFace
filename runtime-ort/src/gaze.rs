@@ -53,6 +53,7 @@ struct EyePrep {
     reference: [f32; 2],
     angle: f32,
     flip: bool,
+    glare: bool,
 }
 
 fn prepare_eye(face: &BgrImage, corners: [[f32; 2]; 2], flip: bool) -> Option<EyePrep> {
@@ -60,10 +61,20 @@ fn prepare_eye(face: &BgrImage, corners: [[f32; 2]; 2], flip: bool) -> Option<Ey
     let (c2, a) = compensate(c1, corners[1]);
     let center = [(c1[0] + c2.0) / 2.0, (c1[1] + c2.1) / 2.0];
     let radius = ((c1[0] - c2.0).hypot(c1[1] - c2.1) / 2.0).max(1.0);
-    let rx = radius * 1.4;
-    let ry = radius * 1.2;
     let w = face.width as f32;
     let h = face.height as f32;
+    let probe_rx = radius * 1.4;
+    let probe_ry = radius * 1.2;
+    let glare = crate::glasses::region_glare_frac(
+        face,
+        center[0] - probe_rx,
+        center[1] - probe_ry,
+        center[0] + probe_rx,
+        center[1] + probe_ry,
+    ) > crate::glasses::GLARE_FRAC_THRESH;
+    let (px, py) = if glare { (1.65, 1.45) } else { (1.4, 1.2) };
+    let rx = radius * px;
+    let ry = radius * py;
     let (x1, y1) = clamp_to_im(center[0] - rx, center[1] - ry, w, h);
     let (x2, y2) = clamp_to_im(center[0] + rx, center[1] + ry, w, h);
     if x2 <= x1 || y2 <= y1 {
@@ -78,6 +89,7 @@ fn prepare_eye(face: &BgrImage, corners: [[f32; 2]; 2], flip: bool) -> Option<Ey
         reference: c1,
         angle: a,
         flip,
+        glare,
     })
 }
 
@@ -103,6 +115,9 @@ fn eye_nchw_into(face: &BgrImage, p: &EyePrep, dst: &mut [f16]) {
     }
     if p.flip {
         crop.flip_h_in_place();
+    }
+    if p.glare || crate::glasses::glare_frac(&crop) > crate::glasses::GLARE_FRAC_THRESH {
+        crate::glasses::suppress_glare(&mut crop);
     }
     imagenet_nchw_into(&crop, 32, dst);
 }

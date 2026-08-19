@@ -207,8 +207,11 @@ impl Feature {
 /// Landmark EAR at a fully shut lid (~8% of the open-eye median).
 const EYE_CLOSED_FRAC: f32 = 0.08;
 const EYE_ALPHA: f32 = 0.6;
+const EYE_ALPHA_OUTLIER: f32 = 0.82;
 /// Ignore blinks / held squints when updating the open-eye baseline.
 const EYE_MEDIAN_GATE: f32 = 0.70;
+/// Frame height looks like an extra-open eye; skip median updates.
+const EYE_FRAME_FRAC: f32 = 1.12;
 
 /// Continuous eye openness. Mouth / brow features keep [`Feature`].
 struct EyeFeature {
@@ -218,6 +221,7 @@ struct EyeFeature {
     max_feature_updates: f32,
     first_seen: f32,
     updating: bool,
+    outlier_run: u8,
 }
 
 impl EyeFeature {
@@ -229,18 +233,34 @@ impl EyeFeature {
             max_feature_updates,
             first_seen: -1.0,
             updating: true,
+            outlier_run: 0,
         }
     }
 
     fn update(&mut self, x: f32, now: f32) -> f32 {
+        self.update_ex(x, now, None)
+    }
+
+    fn update_ex(&mut self, x: f32, now: f32, eye_conf: Option<f32>) -> f32 {
         if self.max_feature_updates > 0.0 && self.first_seen < 0.0 {
             self.first_seen = now;
         }
         let updating = self.updating
             && (self.max_feature_updates == 0.0
                 || now - self.first_seen < self.max_feature_updates);
+        let weak = eye_conf.map(|c| c < 0.4).unwrap_or(false);
+        let too_wide = self.current_median > 1e-8 && x > self.current_median * EYE_FRAME_FRAC;
+        let outlier = weak || too_wide;
+        if outlier {
+            self.outlier_run = self.outlier_run.saturating_add(1);
+        } else {
+            self.outlier_run = 0;
+        }
         if updating {
-            if self.current_median.abs() < 1e-8 || x >= self.current_median * EYE_MEDIAN_GATE {
+            let allow_median = !weak && !too_wide;
+            if allow_median
+                && (self.current_median.abs() < 1e-8 || x >= self.current_median * EYE_MEDIAN_GATE)
+            {
                 self.median.add(x);
                 self.current_median = self.median.median();
             }
@@ -248,7 +268,12 @@ impl EyeFeature {
             self.updating = false;
         }
         let new = eye_value(x, self.current_median);
-        self.last = self.last * EYE_ALPHA + new * (1.0 - EYE_ALPHA);
+        let alpha = if self.outlier_run >= 2 {
+            EYE_ALPHA_OUTLIER
+        } else {
+            EYE_ALPHA
+        };
+        self.last = self.last * alpha + new * (1.0 - alpha);
         self.last
     }
 }
@@ -327,6 +352,15 @@ impl FeatureExtractor {
     }
 
     pub fn update(&mut self, pts: &[[f32; 3]], full: bool) -> [f32; 14] {
+        self.update_ex(pts, full, None)
+    }
+
+    pub fn update_ex(
+        &mut self,
+        pts: &[[f32; 3]],
+        full: bool,
+        eye_conf: Option<f32>,
+    ) -> [f32; 14] {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f32())
@@ -341,10 +375,10 @@ impl FeatureExtractor {
         let nx = norm_distance_x.abs().max(1e-6);
 
         let (a1, f) = eye_aspect(p(42), p(45), [p(43), p(44), p(47), p(46)]);
-        let eye_l = self.eye_l.update(f, now);
+        let eye_l = self.eye_l.update_ex(f, now, eye_conf);
 
         let (a2, f) = eye_aspect(p(36), p(39), [p(37), p(38), p(41), p(40)]);
-        let eye_r = self.eye_r.update(f, now);
+        let eye_r = self.eye_r.update_ex(f, now, eye_conf);
 
         let (steep_l, quirk_l, steep_r, quirk_r) = if full {
             let (a3, _) = Self::align_points(p(0), p(16), &[]);
@@ -520,5 +554,19 @@ mod tests {
             assert!(f[0] < -0.05 && f[0] > -0.95);
             assert!(f[1] < -0.05 && f[1] > -0.95);
         }
+    }
+
+    #[test]
+    fn outlier_keeps_calibrated_median() {
+        let mut eye = EyeFeature::new(0.0);
+        feed(&mut eye, 0.25, 80);
+        for i in 0..40 {
+            eye.update_ex(0.45, 3.0 + i as f32 * 0.03, Some(0.9));
+        }
+        let open = eye.update_ex(0.25, 5.0, Some(0.9));
+        assert!(
+            open.abs() < 0.2,
+            "true-open EAR treated as closed after frame-height: {open}"
+        );
     }
 }

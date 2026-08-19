@@ -4,8 +4,9 @@
 //! rotation is not applied to the crop. Scale and translation come from
 //! Umeyama on points 36/39/42/45/30; size is a running max of the detector
 //! box, the 66-pt hull, and the scaled FACE_3D template (grows, never shrinks
-//! with jaw/mouth jitter). Weak refs fall back to interior landmarks, then
-//! hold the previous box.
+//! with jaw/mouth jitter). If a parallel brows+nose fit disagrees (eye corners
+//! pulled onto a rim), that fit is used instead. Weak refs fall back to
+//! interior landmarks, then hold the previous box.
 
 use crate::decode::landmark_bbox;
 use crate::geom::{similarity_umeyama, xywh_iou, Similarity};
@@ -19,6 +20,12 @@ const IOU_RESET: f32 = 0.3;
 const JUMP_FRAC: f32 = 0.2;
 const INTERIOR: std::ops::Range<usize> = 17..48;
 const EYES_NOSE: [usize; 5] = [36, 39, 42, 45, 30];
+/// Brows 17–26 + nose 27–35 (no lids / corners).
+const BROWS_NOSE: std::ops::Range<usize> = 17..36;
+/// Switch to brows+nose when implied eye corners diverge by this fraction of IOD.
+/// 0.12 fires on a clean 3D face (different subsets); 0.55 still catches a ~48px rim pull.
+const SHIFT_FRAC: f32 = 0.55;
+const EYE_CORNERS: [usize; 4] = [36, 39, 42, 45];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CropSmoothState {
@@ -106,16 +113,38 @@ fn collect_range(
     (src, dst)
 }
 
-fn collect_pairs(pts: &[[f32; 3]]) -> (Vec<[f32; 2]>, Vec<[f32; 2]>) {
-    let (src, dst) = collect_indices(pts, &EYES_NOSE);
-    if src.len() >= MIN_PTS {
-        return (src, dst);
-    }
+fn collect_fallback(pts: &[[f32; 3]]) -> (Vec<[f32; 2]>, Vec<[f32; 2]>) {
     let interior = collect_range(pts, INTERIOR);
     if interior.0.len() >= MIN_PTS {
         return interior;
     }
     collect_range(pts, 0..pts.len().min(66))
+}
+
+fn fits_disagree(eyes: &Similarity, brows: &Similarity) -> bool {
+    // Compare implied eye-corner locations, not raw (tx, scale): brows vs eyes
+    // subsets have different centroids/scales even on a clean 3D face.
+    let mut max_d = 0.0f32;
+    let mut n = 0u32;
+    for &i in &EYE_CORNERS {
+        let Some(t) = template_xy(i) else { continue };
+        let a = eyes.apply(t);
+        let b = brows.apply(t);
+        max_d = max_d.max((a[0] - b[0]).hypot(a[1] - b[1]));
+        n += 1;
+    }
+    if n == 0 {
+        return false;
+    }
+    let iod = match (template_xy(36), template_xy(45)) {
+        (Some(l), Some(r)) => {
+            let a = eyes.apply(l);
+            let b = eyes.apply(r);
+            (a[0] - b[0]).hypot(a[1] - b[1])
+        }
+        _ => eyes.scale.abs() * 2.0,
+    };
+    max_d > SHIFT_FRAC * iod.max(1.0)
 }
 
 fn aabb_pts(pts: &[[f32; 3]], range: std::ops::Range<usize>) -> Option<[f32; 4]> {
@@ -183,25 +212,50 @@ fn axis_pose(scale: f32, src: &[[f32; 2]], dst: &[[f32; 2]]) -> Similarity {
     }
 }
 
+fn pose_from_pairs(
+    src: &[[f32; 2]],
+    dst: &[[f32; 2]],
+    prev: Option<Similarity>,
+) -> Option<Similarity> {
+    if src.len() < MIN_PTS {
+        return None;
+    }
+    if let Some(sim) = similarity_umeyama(src, dst) {
+        return Some(axis_pose(sim.scale, src, dst));
+    }
+    prev.map(|p| axis_pose(p.scale, src, dst))
+}
+
 fn fit_sim(pts: &[[f32; 3]], prev: Option<Similarity>) -> Option<Similarity> {
-    let (src, dst) = collect_pairs(pts);
-    if src.len() >= MIN_PTS {
-        if let Some(sim) = similarity_umeyama(&src, &dst) {
-            return Some(axis_pose(sim.scale, &src, &dst));
+    let eyes = collect_indices(pts, &EYES_NOSE);
+    let brows = collect_range(pts, BROWS_NOSE);
+    let eyes_fit = pose_from_pairs(&eyes.0, &eyes.1, prev);
+    let brows_fit = pose_from_pairs(&brows.0, &brows.1, prev);
+    match (eyes_fit, brows_fit) {
+        (Some(e), Some(b)) if fits_disagree(&e, &b) => Some(b),
+        (Some(e), _) => Some(e),
+        (None, Some(b)) => Some(b),
+        (None, None) => {
+            let (src, dst) = collect_fallback(pts);
+            if src.len() >= MIN_PTS {
+                if let Some(sim) = similarity_umeyama(&src, &dst) {
+                    return Some(axis_pose(sim.scale, &src, &dst));
+                }
+            }
+            if let Some(p) = prev {
+                if !src.is_empty() {
+                    return Some(axis_pose(p.scale, &src, &dst));
+                }
+                return Some(Similarity {
+                    scale: p.scale,
+                    theta: 0.0,
+                    tx: p.tx,
+                    ty: p.ty,
+                });
+            }
+            None
         }
     }
-    if let Some(p) = prev {
-        if !src.is_empty() {
-            return Some(axis_pose(p.scale, &src, &dst));
-        }
-        return Some(Similarity {
-            scale: p.scale,
-            theta: 0.0,
-            tx: p.tx,
-            ty: p.ty,
-        });
-    }
-    None
 }
 
 fn mix(state: &mut CropSmoothState, raw: Similarity) -> Similarity {
@@ -413,5 +467,37 @@ mod tests {
             "must follow a large translation, got {:?}",
             b1
         );
+    }
+
+    #[test]
+    fn shifted_eye_corners_use_brows_nose() {
+        let mut pts = synth_pts(100.0, 320.0, 240.0);
+        for &i in &[36usize, 39, 42, 45] {
+            pts[i][1] += 48.0;
+        }
+        let eyes = collect_indices(&pts, &EYES_NOSE);
+        let brows = collect_range(&pts, BROWS_NOSE);
+        let e = pose_from_pairs(&eyes.0, &eyes.1, None).unwrap();
+        let b = pose_from_pairs(&brows.0, &brows.1, None).unwrap();
+        assert!(fits_disagree(&e, &b), "eyes vs brows should disagree");
+        let box4 = stable_landmark_bbox(&pts, None).unwrap();
+        let cx = box4[0] + box4[2] * 0.5;
+        assert!(
+            (cx - 320.0).abs() < 12.0,
+            "brows+nose should keep cx near 320, got {cx}"
+        );
+    }
+
+    #[test]
+    fn clean_face_keeps_eyes_nose() {
+        let pts = synth_pts(100.0, 320.0, 240.0);
+        let eyes = collect_indices(&pts, &EYES_NOSE);
+        let brows = collect_range(&pts, BROWS_NOSE);
+        let e = pose_from_pairs(&eyes.0, &eyes.1, None).unwrap();
+        let b = pose_from_pairs(&brows.0, &brows.1, None).unwrap();
+        assert!(!fits_disagree(&e, &b), "clean face fits should agree");
+        let box4 = stable_landmark_bbox(&pts, None).unwrap();
+        let cx = box4[0] + box4[2] * 0.5;
+        assert!((cx - 320.0).abs() < 2.0, "cx={cx}");
     }
 }

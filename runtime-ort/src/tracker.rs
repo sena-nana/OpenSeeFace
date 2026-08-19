@@ -11,6 +11,7 @@ use crate::features::FeatureExtractor;
 use crate::filter::{FilterCfg, FilterKind, FilterQuality, OutputFilter};
 use crate::gaze::get_eye_state;
 use crate::geom::{clamp_to_im, group_rects};
+use crate::glasses::hold_gaze;
 use crate::gpu_pre::GpuTracker;
 use crate::pnp::{adjust_3d, estimate_depth, Camera, CONTOUR_PTS, CONTOUR_PTS_T, FACE_3D};
 use crate::preprocess::{imagenet_nchw_into, imagenet_nchw_roi_into, BgrImage};
@@ -168,7 +169,7 @@ impl FaceInfo {
         self.frame_count = frame_count;
         self.conf = conf;
         self.lms = lms;
-        self.eye_state = eye;
+        self.eye_state = hold_gaze(self.eye_state, eye);
         self.coord = Some(coord);
         self.alive = true;
         let _ = (model_type, max_feature_updates);
@@ -425,9 +426,9 @@ impl Tracker {
         dets.into_iter().map(|d| [d[0], d[1], d[2], d[3]]).collect()
     }
 
-    fn assign_face_info(&mut self, results: Vec<(f32, Vec<[f32; 3]>, [[f32; 4]; 2], f32)>) {
+    fn assign_face_info(&mut self, results: Vec<(f32, Vec<[f32; 3]>, [[f32; 4]; 2])>) {
         if self.max_faces == 1 && results.len() == 1 {
-            let (conf, lms, eye, _) = results.into_iter().next().unwrap();
+            let (conf, lms, eye) = results.into_iter().next().unwrap();
             let coord = mean_xy(&lms);
             self.face_info[0].update_det(
                 conf,
@@ -469,7 +470,7 @@ impl Tracker {
                 break;
             }
             let (_, fi, ri) = best;
-            let (conf, lms, eye, _) = results[ri].clone();
+            let (conf, lms, eye) = results[ri].clone();
             self.face_info[fi].update_det(
                 conf,
                 lms,
@@ -595,7 +596,8 @@ impl Tracker {
                 continue;
             }
             let eye = if let Some(g) = self.gaze.as_mut() {
-                get_eye_state(g, frame, &lms, self.no_gaze).unwrap_or([[1.0, 0.0, 0.0, 0.0]; 2])
+                get_eye_state(g, frame, &lms, self.no_gaze)
+                    .unwrap_or([[1.0, 0.0, 0.0, 0.0]; 2])
             } else {
                 [[1.0, 0.0, 0.0, 0.0]; 2]
             };
@@ -628,12 +630,12 @@ impl Tracker {
                 best[g] = Some((score, i));
             }
         }
-        let mut picked: Vec<(f32, Vec<[f32; 3]>, [[f32; 4]; 2], f32)> = best
+        let mut picked: Vec<(f32, Vec<[f32; 3]>, [[f32; 4]; 2])> = best
             .into_iter()
             .flatten()
             .map(|(_, i)| {
-                let (c, l, e, b, _) = raw[i].clone();
-                (c, l, e, b)
+                let (c, l, e, _, _) = raw[i].clone();
+                (c, l, e)
             })
             .collect();
         picked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));

@@ -42,6 +42,7 @@ CPU is the default. GPU (CoreML on Apple, CUDA on NVIDIA) uses the same loop; de
 # General notes
 
 * The tracking seems to be quite robust even with partial occlusion of the face, glasses or bad lighting conditions.
+* With glasses, next-frame crop switches to brows+nose when eye corners disagree with that fit. Blink skips EAR outliers / low eye conf; gaze holds the last pupil when heatmap conf drops and suppresses specular only when the eye crop is blown out. Sunglasses / missing iris still cannot recover appearance-based gaze.
 * The highest quality model is selected with `--model 3`, the fastest model with the lowest tracking quality is `--model 0`.
 * Lower tracking quality mainly means more rigid tracking, making it harder to detect blinking and eyebrow motion.
 * Depending on the frame rate, face tracking can easily use up a whole CPU core. At 30fps for a single face, it should still use less than 100% of one core on a decent CPU. If tracking uses too much CPU, try lowering the frame rate. A frame rate of 20 is probably fine and anything above 30 should rarely be necessary.
@@ -131,6 +132,11 @@ Face-size adaptive tracking: CPU zooms the 224 detector on small faces and switc
 Next-frame crop uses an eyes+nose similarity fit. After a face is locked, that crop is reused and the 224 detector is not run (`osf-bench --suite crop`):
 
     cargo run --release --manifest-path runtime-ort/Cargo.toml --bin osf-bench -- --suite crop --model 3 --threads 4
+
+Glasses runtime path (bare vs synthetic rims/glare on the seed face; Wikimedia stills if `benchmarks/fixtures/cache/` is populated). Download the CC/PD portraits first:
+
+    python3 benchmarks/fixtures/fetch.py
+    cargo run --release --manifest-path runtime-ort/Cargo.toml --bin osf-bench -- --suite glasses --model 3 --threads 4
 
 Output post-process (`none` vs default `one-euro`) on the same raw pose and landmarks (`osf-bench --suite filter`). Decision notes: [benchmarks/filter-eval.md](benchmarks/filter-eval.md).
 

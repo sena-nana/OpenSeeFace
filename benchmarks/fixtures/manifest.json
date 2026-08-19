@@ -3,27 +3,103 @@
     {
       "id": "yu_hwang_wu",
       "file": "YU HWANG WU.jpg",
+      "commons": "File:YU HWANG WU.jpg",
       "license": "CC BY-SA 2.0",
       "artist": "Yu Hwang-Wu",
       "page": "https://commons.wikimedia.org/wiki/File:YU_HWANG_WU.jpg",
-      "tags": ["glasses"]
+      "tags": ["glasses", "frontal", "man", "thin-metal"]
     },
     {
       "id": "banasiewicz",
       "file": "0006RP7JBDVECJOS-C122-F4.jpg",
+      "commons": "File:0006RP7JBDVECJOS-C122-F4.jpg",
       "license": "CC BY-SA 4.0",
       "artist": "Maya.Jachim",
       "page": "https://commons.wikimedia.org/wiki/File:0006RP7JBDVECJOS-C122-F4.jpg",
-      "tags": ["glasses"]
+      "tags": ["glasses", "man", "semi-rimless", "glare"]
     },
     {
       "id": "casola",
       "file": "Christian Casola of Salerno.jpg",
-      "title": "File:\"Christian Casola of Salerno from Radio Castelluccio - Oct 2020.jpg\".jpg",
+      "commons": "File:\"Christian Casola of Salerno from Radio Castelluccio - Oct 2020.jpg\".jpg",
       "license": "CC BY-SA 4.0",
       "artist": "Teddysheen",
       "page": "https://commons.wikimedia.org/wiki/File:%22Christian_Casola_of_Salerno_from_Radio_Castelluccio_-_Oct_2020.jpg%22.jpg",
-      "tags": ["glasses"]
+      "tags": ["glasses", "man", "frontal"]
+    },
+    {
+      "id": "eileen_higgins",
+      "file": "eileen_higgins.jpg",
+      "commons": "File:Eileen Higgins (Miami–Dade County Commissioner) official headshot with white background.jpg",
+      "license": "Public domain",
+      "artist": "Office of Commissioner Eileen Higgins",
+      "page": "https://commons.wikimedia.org/wiki/File:Eileen_Higgins_(Miami%E2%80%93Dade_County_Commissioner)_official_headshot_with_white_background.jpg",
+      "tags": ["glasses", "frontal", "woman", "studio", "glare"]
+    },
+    {
+      "id": "juliana_rotich",
+      "file": "juliana_rotich.jpg",
+      "commons": "File:Juliana Rotich in Berlin, April 2017 (cropped).jpg",
+      "license": "Public domain",
+      "artist": "U.S. Mission Germany / usbotschaftberlin (Flickr)",
+      "page": "https://commons.wikimedia.org/wiki/File:Juliana_Rotich_in_Berlin,_April_2017_(cropped).jpg",
+      "tags": ["glasses", "woman", "three-quarter", "glare"],
+      "webcam_pad": true
+    },
+    {
+      "id": "wahid_2020",
+      "file": "wahid_2020.jpg",
+      "commons": "File:Wahid Headshot jan 2020.jpg",
+      "license": "CC BY-SA 4.0",
+      "artist": "WeaverOfSamsara",
+      "page": "https://commons.wikimedia.org/wiki/File:Wahid_Headshot_jan_2020.jpg",
+      "tags": ["glasses", "frontal", "man", "headshot", "glare"]
+    },
+    {
+      "id": "marc_maechler",
+      "file": "marc_maechler.jpg",
+      "commons": "File:01 Marc Maechler Portrait.jpg",
+      "license": "CC BY-SA 3.0",
+      "artist": "Jerry Gross",
+      "page": "https://commons.wikimedia.org/wiki/File:01_Marc_Maechler_Portrait.jpg",
+      "tags": ["glasses", "frontal", "man", "studio", "glare"]
+    },
+    {
+      "id": "rolf_tophoven",
+      "file": "rolf_tophoven.jpg",
+      "commons": "File:2020-09-24 Rolf Tophoven 4454.JPG",
+      "license": "CC BY-SA 3.0",
+      "artist": "Michael Lucan",
+      "page": "https://commons.wikimedia.org/wiki/File:2020-09-24_Rolf_Tophoven_4454.JPG",
+      "tags": ["glasses", "man", "thin-metal"]
+    },
+    {
+      "id": "gustavo_cerati",
+      "file": "gustavo_cerati.jpg",
+      "commons": "File:Gustavo Cerati fn.jpg",
+      "license": "CC BY-SA 4.0",
+      "artist": "OrdeP orroP",
+      "page": "https://commons.wikimedia.org/wiki/File:Gustavo_Cerati_fn.jpg",
+      "tags": ["sunglasses", "man", "occlusion"]
+    },
+    {
+      "id": "christin_loehner",
+      "file": "christin_loehner.jpg",
+      "commons": "File:Christin Löhner (August 2019).jpg",
+      "license": "CC BY-SA 4.0",
+      "artist": "Wikitgirl",
+      "page": "https://commons.wikimedia.org/wiki/File:Christin_L%C3%B6hner_(August_2019).jpg",
+      "tags": ["glasses", "woman", "frontal"]
+    },
+    {
+      "id": "grazyna_dziedzic",
+      "file": "grazyna_dziedzic.jpg",
+      "commons": "File:Grazyna Dziedzic 2020.jpg",
+      "license": "CC BY-SA 4.0",
+      "artist": "Adrian Tync",
+      "page": "https://commons.wikimedia.org/wiki/File:Grazyna_Dziedzic_2020.jpg",
+      "tags": ["glasses", "woman", "outdoor", "yaw"],
+      "webcam_pad": true
     }
   ]
 }

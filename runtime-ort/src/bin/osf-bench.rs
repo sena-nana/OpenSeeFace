@@ -7,12 +7,13 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use clap::Parser;
 use osf_ort::{
-    center_2x, cosine, crop_box, crop_box_pad, crop_img, det_window, detect_faces, enhance_bgr,
-    face_crop, imagenet_nchw, iou, max_abs, mean_abs, mean_conf, model_path, nme, paste_bgr,
-    pick_lm, read_f32_le, resize_bgr, retina_nchw, rss, synth_canvas, unwrap_deg, xywh_iou,
-    AdaptiveCfg, AdaptiveState, BgrImage, CropTrack, DetWindow, Device, EnhanceCfg, FilterCfg,
-    FilterKind, FilterQuality, GpuTracker, Latency, LmSpec, OrtModel, OutputFilter, TensorF16,
-    Tracker, TrackerConfig, EYE_IDX, FAST_LM, VERSION,
+    center_2x, cosine, crop_box, crop_box_pad, crop_img, det_window, detect_faces, ear_2d,
+    enhance_bgr, face_crop, imagenet_nchw, iou, max_abs, mean_abs,
+    mean_conf, model_path, nme, paint_synthetic_glasses, paste_bgr, pick_lm, read_f32_le, resize_bgr,
+    retina_nchw, rss, synth_canvas, unwrap_deg, xywh_iou, AdaptiveCfg, AdaptiveState, BgrImage,
+    CropTrack, DetWindow, Device, EnhanceCfg, FilterCfg, FilterKind, FilterQuality, GpuTracker,
+    Latency, LmSpec, OrtModel, OutputFilter, TensorF16, Tracker, TrackerConfig, EYE_IDX, FAST_LM,
+    VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -33,7 +34,7 @@ struct Args {
     /// cpu | gpu (CoreML on Apple, CUDA on NVIDIA)
     #[arg(long, default_value = "cpu")]
     device: String,
-    /// micro | realistic | all | scale | enhance | crop | filter
+    /// micro | realistic | all | scale | enhance | crop | filter | glasses
     #[arg(long, default_value = "micro")]
     suite: String,
     #[arg(long)]
@@ -183,6 +184,11 @@ fn main() -> Result<()> {
     if args.suite == "filter" {
         let path = args.out.clone().unwrap_or_else(default_filter_out);
         run_filter_suite(&args, spec, device, &path)?;
+        return Ok(());
+    }
+    if args.suite == "glasses" {
+        let path = args.out.clone().unwrap_or_else(default_glasses_out);
+        run_glasses_suite(&args, spec, device, &path)?;
         return Ok(());
     }
     let run_micro = args.suite == "micro" || args.suite == "all";
@@ -543,6 +549,7 @@ struct Row {
     crop_h: u32,
     box5: Option<[f32; 5]>,
     pts: Vec<[f32; 3]>,
+    ear: Option<f32>,
 }
 
 fn gaze_input(frame: &BgrImage, pts: &[[f32; 3]]) -> Option<TensorF16> {
@@ -662,6 +669,7 @@ fn one_frame(
         crop_h: 0,
         box5: None,
         pts: Vec::new(),
+        ear: None,
     };
     let Some(d) = box5 else {
         crop.reset();
@@ -746,6 +754,7 @@ fn one_frame(
         crop_w,
         crop_h,
         box5: Some(next),
+        ear: ear_2d(&pts),
         pts,
     })
 }
@@ -1037,6 +1046,10 @@ fn default_filter_out() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../benchmarks/out/filter.json")
 }
 
+fn default_glasses_out() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../benchmarks/out/glasses.json")
+}
+
 const SCALE_FRACS: [f32; 7] = [0.10, 0.14, 0.20, 0.28, 0.36, 0.48, 0.60];
 const SCALE_W: u32 = 1280;
 const SCALE_H: u32 = 720;
@@ -1160,6 +1173,18 @@ struct TeachFrame {
 }
 
 fn run_seq(
+    cpu: Option<&mut CpuPipe>,
+    gpu: Option<&mut GpuTracker>,
+    spec: LmSpec,
+    seq: &ScaleSeq,
+    cfg: Option<&AdaptiveCfg>,
+    enhance: EnhanceCfg,
+    scan_every: u32,
+) -> Result<Vec<Row>> {
+    run_seq_ex(cpu, gpu, spec, seq, cfg, enhance, scan_every, false)
+}
+
+fn run_seq_ex(
     mut cpu: Option<&mut CpuPipe>,
     mut gpu: Option<&mut GpuTracker>,
     spec: LmSpec,
@@ -1167,11 +1192,25 @@ fn run_seq(
     cfg: Option<&AdaptiveCfg>,
     enhance: EnhanceCfg,
     scan_every: u32,
+    do_gaze: bool,
 ) -> Result<Vec<Row>> {
     let mut state = cfg.copied().map(AdaptiveState::new);
     let mut box5 = None;
     let mut rows = Vec::with_capacity(seq.frames.len());
     let mut gaze = None;
+    if do_gaze {
+        let p = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../models/mnv3_gaze32_split_opt.onnx");
+        let p2 = PathBuf::from("models/mnv3_gaze32_split_opt.onnx");
+        let path = if p.is_file() {
+            p
+        } else {
+            p2
+        };
+        if path.is_file() {
+            gaze = OrtModel::open(path, 1, Device::Cpu, 2).ok();
+        }
+    }
     let mut crop = CropTrack::new();
     for (i, frame) in seq.frames.iter().enumerate() {
         let ad = match (cfg, state.as_mut()) {
@@ -1192,7 +1231,7 @@ fn run_seq(
             0.1,
             0.125,
             do_detect,
-            false,
+            do_gaze,
             ad,
             enhance,
             &mut crop,
@@ -2490,6 +2529,230 @@ fn run_filter_suite(args: &Args, _spec: LmSpec, device: Device, out: &Path) -> R
         filter_us,
         vs_speed_jitter,
         scenes: scores,
+    };
+    if let Some(dir) = out.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    fs::write(out, serde_json::to_string_pretty(&report)?)?;
+    eprintln!("wrote {}", out.display());
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct GlassesSceneScore {
+    name: String,
+    frames: usize,
+    hits: usize,
+    lm_conf: Option<f32>,
+    eye_conf: Option<f32>,
+    gaze_conf: Option<f32>,
+    ear_mean: Option<f32>,
+    ear_std: Option<f32>,
+    crop_iou_vs_control: Option<f32>,
+    e2e_p50_ms: f64,
+}
+
+#[derive(Serialize)]
+struct GlassesReport {
+    frames: usize,
+    scenes: Vec<GlassesSceneScore>,
+}
+
+fn std_f32(v: &[f32]) -> Option<f32> {
+    let m = mean_f32(v)?;
+    if v.len() < 2 {
+        return Some(0.0);
+    }
+    let var = v.iter().map(|x| (x - m) * (x - m)).sum::<f32>() / v.len() as f32;
+    Some(var.sqrt())
+}
+
+fn glasses_scene(name: &str, rows: &[Row], control: Option<&[Row]>) -> GlassesSceneScore {
+    let hits = rows.iter().filter(|r| r.faces > 0).count();
+    let mut iou = Vec::new();
+    if let Some(ctl) = control {
+        for (a, b) in rows.iter().zip(ctl.iter()) {
+            if let (Some(x), Some(y)) = (a.box5, b.box5) {
+                iou.push(xywh_iou(
+                    [x[0], x[1], x[2], x[3]],
+                    [y[0], y[1], y[2], y[3]],
+                ));
+            }
+        }
+    }
+    let ears: Vec<f32> = rows.iter().filter_map(|r| r.ear).collect();
+    GlassesSceneScore {
+        name: name.into(),
+        frames: rows.len(),
+        hits,
+        lm_conf: mean_opt(rows.iter().map(|r| r.lm_conf)),
+        eye_conf: mean_opt(rows.iter().map(|r| r.eye_conf)),
+        gaze_conf: mean_opt(rows.iter().map(|r| r.gaze_conf)),
+        ear_mean: mean_f32(&ears),
+        ear_std: std_f32(&ears),
+        crop_iou_vs_control: mean_f32(&iou),
+        e2e_p50_ms: Latency::from_samples(0, &rows.iter().map(|r| r.e2e_ms).collect::<Vec<_>>())
+            .p50_ms,
+    }
+}
+
+fn print_glasses_scene(s: &GlassesSceneScore) {
+    eprintln!(
+        "  {:16} lm={:.3} eye={:.3} gaze={:.3} ear={:.3}±{:.3} iou={:.3} rec={:.3} p50={:.2}ms",
+        s.name,
+        s.lm_conf.unwrap_or(0.0),
+        s.eye_conf.unwrap_or(0.0),
+        s.gaze_conf.unwrap_or(0.0),
+        s.ear_mean.unwrap_or(0.0),
+        s.ear_std.unwrap_or(0.0),
+        s.crop_iou_vs_control.unwrap_or(0.0),
+        s.hits as f32 / s.frames.max(1) as f32,
+        s.e2e_p50_ms
+    );
+}
+
+fn wikimedia_stills() -> Vec<(String, BgrImage)> {
+    let cache = Path::new(env!("CARGO_MANIFEST_DIR")).join("../benchmarks/fixtures/cache");
+    let man = Path::new(env!("CARGO_MANIFEST_DIR")).join("../benchmarks/fixtures/manifest.json");
+    let Ok(text) = fs::read_to_string(man) else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let Some(photos) = v.get("photos").and_then(|p| p.as_array()) else {
+        return out;
+    };
+    for p in photos {
+        let Some(file) = p.get("file").and_then(|s| s.as_str()) else {
+            continue;
+        };
+        let id = p
+            .get("id")
+            .and_then(|s| s.as_str())
+            .unwrap_or(file)
+            .to_string();
+        let path = cache.join(file);
+        if let Ok(im) = BgrImage::load(&path) {
+            out.push((id, im));
+        }
+    }
+    out
+}
+
+fn run_glasses_suite(args: &Args, _spec: LmSpec, device: Device, out: &Path) -> Result<()> {
+    let spec = LmSpec::from_type(3)?;
+    let mut pipe = open_cpu_pipe(args, spec, false)?;
+    let seed = BgrImage::load(&args.image)?;
+    let (tile, face_h) = extract_face_tile(&mut pipe, &seed)?;
+    let n = args.frames.max(24);
+    let bare = make_scale_seq_n(&tile, face_h, 0.20, n, true);
+    eprintln!("glasses: seed face_h={face_h:.1}px, {n} frames");
+
+    let mut gpu = (device == Device::Gpu)
+        .then(|| {
+            GpuTracker::with_enhance(
+                &args.models_dir,
+                spec,
+                args.threads,
+                &bare.frames[0],
+                EnhanceCfg::off(),
+            )
+        })
+        .transpose()?;
+
+    let bare_rows = if let Some(g) = gpu.as_mut() {
+        run_seq_ex(
+            None,
+            Some(g),
+            spec,
+            &bare,
+            None,
+            EnhanceCfg::off(),
+            0,
+            true,
+        )?
+    } else {
+        run_seq_ex(
+            Some(&mut pipe),
+            None,
+            spec,
+            &bare,
+            None,
+            EnhanceCfg::off(),
+            0,
+            true,
+        )?
+    };
+
+    let mut painted = Vec::with_capacity(bare.frames.len());
+    for (frame, row) in bare.frames.iter().zip(bare_rows.iter()) {
+        let mut f = frame.clone();
+        if row.pts.len() >= 48 {
+            paint_synthetic_glasses(&mut f, &row.pts);
+        }
+        painted.push(f);
+    }
+    let glasses_seq = ScaleSeq {
+        face_frac: bare.face_frac,
+        frames: painted,
+    };
+    let glasses_rows = if let Some(g) = gpu.as_mut() {
+        run_seq_ex(
+            None,
+            Some(g),
+            spec,
+            &glasses_seq,
+            None,
+            EnhanceCfg::off(),
+            0,
+            true,
+        )?
+    } else {
+        run_seq_ex(
+            Some(&mut pipe),
+            None,
+            spec,
+            &glasses_seq,
+            None,
+            EnhanceCfg::off(),
+            0,
+            true,
+        )?
+    };
+
+    let mut scenes = vec![
+        glasses_scene("bare", &bare_rows, None),
+        glasses_scene("synth_glasses", &glasses_rows, Some(&bare_rows)),
+    ];
+    for (id, im) in wikimedia_stills() {
+        let seq = ScaleSeq {
+            face_frac: 0.0,
+            frames: vec![im; 8.min(n).max(1)],
+        };
+        let rows = if let Some(g) = gpu.as_mut() {
+            run_seq_ex(None, Some(g), spec, &seq, None, EnhanceCfg::off(), 1, true)?
+        } else {
+            run_seq_ex(
+                Some(&mut pipe),
+                None,
+                spec,
+                &seq,
+                None,
+                EnhanceCfg::off(),
+                1,
+                true,
+            )?
+        };
+        scenes.push(glasses_scene(&id, &rows, None));
+    }
+    for s in &scenes {
+        print_glasses_scene(s);
+    }
+    let report = GlassesReport {
+        frames: n,
+        scenes,
     };
     if let Some(dir) = out.parent() {
         fs::create_dir_all(dir)?;

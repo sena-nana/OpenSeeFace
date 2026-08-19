@@ -3,6 +3,7 @@
 use nalgebra::{Matrix3, Vector3};
 use rand::Rng;
 
+use crate::decode::{mean_conf, EYE_IDX};
 use crate::geom::matrix_to_quaternion;
 
 pub const FACE_3D: [[f32; 3]; 70] = [
@@ -557,7 +558,14 @@ pub fn adjust_3d(
 ) {
     if conf < 0.4 || pnp_error > 300.0 {
         normalize_pts3d(pts_3d, face_3d);
-        apply_features(pts_3d, feature_level, features, current_features, eye_blink);
+        apply_features(
+            pts_3d,
+            feature_level,
+            features,
+            current_features,
+            eye_blink,
+            mean_conf(lms, &EYE_IDX),
+        );
         return;
     }
     if model_type != -1 && !static_model {
@@ -650,7 +658,14 @@ pub fn adjust_3d(
         }
     }
     normalize_pts3d(pts_3d, face_3d);
-    apply_features(pts_3d, feature_level, features, current_features, eye_blink);
+    apply_features(
+        pts_3d,
+        feature_level,
+        features,
+        current_features,
+        eye_blink,
+        mean_conf(lms, &EYE_IDX),
+    );
 }
 
 fn apply_features(
@@ -659,9 +674,10 @@ fn apply_features(
     features: &mut crate::features::FeatureExtractor,
     current_features: &mut [f32; 14],
     eye_blink: &mut [f32; 2],
+    eye_conf: Option<f32>,
 ) {
     if feature_level >= 1 {
-        *current_features = features.update(pts_3d, feature_level == 2);
+        *current_features = features.update_ex(pts_3d, feature_level == 2, eye_conf);
         eye_blink[0] = 1.0 - (-current_features[1]).clamp(0.0, 1.0);
         eye_blink[1] = 1.0 - (-current_features[0]).clamp(0.0, 1.0);
     }
