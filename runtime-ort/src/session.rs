@@ -64,9 +64,12 @@ pub(crate) fn oe(e: impl std::fmt::Display) -> anyhow::Error {
     anyhow::anyhow!("{e}")
 }
 
-pub(crate) fn gpu_eps() -> Result<Vec<ort::ep::ExecutionProviderDispatch>> {
+pub(crate) fn gpu_eps(cuda_graph: bool) -> Result<Vec<ort::ep::ExecutionProviderDispatch>> {
     #[cfg(not(feature = "gpu"))]
-    bail!("GPU requested; rebuild with `--features gpu` or use `--device cpu`");
+    {
+        let _ = cuda_graph;
+        bail!("GPU requested; rebuild with `--features gpu` or use `--device cpu`");
+    }
 
     #[cfg(feature = "gpu")]
     {
@@ -74,6 +77,7 @@ pub(crate) fn gpu_eps() -> Result<Vec<ort::ep::ExecutionProviderDispatch>> {
         let mut eps = Vec::new();
         #[cfg(target_os = "macos")]
         if ort::ep::CoreML::default().is_available().unwrap_or(false) {
+            let _ = cuda_graph;
             eps.push(
                 ort::ep::CoreML::default()
                     .with_compute_units(ort::ep::coreml::ComputeUnits::CPUAndGPU)
@@ -84,7 +88,12 @@ pub(crate) fn gpu_eps() -> Result<Vec<ort::ep::ExecutionProviderDispatch>> {
         }
         #[cfg(not(target_os = "macos"))]
         if ort::ep::CUDA::default().is_available().unwrap_or(false) {
-            eps.push(ort::ep::CUDA::default().build().error_on_failure());
+            let mut cuda = ort::ep::CUDA::default()
+                .with_conv_algorithm_search(ort::ep::cuda::ConvAlgorithmSearch::Heuristic);
+            if cuda_graph {
+                cuda = cuda.with_cuda_graph(true);
+            }
+            eps.push(cuda.build().error_on_failure());
         }
         if eps.is_empty() {
             bail!("GPU requested but no GPU execution provider is available; use --device cpu");
@@ -99,6 +108,17 @@ pub(crate) fn make_session(
     device: Device,
     batch: i64,
     dims: &[(&str, i64)],
+) -> Result<(Session, f64)> {
+    make_session_cuda(path, threads, device, batch, dims, false)
+}
+
+pub(crate) fn make_session_cuda(
+    path: &Path,
+    threads: usize,
+    device: Device,
+    batch: i64,
+    dims: &[(&str, i64)],
+    cuda_graph: bool,
 ) -> Result<(Session, f64)> {
     let start = Instant::now();
     let mut builder = Session::builder()
@@ -119,7 +139,7 @@ pub(crate) fn make_session(
         builder = builder
             .with_dimension_override("batch_size", batch.max(1))
             .map_err(oe)?
-            .with_execution_providers(gpu_eps()?)
+            .with_execution_providers(gpu_eps(cuda_graph)?)
             .map_err(oe)?;
         for (name, size) in dims {
             builder = builder.with_dimension_override(*name, *size).map_err(oe)?;
@@ -212,18 +232,7 @@ impl OrtModel {
     }
 
     fn output_specs(&self, batch: i64) -> Result<Vec<(String, Vec<i64>)>> {
-        let mut specs = Vec::new();
-        for o in self.session.outputs() {
-            let ValueType::Tensor { shape, .. } = o.dtype() else {
-                bail!("expected tensor output {}", o.name());
-            };
-            let mut dims: Vec<i64> = shape.iter().copied().collect();
-            if dims.first().is_some_and(|d| *d <= 0) {
-                dims[0] = batch;
-            }
-            specs.push((o.name().to_string(), dims));
-        }
-        Ok(specs)
+        f16_output_specs(&self.session, batch)
     }
 
     fn ensure_bound(&mut self, shape: &[i64]) -> Result<()> {
@@ -342,6 +351,21 @@ pub(crate) fn output_f16<'s>(
 ) -> Result<&'s [f16]> {
     let (_, data) = outputs[i].try_extract_tensor::<f16>().map_err(oe)?;
     Ok(data)
+}
+
+pub(crate) fn f16_output_specs(session: &Session, batch: i64) -> Result<Vec<(String, Vec<i64>)>> {
+    let mut specs = Vec::new();
+    for o in session.outputs() {
+        let ValueType::Tensor { shape, .. } = o.dtype() else {
+            bail!("expected tensor output {}", o.name());
+        };
+        let mut dims: Vec<i64> = shape.iter().copied().collect();
+        if dims.first().is_some_and(|d| *d <= 0) {
+            dims[0] = batch;
+        }
+        specs.push((o.name().to_string(), dims));
+    }
+    Ok(specs)
 }
 
 fn decode_outputs<R>(

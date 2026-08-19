@@ -105,6 +105,19 @@ mod tests {
     }
 
     #[test]
+    fn resize_roi_matches_crop() {
+        let mut im = BgrImage::zeros(40, 30);
+        for i in 0..im.data.len() {
+            im.data[i] = (i % 251) as u8;
+        }
+        let crop = crop_img(&im, 5, 7, 21, 23);
+        let via_crop = resize_bgr(&crop, 16, 16);
+        let mut direct = vec![0u8; 16 * 16 * 3];
+        crate::preprocess::resize_roi_into(&im.data, 40, 30, 5, 7, 21, 23, 16, 16, &mut direct);
+        assert_eq!(via_crop.data, direct);
+    }
+
+    #[test]
     fn nchw_roi_matches_crop() {
         let mut im = BgrImage::zeros(40, 30);
         for i in 0..im.data.len() {

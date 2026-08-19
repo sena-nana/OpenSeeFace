@@ -118,7 +118,7 @@ fn main() -> Result<()> {
         args.repeat_video != 0,
     )?;
     let is_video = src.is_video;
-    let mut input = PipedInput::start(src);
+    let mut input = PipedInput::start(src)?;
     let sock = UdpSocket::bind("0.0.0.0:0").context("udp bind")?;
     let dest = format!("{}:{}", args.ip, args.port);
     let filter: FilterKind = args.filter.parse().context("--filter")?;
@@ -145,7 +145,7 @@ fn main() -> Result<()> {
                     args.fps,
                     true,
                 ) {
-                    input = PipedInput::start(src);
+                    input = PipedInput::start(src)?;
                     continue;
                 }
             }

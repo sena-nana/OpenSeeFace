@@ -1,9 +1,9 @@
 //! GPU preprocess: ONNX Resize+Normalize on the EP.
 //!
 //! CoreML fuses uint8 NHWC → Resize+Normalize+model (ORT has no CoreML device allocator).
-//! Landmark crop stays on CPU because CoreML wants static spatial dims.
-//! CUDA uploads the uint8 frame once (PINNED), keeps NCHW on device, and only
-//! readbacks boxes/heatmaps.
+//! Landmark crop is CPU bilinear into a persistent host tensor (static spatial dims).
+//! CUDA uses a fused detect graph (CUDA Graph) plus device-resident landmark NCHW;
+//! only boxes/heatmaps are read back.
 
 use std::path::Path;
 #[cfg(feature = "gpu")]
@@ -20,31 +20,29 @@ use crate::enhance_gpu::GpuEnhance;
 #[cfg(feature = "gpu")]
 use crate::preprocess::crop_box_pad;
 #[cfg(all(feature = "gpu", target_os = "macos"))]
-use crate::preprocess::crop_slice;
-#[cfg(all(feature = "gpu", target_os = "macos"))]
-use crate::preprocess::resize_bgr;
+use crate::preprocess::resize_roi_into;
 use crate::preprocess::BgrImage;
+#[cfg(all(feature = "gpu", target_os = "macos"))]
+use crate::session::make_session;
+#[cfg(all(feature = "gpu", not(target_os = "macos")))]
+use crate::session::make_session_cuda;
 #[cfg(feature = "gpu")]
 use crate::session::Device;
 #[cfg(feature = "gpu")]
-use crate::session::{make_session, oe};
+use crate::session::{f16_output_specs, oe};
 #[cfg(feature = "gpu")]
 use anyhow::Context;
 use anyhow::{bail, Result};
-#[cfg(all(feature = "gpu", not(target_os = "macos")))]
+#[cfg(feature = "gpu")]
 use half::f16;
-#[cfg(all(feature = "gpu", not(target_os = "macos")))]
+#[cfg(feature = "gpu")]
 use ort::memory::Allocator;
-#[cfg(all(feature = "gpu", not(target_os = "macos")))]
+#[cfg(feature = "gpu")]
 use ort::session::IoBinding;
 #[cfg(feature = "gpu")]
 use ort::session::Session;
-#[cfg(all(feature = "gpu", not(target_os = "macos")))]
+#[cfg(feature = "gpu")]
 use ort::value::Tensor;
-#[cfg(all(feature = "gpu", target_os = "macos"))]
-use ort::value::TensorRef;
-#[cfg(all(feature = "gpu", not(target_os = "macos")))]
-use ort::value::ValueType;
 
 #[cfg(feature = "gpu")]
 fn pre_dir(models_dir: &Path) -> PathBuf {
@@ -54,7 +52,7 @@ fn pre_dir(models_dir: &Path) -> PathBuf {
 #[cfg(feature = "gpu")]
 fn ensure_pre_models(models_dir: &Path) -> Result<PathBuf> {
     let out = pre_dir(models_dir);
-    if out.join("imagenet_224.onnx").is_file() {
+    if out.join("imagenet_224.onnx").is_file() && out.join("mnv3_detection_opt.onnx").is_file() {
         return Ok(out);
     }
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/wrap_preprocess.py");
@@ -75,7 +73,10 @@ fn ensure_pre_models(models_dir: &Path) -> Result<PathBuf> {
             .success())
     };
     let ok = run("uv", &["run", "python"]).or_else(|_| run("python3", &[]))?;
-    if !ok || !out.join("imagenet_224.onnx").is_file() {
+    if !ok
+        || !out.join("imagenet_224.onnx").is_file()
+        || !out.join("mnv3_detection_opt.onnx").is_file()
+    {
         bail!(
             "failed to generate GPU preprocess graphs in {} (need Python + onnx). Run runtime-ort/scripts/wrap_preprocess.py or use --device cpu",
             out.display()
@@ -260,12 +261,38 @@ impl GpuTracker {
     }
 }
 
+#[cfg(feature = "gpu")]
+fn bind_f16_outs(sess: &Session, bind: &mut IoBinding, alloc: &Allocator) -> Result<()> {
+    for (name, dims) in f16_output_specs(sess, 1)? {
+        if dims.iter().any(|d| *d <= 0) {
+            bail!("dynamic output {name}");
+        }
+        bind.bind_output(name, Tensor::<f16>::new(alloc, dims).map_err(oe)?)
+            .map_err(oe)?;
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "gpu", not(target_os = "macos")))]
+fn pin_alloc(sess: &Session, ty: ort::memory::MemoryType) -> Result<Allocator> {
+    use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo};
+    Allocator::new(
+        sess,
+        MemoryInfo::new(AllocationDevice::CUDA_PINNED, 0, AllocatorType::Device, ty).map_err(oe)?,
+    )
+    .map_err(oe)
+}
+
 #[cfg(all(feature = "gpu", target_os = "macos"))]
 struct CoreMlPipe {
     det: Session,
+    det_bind: IoBinding,
     det_name: String,
+    det_in: Tensor<u8>,
     lm: Session,
+    lm_bind: IoBinding,
     lm_name: String,
+    lm_in: Tensor<u8>,
     enhance: GpuEnhance,
 }
 
@@ -303,11 +330,28 @@ impl CoreMlPipe {
             1,
             &[("height", spec.size as i64), ("width", spec.size as i64)],
         )?;
+        let alloc = Allocator::default();
+        let det_in = Tensor::<u8>::new(&alloc, [1i64, frame.height as i64, frame.width as i64, 3])
+            .map_err(oe)?;
+        let lm_in =
+            Tensor::<u8>::new(&alloc, [1i64, spec.size as i64, spec.size as i64, 3]).map_err(oe)?;
+        let det_name = in_name(&det);
+        let lm_name = in_name(&lm);
+        let mut det_bind = det.create_binding().map_err(oe)?;
+        det_bind.bind_input(det_name.clone(), &det_in).map_err(oe)?;
+        bind_f16_outs(&det, &mut det_bind, &alloc)?;
+        let mut lm_bind = lm.create_binding().map_err(oe)?;
+        lm_bind.bind_input(lm_name.clone(), &lm_in).map_err(oe)?;
+        bind_f16_outs(&lm, &mut lm_bind, &alloc)?;
         Ok(Self {
-            det_name: in_name(&det),
             det,
-            lm_name: in_name(&lm),
+            det_bind,
+            det_name,
+            det_in,
             lm,
+            lm_bind,
+            lm_name,
+            lm_in,
             enhance: GpuEnhance::new(frame.width, frame.height, enhance)?,
         })
     }
@@ -318,11 +362,21 @@ impl CoreMlPipe {
         threshold: f32,
         max_faces: usize,
     ) -> Result<Vec<[f32; 5]>> {
-        let name = self.det_name.clone();
-        let shape = [1i64, frame.height as i64, frame.width as i64, 3];
-        let bytes = self.enhance.run(frame)?;
-        let t = TensorRef::from_array_view((shape.as_slice(), bytes)).map_err(oe)?;
-        let outs = self.det.run(ort::inputs![name.as_str() => t]).map_err(oe)?;
+        let CoreMlPipe {
+            enhance,
+            det_in,
+            det_bind,
+            det_name,
+            det,
+            ..
+        } = self;
+        let bytes = enhance.run(frame)?;
+        {
+            let (_, buf) = det_in.extract_tensor_mut();
+            buf.copy_from_slice(bytes);
+        }
+        det_bind.bind_input(det_name.clone(), det_in).map_err(oe)?;
+        let outs = det.run_binding(det_bind).map_err(oe)?;
         let a = crate::session::output_f16(&outs, 0)?;
         let b = crate::session::output_f16(&outs, 1)?;
         Ok(crate::decode::detect_faces_data(
@@ -344,21 +398,35 @@ impl CoreMlPipe {
         y2: i32,
         spec: LmSpec,
     ) -> Result<(f32, Vec<[f32; 3]>)> {
-        let name = self.lm_name.clone();
-        let bytes = self.enhance.run(frame)?;
-        let crop = crop_slice(bytes, frame.width, frame.height, x1, y1, x2, y2);
-        if crop.width < 4 || crop.height < 4 {
+        if x2 - x1 < 4 || y2 - y1 < 4 {
             bail!("crop too small");
         }
-        let sized = if crop.width == spec.size && crop.height == spec.size {
-            crop
-        } else {
-            resize_bgr(&crop, spec.size, spec.size)
-        };
-        let shape = [1i64, sized.height as i64, sized.width as i64, 3];
-        let t =
-            TensorRef::from_array_view((shape.as_slice(), sized.data.as_slice())).map_err(oe)?;
-        let outs = self.lm.run(ort::inputs![name.as_str() => t]).map_err(oe)?;
+        let CoreMlPipe {
+            enhance,
+            lm_in,
+            lm_bind,
+            lm_name,
+            lm,
+            ..
+        } = self;
+        let bytes = enhance.run(frame)?;
+        {
+            let (_, buf) = lm_in.extract_tensor_mut();
+            resize_roi_into(
+                bytes,
+                frame.width,
+                frame.height,
+                x1,
+                y1,
+                x2,
+                y2,
+                spec.size,
+                spec.size,
+                buf,
+            );
+        }
+        lm_bind.bind_input(lm_name.clone(), lm_in).map_err(oe)?;
+        let outs = lm.run_binding(lm_bind).map_err(oe)?;
         let data = crate::session::output_f16(&outs, 0)?;
         let scale_x = (x2 - x1) as f32 / spec.size as f32;
         let scale_y = (y2 - y1) as f32 / spec.size as f32;
@@ -376,18 +444,16 @@ struct CudaPipe {
     h: u32,
     frame: Tensor<u8>,
     uploaded_ptr: usize,
-    pre_det: Session,
-    pre_det_name: String,
     det: Session,
+    det_bind: IoBinding,
     det_in: String,
     pre_lm: Session,
+    pre_lm_bind: IoBinding,
     pre_lm_names: Vec<String>,
     starts: Tensor<i64>,
     ends: Tensor<i64>,
     lm: Session,
-    lm_in: String,
-    cuda_info: ort::memory::MemoryInfo<'static>,
-    pin_out: Allocator,
+    lm_bind: IoBinding,
     enhance: GpuEnhance,
     enhanced: bool,
 }
@@ -404,60 +470,39 @@ impl CudaPipe {
     ) -> Result<Self> {
         use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
 
+        let fused_det = pre.join("mnv3_detection_opt.onnx");
+        let crop = pre.join(format!("imagenet_crop_{}.onnx", spec.size));
+        if !fused_det.is_file() || !crop.is_file() {
+            bail!(
+                "fused CUDA graphs not in {} (run runtime-ort/scripts/wrap_preprocess.py or use --device cpu)",
+                pre.display()
+            );
+        }
         let hw = [
             ("height", frame.height as i64),
             ("width", frame.width as i64),
         ];
-        let (pre_det, _) =
-            make_session(&pre.join("imagenet_224.onnx"), threads, Device::Gpu, 1, &hw)?;
-        let (det, _) = make_session(
-            &crate::metrics::model_path(models_dir, "mnv3_detection_opt.onnx"),
-            threads,
-            Device::Gpu,
-            1,
-            &[],
-        )?;
-        let (pre_lm, _) = make_session(
-            &pre.join(format!("imagenet_crop_{}.onnx", spec.size)),
-            threads,
-            Device::Gpu,
-            1,
-            &hw,
-        )?;
-        let (lm, _) = make_session(
+        let (det, _) = make_session_cuda(&fused_det, threads, Device::Gpu, 1, &hw, true)?;
+        let (pre_lm, _) = make_session_cuda(&crop, threads, Device::Gpu, 1, &hw, false)?;
+        let (lm, _) = make_session_cuda(
             &crate::metrics::model_path(models_dir, spec.file),
             threads,
             Device::Gpu,
             1,
             &[],
+            true,
         )?;
-        let pin_in = Allocator::new(
-            &pre_det,
+        let pin_in = pin_alloc(&det, MemoryType::CPUInput)?;
+        let pin_out = pin_alloc(&det, MemoryType::CPUOutput)?;
+        let cuda_alloc = Allocator::new(
+            &pre_lm,
             MemoryInfo::new(
-                AllocationDevice::CUDA_PINNED,
+                AllocationDevice::CUDA,
                 0,
                 AllocatorType::Device,
-                MemoryType::CPUInput,
+                MemoryType::Default,
             )
             .map_err(oe)?,
-        )
-        .map_err(oe)?;
-        let pin_out = Allocator::new(
-            &det,
-            MemoryInfo::new(
-                AllocationDevice::CUDA_PINNED,
-                0,
-                AllocatorType::Device,
-                MemoryType::CPUOutput,
-            )
-            .map_err(oe)?,
-        )
-        .map_err(oe)?;
-        let cuda_info = MemoryInfo::new(
-            AllocationDevice::CUDA,
-            0,
-            AllocatorType::Device,
-            MemoryType::Default,
         )
         .map_err(oe)?;
         let mut frame_t =
@@ -477,27 +522,49 @@ impl CudaPipe {
             let (_, b) = ends.extract_tensor_mut();
             b.copy_from_slice(&[1, 1, 1, 3]);
         }
+        let nchw_lm =
+            Tensor::<f16>::new(&cuda_alloc, [1i64, 3, spec.size as i64, spec.size as i64])
+                .map_err(oe)?;
+
+        let det_in = in_name(&det);
+        let mut det_bind = det.create_binding().map_err(oe)?;
+        det_bind.bind_input(det_in.clone(), &frame_t).map_err(oe)?;
+        bind_f16_outs(&det, &mut det_bind, &pin_out)?;
+
+        let pre_lm_names: Vec<String> = pre_lm
+            .inputs()
+            .iter()
+            .map(|i| i.name().to_string())
+            .collect();
+        let mut pre_lm_bind = pre_lm.create_binding().map_err(oe)?;
+        for n in &pre_lm_names {
+            match n.as_str() {
+                "starts" => pre_lm_bind.bind_input(n.clone(), &starts).map_err(oe)?,
+                "ends" => pre_lm_bind.bind_input(n.clone(), &ends).map_err(oe)?,
+                _ => pre_lm_bind.bind_input(n.clone(), &frame_t).map_err(oe)?,
+            }
+        }
+        let lm_in = in_name(&lm);
+        let mut lm_bind = lm.create_binding().map_err(oe)?;
+        lm_bind.bind_input(lm_in, &nchw_lm).map_err(oe)?;
+        bind_f16_outs(&lm, &mut lm_bind, &pin_out)?;
+        pre_lm_bind.bind_output("nchw", nchw_lm).map_err(oe)?;
+
         Ok(Self {
             w: frame.width,
             h: frame.height,
             frame: frame_t,
             uploaded_ptr: frame.data.as_ptr() as usize,
-            pre_det_name: in_name(&pre_det),
-            pre_det,
-            det_in: in_name(&det),
             det,
-            pre_lm_names: pre_lm
-                .inputs()
-                .iter()
-                .map(|i| i.name().to_string())
-                .collect(),
+            det_bind,
+            det_in,
             pre_lm,
+            pre_lm_bind,
+            pre_lm_names,
             starts,
             ends,
-            lm_in: in_name(&lm),
             lm,
-            cuda_info,
-            pin_out,
+            lm_bind,
             enhance: GpuEnhance::new(frame.width, frame.height, enhance)?,
             enhanced: false,
         })
@@ -533,24 +600,6 @@ impl CudaPipe {
         Ok(())
     }
 
-    fn bind_f16_outs(sess: &Session, bind: &mut IoBinding, pin: &Allocator) -> Result<()> {
-        for o in sess.outputs() {
-            let ValueType::Tensor { shape, .. } = o.dtype() else {
-                continue;
-            };
-            let mut dims: Vec<i64> = shape.iter().copied().collect();
-            if dims.first().is_some_and(|d| *d <= 0) {
-                dims[0] = 1;
-            }
-            bind.bind_output(
-                o.name().to_string(),
-                Tensor::<f16>::new(pin, dims).map_err(oe)?,
-            )
-            .map_err(oe)?;
-        }
-        Ok(())
-    }
-
     fn detect(
         &mut self,
         frame: &BgrImage,
@@ -559,22 +608,9 @@ impl CudaPipe {
     ) -> Result<Vec<[f32; 5]>> {
         self.upload_frame(frame, true)?;
         self.ensure_enhanced()?;
-        let mut pre_bind = self.pre_det.create_binding().map_err(oe)?;
-        pre_bind
-            .bind_input(self.pre_det_name.clone(), &self.frame)
-            .map_err(oe)?;
-        pre_bind
-            .bind_output_to_device("nchw", &self.cuda_info)
-            .map_err(oe)?;
-        let mut pre_out = self.pre_det.run_binding(&pre_bind).map_err(oe)?;
-        let nchw = pre_out.remove("nchw").context("pre nchw")?;
-
-        let mut det_bind = self.det.create_binding().map_err(oe)?;
-        det_bind
-            .bind_input(self.det_in.clone(), &nchw)
-            .map_err(oe)?;
-        Self::bind_f16_outs(&self.det, &mut det_bind, &self.pin_out)?;
-        let det_out = self.det.run_binding(&det_bind).map_err(oe)?;
+        let name = self.det_in.clone();
+        self.det_bind.bind_input(name, &self.frame).map_err(oe)?;
+        let det_out = self.det.run_binding(&self.det_bind).map_err(oe)?;
         let a = crate::session::output_f16(&det_out, 0)?;
         let b = crate::session::output_f16(&det_out, 1)?;
         Ok(crate::decode::detect_faces_data(
@@ -610,24 +646,24 @@ impl CudaPipe {
             e.copy_from_slice(&[1, y2 as i64, x2 as i64, 3]);
         }
         let names = self.pre_lm_names.clone();
-        let mut pre_bind = self.pre_lm.create_binding().map_err(oe)?;
         for n in &names {
             match n.as_str() {
-                "starts" => pre_bind.bind_input(n.clone(), &self.starts).map_err(oe)?,
-                "ends" => pre_bind.bind_input(n.clone(), &self.ends).map_err(oe)?,
-                _ => pre_bind.bind_input(n.clone(), &self.frame).map_err(oe)?,
+                "starts" => self
+                    .pre_lm_bind
+                    .bind_input(n.clone(), &self.starts)
+                    .map_err(oe)?,
+                "ends" => self
+                    .pre_lm_bind
+                    .bind_input(n.clone(), &self.ends)
+                    .map_err(oe)?,
+                _ => self
+                    .pre_lm_bind
+                    .bind_input(n.clone(), &self.frame)
+                    .map_err(oe)?,
             }
         }
-        pre_bind
-            .bind_output_to_device("nchw", &self.cuda_info)
-            .map_err(oe)?;
-        let mut pre_out = self.pre_lm.run_binding(&pre_bind).map_err(oe)?;
-        let nchw = pre_out.remove("nchw").context("lm nchw")?;
-
-        let mut lm_bind = self.lm.create_binding().map_err(oe)?;
-        lm_bind.bind_input(self.lm_in.clone(), &nchw).map_err(oe)?;
-        Self::bind_f16_outs(&self.lm, &mut lm_bind, &self.pin_out)?;
-        let lm_out = self.lm.run_binding(&lm_bind).map_err(oe)?;
+        self.pre_lm.run_binding(&self.pre_lm_bind).map_err(oe)?;
+        let lm_out = self.lm.run_binding(&self.lm_bind).map_err(oe)?;
         let data = crate::session::output_f16(&lm_out, 0)?;
         let scale_x = (x2 - x1) as f32 / spec.size as f32;
         let scale_y = (y2 - y1) as f32 / spec.size as f32;

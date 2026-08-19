@@ -376,44 +376,89 @@ pub fn resize_bgr(bgr: &BgrImage, dw: u32, dh: u32) -> BgrImage {
     if dw == bgr.width && dh == bgr.height {
         return bgr.clone();
     }
-    if bgr.width == 0 || bgr.height == 0 {
-        return BgrImage {
-            width: dw,
-            height: dh,
-            data: vec![0u8; dw as usize * dh as usize * 3],
-        };
-    }
-    let fx = bgr.width as f32 / dw as f32;
-    let fy = bgr.height as f32 / dh as f32;
     let mut data = vec![0u8; dw as usize * dh as usize * 3];
-    for y in 0..dh {
-        let sy = (y as f32 + 0.5) * fy - 0.5;
-        let y0 = sy.floor().clamp(0.0, (bgr.height - 1) as f32) as u32;
-        let y1 = (y0 + 1).min(bgr.height - 1);
-        let wy = (sy - y0 as f32).clamp(0.0, 1.0);
-        for x in 0..dw {
-            let sx = (x as f32 + 0.5) * fx - 0.5;
-            let x0 = sx.floor().clamp(0.0, (bgr.width - 1) as f32) as u32;
-            let x1 = (x0 + 1).min(bgr.width - 1);
-            let wx = (sx - x0 as f32).clamp(0.0, 1.0);
-            let i00 = ((y0 * bgr.width + x0) * 3) as usize;
-            let i10 = ((y0 * bgr.width + x1) * 3) as usize;
-            let i01 = ((y1 * bgr.width + x0) * 3) as usize;
-            let i11 = ((y1 * bgr.width + x1) * 3) as usize;
-            let o = ((y * dw + x) * 3) as usize;
-            for c in 0..3 {
-                let v = bgr.data[i00 + c] as f32 * (1.0 - wx) * (1.0 - wy)
-                    + bgr.data[i10 + c] as f32 * wx * (1.0 - wy)
-                    + bgr.data[i01 + c] as f32 * (1.0 - wx) * wy
-                    + bgr.data[i11 + c] as f32 * wx * wy;
-                data[o + c] = v.round().clamp(0.0, 255.0) as u8;
-            }
-        }
-    }
+    resize_roi_into(
+        &bgr.data,
+        bgr.width,
+        bgr.height,
+        0,
+        0,
+        bgr.width as i32,
+        bgr.height as i32,
+        dw,
+        dh,
+        &mut data,
+    );
     BgrImage {
         width: dw,
         height: dh,
         data,
+    }
+}
+
+/// Crop `[x1,y1,x2,y2)` then half-pixel bilinear-resize into `dst` (`dw*dh*3` bytes).
+pub(crate) fn resize_roi_into(
+    src: &[u8],
+    width: u32,
+    height: u32,
+    x1: i32,
+    y1: i32,
+    x2: i32,
+    y2: i32,
+    dw: u32,
+    dh: u32,
+    dst: &mut [u8],
+) {
+    let need = dw as usize * dh as usize * 3;
+    if dw == 0 || dh == 0 || dst.len() < need {
+        return;
+    }
+    let x1 = x1.max(0) as u32;
+    let y1 = y1.max(0) as u32;
+    let x2 = (x2.max(0) as u32).min(width);
+    let y2 = (y2.max(0) as u32).min(height);
+    let cw = x2.saturating_sub(x1);
+    let ch = y2.saturating_sub(y1);
+    if cw == 0 || ch == 0 || width == 0 || height == 0 {
+        dst[..need].fill(0);
+        return;
+    }
+    if cw == dw && ch == dh {
+        for row in 0..dh {
+            let s = (((y1 + row) * width + x1) * 3) as usize;
+            let d = (row * dw * 3) as usize;
+            let n = (dw * 3) as usize;
+            dst[d..d + n].copy_from_slice(&src[s..s + n]);
+        }
+        return;
+    }
+    let fx = cw as f32 / dw as f32;
+    let fy = ch as f32 / dh as f32;
+    let y_max = (ch - 1) as f32;
+    let x_max = (cw - 1) as f32;
+    for y in 0..dh {
+        let sy = (y as f32 + 0.5) * fy - 0.5;
+        let y0 = sy.floor().clamp(0.0, y_max) as u32;
+        let y1s = (y0 + 1).min(ch - 1);
+        let wy = (sy - y0 as f32).clamp(0.0, 1.0);
+        for x in 0..dw {
+            let sx = (x as f32 + 0.5) * fx - 0.5;
+            let x0 = sx.floor().clamp(0.0, x_max) as u32;
+            let x1s = (x0 + 1).min(cw - 1);
+            let wx = (sx - x0 as f32).clamp(0.0, 1.0);
+            let i00 = (((y1 + y0) * width + x1 + x0) * 3) as usize;
+            let i10 = (((y1 + y0) * width + x1 + x1s) * 3) as usize;
+            let i01 = (((y1 + y1s) * width + x1 + x0) * 3) as usize;
+            let i11 = (((y1 + y1s) * width + x1 + x1s) * 3) as usize;
+            let o = ((y * dw + x) * 3) as usize;
+            for c in 0..3 {
+                let v = src[i00 + c] as f32 * (1.0 - wx) * (1.0 - wy)
+                    + src[i10 + c] as f32 * wx * (1.0 - wy)
+                    + src[i01 + c] as f32 * (1.0 - wx) * wy
+                    + src[i11 + c] as f32 * wx * wy;
+                dst[o + c] = v.round().clamp(0.0, 255.0) as u8;
+            }
+        }
     }
 }
 

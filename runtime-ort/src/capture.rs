@@ -19,7 +19,15 @@ pub struct InputSource {
 
 enum Inner {
     Safe(SafeInner),
+    /// Opened camera; not `Send`, so `PipedInput` keeps it on the calling thread.
     Camera(CameraCap),
+    /// Camera index to open on the capture worker (backends are not `Send`).
+    CameraJob {
+        idx: u32,
+        width: u32,
+        height: u32,
+        fps: u32,
+    },
 }
 
 enum SafeInner {
@@ -99,13 +107,16 @@ impl InputSource {
             });
         }
         let idx: u32 = capture.parse().unwrap_or(0);
-        let cam = open_camera(idx, width, height, fps)?;
-        let res = cam.resolution();
         Ok(Self {
             name: format!("camera {idx}"),
-            width: res.width(),
-            height: res.height(),
-            inner: Inner::Camera(CameraCap { cam }),
+            width: width.max(1),
+            height: height.max(1),
+            inner: Inner::CameraJob {
+                idx,
+                width,
+                height,
+                fps,
+            },
             is_camera: true,
             is_video: false,
         })
@@ -122,21 +133,33 @@ impl InputSource {
 
     /// Fill `dst`, reusing its allocation when the size is unchanged.
     pub fn read_into(&mut self, dst: &mut BgrImage) -> Result<bool> {
+        let job = match &self.inner {
+            Inner::CameraJob {
+                idx,
+                width,
+                height,
+                fps,
+            } => Some((*idx, *width, *height, *fps)),
+            _ => None,
+        };
+        if let Some((idx, width, height, fps)) = job {
+            let cam = open_camera(idx, width, height, fps)?;
+            let res = cam.resolution();
+            self.width = res.width();
+            self.height = res.height();
+            self.inner = Inner::Camera(CameraCap { cam });
+        }
         match &mut self.inner {
             Inner::Safe(safe) => safe.read_into(dst),
             Inner::Camera(c) => {
-                let frame = c.cam.frame().context("camera frame")?;
-                let decoded = frame.decode_image::<nokhwa::pixel_format::RgbFormat>()?;
-                let (w, h) = (decoded.width(), decoded.height());
-                let mut raw = decoded.into_raw();
-                crate::preprocess::rgb_to_bgr_in_place(&mut raw);
-                dst.width = w;
-                dst.height = h;
-                dst.data = raw;
-                self.width = w;
-                self.height = h;
-                Ok(true)
+                let ok = read_camera(&mut c.cam, dst)?;
+                if ok {
+                    self.width = dst.width;
+                    self.height = dst.height;
+                }
+                Ok(ok)
             }
+            Inner::CameraJob { .. } => unreachable!("camera job opened above"),
         }
     }
 }
@@ -193,6 +216,20 @@ impl Drop for SafeInner {
             let _ = child.wait();
         }
     }
+}
+
+fn read_camera(cam: &mut nokhwa::Camera, dst: &mut BgrImage) -> Result<bool> {
+    let frame = cam.frame().context("camera frame")?;
+    let decoded = frame.decode_image::<nokhwa::pixel_format::RgbFormat>()?;
+    let (w, h) = (decoded.width(), decoded.height());
+    let raw = decoded.into_raw();
+    dst.resize_buffer(w, h);
+    if raw.len() != dst.data.len() {
+        bail!("camera frame size mismatch");
+    }
+    dst.data.copy_from_slice(&raw);
+    crate::preprocess::rgb_to_bgr_in_place(&mut dst.data);
+    Ok(true)
 }
 
 fn open_camera(idx: u32, _width: u32, _height: u32, _fps: u32) -> Result<nokhwa::Camera> {
@@ -310,7 +347,7 @@ pub fn mirror_bgr(frame: &BgrImage) -> BgrImage {
 }
 
 /// Capture thread + two recycled BGR buffers so I/O overlaps with inference.
-/// Camera backends are not `Send`, so they reuse a buffer on the calling thread.
+/// Camera backends are not `Send`; they are opened on the worker thread.
 pub struct PipedInput {
     inner: PipedInner,
 }
@@ -328,57 +365,47 @@ enum PipedInner {
 }
 
 impl PipedInput {
-    pub fn start(src: InputSource) -> Self {
-        if matches!(src.inner, Inner::Camera(_)) {
-            let (w, h) = (src.width.max(1), src.height.max(1));
-            return Self {
-                inner: PipedInner::Local {
-                    buf: BgrImage::zeros(w, h),
-                    src,
-                },
-            };
-        }
+    pub fn start(src: InputSource) -> Result<Self> {
         let InputSource {
             inner,
             width,
             height,
             ..
         } = src;
-        let Inner::Safe(mut safe) = inner else {
-            unreachable!();
-        };
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        let (rec_tx, rec_rx) = std::sync::mpsc::sync_channel(2);
-        let w = width.max(1);
-        let h = height.max(1);
-        let _ = rec_tx.send(BgrImage::zeros(w, h));
-        let _ = rec_tx.send(BgrImage::zeros(w, h));
-        let join = std::thread::Builder::new()
-            .name("osf-capture".into())
-            .spawn(move || loop {
-                let mut buf = match rec_rx.recv() {
-                    Ok(b) => b,
-                    Err(_) => break,
-                };
-                match safe.read_into(&mut buf) {
-                    Ok(true) => {
-                        if tx.send(Some(buf)).is_err() {
-                            break;
-                        }
-                    }
-                    _ => {
-                        let _ = tx.send(None);
-                        break;
-                    }
-                }
-            })
-            .expect("capture thread");
-        Self {
-            inner: PipedInner::Thread {
-                rx,
-                recycle: Some(rec_tx),
-                join: Some(join),
-            },
+        match inner {
+            Inner::CameraJob {
+                idx,
+                width,
+                height,
+                fps,
+            } => spawn_worker(Worker::Camera {
+                idx,
+                width,
+                height,
+                fps,
+            }),
+            Inner::Safe(safe) => spawn_worker(Worker::Safe {
+                inner: safe,
+                width,
+                height,
+            }),
+            Inner::Camera(cap) => {
+                let w = width.max(1);
+                let h = height.max(1);
+                Ok(Self {
+                    inner: PipedInner::Local {
+                        buf: BgrImage::zeros(w, h),
+                        src: InputSource {
+                            inner: Inner::Camera(cap),
+                            name: String::new(),
+                            width: w,
+                            height: h,
+                            is_camera: true,
+                            is_video: false,
+                        },
+                    },
+                })
+            }
         }
     }
 
@@ -409,6 +436,99 @@ impl PipedInput {
             }
         }
     }
+}
+
+enum Worker {
+    Safe {
+        inner: SafeInner,
+        width: u32,
+        height: u32,
+    },
+    Camera {
+        idx: u32,
+        width: u32,
+        height: u32,
+        fps: u32,
+    },
+}
+
+enum Live {
+    Safe(SafeInner),
+    Cam(nokhwa::Camera),
+}
+
+impl Live {
+    fn read_into(&mut self, dst: &mut BgrImage) -> Result<bool> {
+        match self {
+            Live::Safe(s) => s.read_into(dst),
+            Live::Cam(c) => read_camera(c, dst),
+        }
+    }
+}
+
+fn spawn_worker(job: Worker) -> Result<PipedInput> {
+    let (w, h) = match &job {
+        Worker::Safe { width, height, .. } | Worker::Camera { width, height, .. } => {
+            (*width, *height)
+        }
+    };
+    let (w, h) = (w.max(1), h.max(1));
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let (rec_tx, rec_rx) = std::sync::mpsc::sync_channel(2);
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let _ = rec_tx.send(BgrImage::zeros(w, h));
+    let _ = rec_tx.send(BgrImage::zeros(w, h));
+    let join = std::thread::Builder::new()
+        .name("osf-capture".into())
+        .spawn(move || {
+            let mut live = match job {
+                Worker::Safe { inner, .. } => {
+                    let _ = ready_tx.send(Ok(()));
+                    Live::Safe(inner)
+                }
+                Worker::Camera {
+                    idx,
+                    width,
+                    height,
+                    fps,
+                } => match open_camera(idx, width, height, fps) {
+                    Ok(cam) => {
+                        let _ = ready_tx.send(Ok(()));
+                        Live::Cam(cam)
+                    }
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e));
+                        return;
+                    }
+                },
+            };
+            loop {
+                let mut buf = match rec_rx.recv() {
+                    Ok(b) => b,
+                    Err(_) => break,
+                };
+                match live.read_into(&mut buf) {
+                    Ok(true) => {
+                        if tx.send(Some(buf)).is_err() {
+                            break;
+                        }
+                    }
+                    _ => {
+                        let _ = tx.send(None);
+                        break;
+                    }
+                }
+            }
+        })
+        .context("capture thread")?;
+    ready_rx.recv().context("capture handshake")??;
+    Ok(PipedInput {
+        inner: PipedInner::Thread {
+            rx,
+            recycle: Some(rec_tx),
+            join: Some(join),
+        },
+    })
 }
 
 impl Drop for PipedInput {

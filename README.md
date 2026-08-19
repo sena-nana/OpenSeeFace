@@ -113,7 +113,7 @@ Tracking no longer uses Python. `train/` keeps the PyTorch architectures (`model
     cargo run --release --manifest-path runtime-ort/Cargo.toml --bin osf-bench -- --model 3 --threads 4
 
 GPU (CoreML on Apple, CUDA on NVIDIA). Per-model `bench()` times bound inference only.
-The GPU *pipeline* runs Resize+Normalize on the EP (fused MLProgram on CoreML; device tensors on CUDA)
+The GPU *pipeline* runs Resize+Normalize on the EP (fused MLProgram on CoreML; fused detect + CUDA Graph on NVIDIA)
 so the CPU does not build f16 NCHW or read back full heatmaps between detect and landmarks:
 
     cargo run --release --features gpu --manifest-path runtime-ort/Cargo.toml --bin osf-bench -- --model 3 --threads 4 --device gpu
