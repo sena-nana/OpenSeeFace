@@ -6,8 +6,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use osf_ort::{
     draw_tracking, dump_symmetric_points, encode_faces_into, encode_vmc, list_cameras,
-    model_base_path, Device, ExtListener, FacePacket, FilterKind, InputSource, PipedInput, Tracker,
-    TrackerConfig, VideoOut, VizWindow, VrmCfg, VrmDriver, PACKET_FRAME_SIZE,
+    model_base_path, Device, ExtListener, FacePacket, FilterKind, InputSource, OutputDriver,
+    PipedInput, Tracker, TrackerConfig, VideoOut, VizWindow, VrmCfg, VrmDriver, PACKET_FRAME_SIZE,
 };
 
 #[derive(Parser, Debug)]
@@ -159,6 +159,7 @@ fn main() -> Result<()> {
         mirror: args.vrm_mirror != 0,
         ..VrmCfg::default()
     });
+    let mut output = OutputDriver::new();
     let mut ext_listen = if args.osf_ext_listen != 0 {
         match ExtListener::bind(([0, 0, 0, 0], args.osf_ext_listen).into()) {
             Ok(l) => Some(l),
@@ -265,21 +266,13 @@ fn main() -> Result<()> {
                         format_eye_open(f.eye_blink[0]),
                     );
                 }
-                FacePacket {
-                    time: tnow,
-                    id: f.id + args.face_id_offset,
-                    width: frame.width as f32,
-                    height: frame.height as f32,
-                    eye_blink: f.eye_blink,
-                    success: f.success,
-                    pnp_error: f.pnp_error,
-                    quaternion: f.quaternion,
-                    euler: f.euler,
-                    translation: f.translation,
-                    lms: f.lms.clone(),
-                    pts_3d: f.pts_3d,
-                    features: f.current_features,
-                }
+                FacePacket::from_face(
+                    f,
+                    tnow,
+                    frame.width as f32,
+                    frame.height as f32,
+                    f.id + args.face_id_offset,
+                )
             })
             .collect();
         if !packets.is_empty() && packets.len() < 40 {
@@ -294,9 +287,11 @@ fn main() -> Result<()> {
                 .find(|p| p.success)
                 .or_else(|| packets.first())
             {
-                if let Some(frame) = vrm.update_with(pkt, ext_listen.as_mut().map(|l| l.poll())) {
-                    if let Ok(buf) = encode_vmc(&frame) {
-                        let _ = sock.send_to(&buf, &vmc_dest);
+                if let Some(out) = output.update(pkt, ext_listen.as_mut().map(|l| l.poll())) {
+                    if let Some(frame) = vrm.map(&out) {
+                        if let Ok(buf) = encode_vmc(&frame) {
+                            let _ = sock.send_to(&buf, &vmc_dest);
+                        }
                     }
                 }
             }

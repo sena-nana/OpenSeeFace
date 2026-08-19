@@ -14,6 +14,7 @@ mod geom;
 mod glasses;
 mod gpu_pre;
 mod metrics;
+mod output;
 mod pnp;
 mod preprocess;
 mod retinaface;
@@ -45,6 +46,7 @@ pub use geom::xywh_iou;
 pub use glasses::{ear_2d, paint_synthetic_glasses};
 pub use gpu_pre::GpuTracker;
 pub use metrics::{cosine, max_abs, mean_abs, model_path, read_f32_le, rss, Latency, Rss};
+pub use output::OutputDriver;
 pub use pnp::Camera;
 pub use preprocess::{
     crop_box, crop_box_pad, crop_img, face_crop, imagenet_nchw, imagenet_nchw_roi_into, iou, nchw,

@@ -77,15 +77,18 @@ pub fn encode_vmc(frame: &VrmFrame) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::features::{FEAT_JAW_OPEN, FEAT_MOUTH_PUCKER};
-    use crate::vrm::{sample_packet, VrmCfg, VrmDriver};
+    use crate::output::OutputDriver;
+    use crate::udp::sample_packet;
+    use crate::vrm::{VrmCfg, VrmDriver};
 
     #[test]
     fn bundle_contains_apply_and_jaw_open() {
         let mut d = VrmDriver::new(VrmCfg::default());
+        let mut out = OutputDriver::new();
         let mut pkt = sample_packet();
         pkt.features[FEAT_MOUTH_PUCKER] = 0.5;
         pkt.features[FEAT_JAW_OPEN] = 0.4;
-        let frame = d.update(&pkt).unwrap();
+        let frame = d.map(&out.update(&pkt, None).unwrap()).unwrap();
         let buf = encode_vmc(&frame).unwrap();
         let text = String::from_utf8_lossy(&buf);
         assert!(text.contains("/VMC/Ext/Blend/Apply"), "{text:?}");
@@ -102,11 +105,12 @@ mod tests {
             perfect_sync: false,
             ..VrmCfg::default()
         });
+        let mut out = OutputDriver::new();
         let mut ext = crate::ext::ExtState::default();
         ext.visemes[10] = 0.8; // aa
         ext.visemes_at = Some(std::time::Instant::now());
         let frame = d
-            .update_with(&crate::vrm::sample_packet(), Some(&ext))
+            .map(&out.update(&sample_packet(), Some(&ext)).unwrap())
             .unwrap();
         let a = frame.blend("A").unwrap_or(0.0);
         assert!(a > 0.5, "A {a}");

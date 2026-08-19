@@ -10,8 +10,6 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use rosc::{OscMessage, OscPacket, OscType};
 
-use crate::udp::FacePacket;
-
 pub const VISEME_COUNT: usize = 15;
 pub const VISEME_NAMES: [&str; VISEME_COUNT] = [
     "sil", "PP", "FF", "TH", "DD", "kk", "CH", "SS", "nn", "RR", "aa", "E", "ih", "oh", "ou",
@@ -59,19 +57,6 @@ pub fn winning(v: &[f32; VISEME_COUNT]) -> (usize, f32) {
         .unwrap_or((0, 0.0))
 }
 
-pub fn from_mouth_states(m: &[f32; 6]) -> [f32; VISEME_COUNT] {
-    let mut v = [0.0f32; VISEME_COUNT];
-    v[10] = m[0];
-    v[12] = m[1];
-    v[14] = m[2];
-    v[11] = m[3];
-    v[13] = m[4];
-    if m.iter().take(5).all(|x| *x < 1e-3) {
-        v[SIL] = 1.0;
-    }
-    v
-}
-
 pub fn expr_blend(name: &str) -> Option<&'static str> {
     Some(match name.trim().to_ascii_lowercase().as_str() {
         "fun" | "smile" => "Fun",
@@ -81,34 +66,6 @@ pub fn expr_blend(name: &str) -> Option<&'static str> {
         "surprise" | "surprised" => "Surprised",
         _ => return None,
     })
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct SimpleExpr {
-    last_mouth: f32,
-    last_brows: f32,
-    pub label: String,
-}
-
-impl SimpleExpr {
-    pub fn update(&mut self, pkt: &FacePacket) -> &str {
-        let f = &pkt.features;
-        let mouth = (f[8] + f[10]) * 0.5;
-        let brows = (f[3] + f[6]) * 0.5;
-        self.last_mouth = self.last_mouth * 0.6 + mouth * 0.4;
-        self.last_brows = self.last_brows * 0.6 + brows * 0.4;
-        self.label = if self.last_mouth < -0.2 {
-            "fun"
-        } else if self.last_brows > 0.2 {
-            "surprise"
-        } else if self.last_brows < -0.25 && self.last_mouth > -0.3 {
-            "angry"
-        } else {
-            "neutral"
-        }
-        .into();
-        &self.label
-    }
 }
 
 #[derive(Clone, Debug)]

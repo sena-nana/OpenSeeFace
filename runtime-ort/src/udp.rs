@@ -4,6 +4,7 @@
 //! (14-feature), 1797-byte (17-feature), and 1805-byte (19-feature) packets.
 
 use crate::features::FeatureVec;
+use crate::tracker::FaceInfo;
 
 /// 8+4+8+8+1+4+12+12+16+272+544+840+80 = 1809
 pub const PACKET_FRAME_SIZE: usize = 1809;
@@ -29,6 +30,26 @@ pub struct FacePacket {
     pub lms: Vec<[f32; 3]>,
     pub pts_3d: [[f32; 3]; 70],
     pub features: FeatureVec,
+}
+
+impl FacePacket {
+    pub fn from_face(face: &FaceInfo, time: f64, width: f32, height: f32, id: i32) -> Self {
+        Self {
+            time,
+            id,
+            width,
+            height,
+            eye_blink: face.eye_blink,
+            success: face.success,
+            pnp_error: face.pnp_error,
+            quaternion: face.quaternion,
+            euler: face.euler,
+            translation: face.translation,
+            lms: face.lms.clone(),
+            pts_3d: face.pts_3d,
+            features: face.current_features,
+        }
+    }
 }
 
 pub fn encode_face(f: &FacePacket) -> Vec<u8> {
@@ -91,6 +112,25 @@ pub fn encode_faces_into(out: &mut Vec<u8>, faces: &[FacePacket]) {
 }
 
 #[cfg(test)]
+pub(crate) fn sample_packet() -> FacePacket {
+    FacePacket {
+        time: 1.0,
+        id: 0,
+        width: 640.0,
+        height: 360.0,
+        eye_blink: [1.0, 1.0],
+        success: true,
+        pnp_error: 0.0,
+        quaternion: [0.0, 0.0, 0.0, 1.0],
+        euler: [0.0; 3],
+        translation: [0.0; 3],
+        lms: vec![[0.0; 3]; 68],
+        pts_3d: [[0.0; 3]; 70],
+        features: [0.0; crate::features::FEATURE_COUNT],
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::features::{
@@ -98,27 +138,9 @@ mod tests {
         FEAT_MOUTH_PRESS_LIP_OPEN, FEAT_MOUTH_PUCKER,
     };
 
-    fn sample() -> FacePacket {
-        FacePacket {
-            time: 1.0,
-            id: 0,
-            width: 640.0,
-            height: 360.0,
-            eye_blink: [1.0, 1.0],
-            success: true,
-            pnp_error: 0.0,
-            quaternion: [0.0, 0.0, 0.0, 1.0],
-            euler: [0.0; 3],
-            translation: [0.0; 3],
-            lms: vec![[0.0; 3]; 68],
-            pts_3d: [[0.0; 3]; 70],
-            features: [0.0; FEATURE_COUNT],
-        }
-    }
-
     #[test]
     fn packet_is_1809() {
-        assert_eq!(encode_face(&sample()).len(), PACKET_FRAME_SIZE);
+        assert_eq!(encode_face(&sample_packet()).len(), PACKET_FRAME_SIZE);
         assert_eq!(
             PACKET_FRAME_SIZE,
             8 + 4
@@ -141,7 +163,7 @@ mod tests {
 
     #[test]
     fn extra_features_are_appended() {
-        let mut f = sample();
+        let mut f = sample_packet();
         f.features[FEAT_MOUTH_PUCKER] = 0.5;
         f.features[FEAT_MOUTH_OFFSET_X] = -0.25;
         f.features[FEAT_CHEEK_PUFF] = 0.8;

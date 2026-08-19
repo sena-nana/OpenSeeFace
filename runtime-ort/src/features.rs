@@ -31,6 +31,18 @@ pub const FEATURE_NAMES: [&str; FEATURE_COUNT] = [
     "mouth_press_lip_open",
 ];
 
+pub const FEAT_EYE_L: usize = 0;
+pub const FEAT_EYE_R: usize = 1;
+pub const FEAT_BROW_STEEP_L: usize = 2;
+pub const FEAT_BROW_UD_L: usize = 3;
+pub const FEAT_BROW_STEEP_R: usize = 5;
+pub const FEAT_BROW_UD_R: usize = 6;
+pub const FEAT_CORNER_UD_L: usize = 8;
+pub const FEAT_CORNER_IO_L: usize = 9;
+pub const FEAT_CORNER_UD_R: usize = 10;
+pub const FEAT_CORNER_IO_R: usize = 11;
+pub const FEAT_MOUTH_OPEN: usize = 12;
+pub const FEAT_MOUTH_WIDE: usize = 13;
 /// Official UDP feature slots 14–19.
 pub const FEAT_MOUTH_PUCKER: usize = 14;
 pub const FEAT_MOUTH_OFFSET_X: usize = 15;
@@ -38,6 +50,14 @@ pub const FEAT_CHEEK_PUFF: usize = 16;
 pub const FEAT_JAW_OPEN: usize = 17;
 pub const FEAT_MOUTH_FUNNEL: usize = 18;
 pub const FEAT_MOUTH_PRESS_LIP_OPEN: usize = 19;
+
+/// Face-width (`nx`) and nose-bridge (`ny`) scale from 3D landmarks.
+pub fn face_norm_basis(pts: &[[f32; 3]]) -> (f32, f32) {
+    let nx = ((pts[0][0] - pts[16][0]) + (pts[1][0] - pts[15][0])) / 2.0;
+    let ny =
+        ((pts[27][1] - pts[28][1]) + (pts[28][1] - pts[29][1]) + (pts[29][1] - pts[30][1])) / 3.0;
+    (nx.abs().max(1e-6), ny.abs().max(1e-6))
+}
 
 /// Bias so [`Feature`] median stays away from 0 (signed offset around rest).
 const OFFSET_BIAS: f32 = 1.0;
@@ -456,12 +476,7 @@ impl FeatureExtractor {
             .unwrap_or(0.0);
 
         let p = |i: usize| [pts[i][0], pts[i][1]];
-        let norm_distance_x = ((pts[0][0] - pts[16][0]) + (pts[1][0] - pts[15][0])) / 2.0;
-        let norm_distance_y =
-            ((pts[27][1] - pts[28][1]) + (pts[28][1] - pts[29][1]) + (pts[29][1] - pts[30][1]))
-                / 3.0;
-        let ny = norm_distance_y.abs().max(1e-6);
-        let nx = norm_distance_x.abs().max(1e-6);
+        let (nx, ny) = face_norm_basis(pts);
 
         let (a1, f) = eye_aspect(p(42), p(45), [p(43), p(44), p(47), p(46)]);
         let eye_l = self.eye_l.update_ex(f, now, eye_conf);
