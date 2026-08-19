@@ -264,6 +264,8 @@ public class OpenSeeVRMDriver : MonoBehaviour {
     
     private bool trackMouth = false;
     private double lastPerfectSync = -1;
+    private bool psGeomInit = false;
+    private float[] psRest;
     
     private float lastAudioTime = -1f;
 
@@ -808,136 +810,160 @@ public class OpenSeeVRMDriver : MonoBehaviour {
         ApplyMouthShape(false);
     }
     
+    const float PS_WEAK = 0.35f;
+
+    void SetPS(string name, float weight) {
+        proxy.SetPerfectSync(name, Mathf.Max(0f, weight), lastPerfectSync);
+    }
+
+    void SetPSLR(string stem, float left, float right) {
+        SetPS(stem + "LEFT", left);
+        SetPS(stem + "RIGHT", right);
+    }
+
+    float PsLook(float v, float dead) {
+        float a = Mathf.Abs(v);
+        return a <= dead ? 0f : Mathf.InverseLerp(dead, 1f, a);
+    }
+
+    float PsDelta(int i, float v, bool adapt) {
+        if (psRest == null)
+            psRest = new float[11];
+        if (!psGeomInit)
+            psRest[i] = v;
+        else if (adapt)
+            psRest[i] = Mathf.Lerp(psRest[i], v, 0.04f);
+        return v - psRest[i];
+    }
+
+    float PsPos(float d, float dead, float scale) {
+        return d > dead ? Mathf.Clamp01((d - dead) * scale) : 0f;
+    }
+
+    void ApplyPsBlink(string side, float browUD, float eye) {
+        bool squint = browUD < 0.2f && eye < 0.1f && eye > -0.6f;
+        SetPS("BROWDOWN" + side, browUD < 0.2f ? -browUD * 0.5f : 0f);
+        SetPS("EYESQUINT" + side, squint ? -eye : 0f);
+        SetPS("EYEBLINK" + side, squint ? 0f : (eye <= (browUD < 0.2f ? -0.6f : -0.3f) ? -eye * 1.5f : 0f));
+    }
+
+    void ApplyPerfectSyncEyeLook() {
+        float lookLR = currentLookLeftRight;
+        float lookUD = currentLookUpDown;
+        if (skipApplyEyes || !gazeTracking || only30Points) {
+            lookLR = 0f;
+            lookUD = 0f;
+        } else if (openSeeIKTarget != null && !openSeeIKTarget.mirrorMotion) {
+            lookLR = -lookLR;
+        }
+        float dead = Mathf.Max(0.08f, gazeStabilizer);
+        float up = lookUD > 0f ? PsLook(lookUD, dead) : 0f;
+        float down = lookUD < 0f ? PsLook(lookUD, dead) : 0f;
+        float left = lookLR > 0f ? PsLook(lookLR, dead) : 0f;
+        float right = lookLR < 0f ? PsLook(lookLR, dead) : 0f;
+        bool m = openSeeIKTarget != null && openSeeIKTarget.mirrorMotion;
+        SetPSLR("EYELOOKUP", up, up);
+        SetPSLR("EYELOOKDOWN", down, down);
+        SetPS(m ? "EYELOOKOUTRIGHT" : "EYELOOKOUTLEFT", left);
+        SetPS(m ? "EYELOOKINLEFT" : "EYELOOKINRIGHT", left);
+        SetPS(m ? "EYELOOKINRIGHT" : "EYELOOKINLEFT", right);
+        SetPS(m ? "EYELOOKOUTLEFT" : "EYELOOKOUTRIGHT", right);
+    }
+
+    void ApplyPerfectSyncMouth() {
+        var f = openSeeData.features;
+        SetPS("MOUTHPUCKER", f.MouthPucker);
+        SetPS("JAWOPEN", f.JawOpen);
+        SetPS("MOUTHCLOSE", -f.MouthOpen);
+        SetPS("MOUTHFUNNEL", f.MouthFunnel);
+        SetPS("CHEEKPUFF", f.CheekPuff);
+        SetPS("MOUTHLEFT", f.MouthOffsetX < -0.3f ? -f.MouthOffsetX * 0.5f : 0f);
+        SetPS("MOUTHRIGHT", f.MouthOffsetX > 0.3f ? f.MouthOffsetX * 0.5f : 0f);
+        SetPSLR("MOUTHSMILE", f.MouthCornerUpDownLeft > 0.3f ? f.MouthCornerUpDownLeft * 0.5f : 0f, f.MouthCornerUpDownRight > 0.3f ? f.MouthCornerUpDownRight * 0.5f : 0f);
+        SetPSLR("MOUTHFROWN", f.MouthCornerUpDownLeft < -0.3f ? -f.MouthCornerUpDownLeft : 0f, f.MouthCornerUpDownRight < -0.3f ? -f.MouthCornerUpDownRight : 0f);
+
+        float openGate = 1f - Mathf.Clamp01(f.MouthOpen / 0.45f);
+        float wide = Mathf.Max(0f, f.MouthWide);
+        SetPSLR("MOUTHSTRETCH", (wide + Mathf.Max(0f, f.MouthCornerInOutLeft)) * 0.6f * openGate, (wide + Mathf.Max(0f, f.MouthCornerInOutRight)) * 0.6f * openGate);
+        float press = Mathf.Max(0f, -f.MouthPressLipOpen);
+        SetPSLR("MOUTHPRESS", press, press);
+
+        float upperL = 0f, upperR = 0f, lowerL = 0f, lowerR = 0f;
+        float jawL = 0f, jawR = 0f, jawFwd = 0f, rollU = 0f, rollLo = 0f, sneerL = 0f, sneerR = 0f, shrugLo = 0f;
+        Vector3[] p = openSeeData.points3D;
+        if (!only30Points && openSeeData.got3DPoints && p != null && p.Length >= 66) {
+            float ny = Mathf.Max(1e-5f, (Mathf.Abs(p[27].y - p[28].y) + Mathf.Abs(p[28].y - p[29].y) + Mathf.Abs(p[29].y - p[30].y)) / 3f);
+            float nx = Mathf.Max(1e-5f, (Mathf.Abs(p[0].x - p[16].x) + Mathf.Abs(p[1].x - p[15].x)) / 2f);
+            bool rest = f.MouthOpen < 0.15f && f.JawOpen < 0.15f && Mathf.Abs(f.MouthWide) < 0.2f && f.MouthPucker < 0.15f && f.MouthFunnel < 0.15f;
+            float outerLo = (p[54].y + p[55].y + p[56].y) / 3f;
+            float dUL = PsDelta(0, (p[51].y - p[30].y) / ny, rest);
+            float dUR = PsDelta(1, (p[49].y - p[30].y) / ny, rest);
+            float dLL = PsDelta(2, (p[54].y - p[30].y) / ny, rest);
+            float dLR = PsDelta(3, (p[56].y - p[30].y) / ny, rest);
+            float dChin = PsDelta(4, (p[8].x - (p[27].x + p[30].x) * 0.5f) / nx, rest);
+            float dFwd = PsDelta(5, (p[8].z - p[30].z) / ny, rest);
+            float dRU = PsDelta(6, Mathf.Abs((p[49].y + p[50].y + p[51].y) / 3f - (p[59].y + p[60].y + p[61].y) / 3f) / ny, rest);
+            float dRL = PsDelta(7, Mathf.Abs(outerLo - (p[63].y + p[64].y + p[65].y) / 3f) / ny, rest);
+            float dSneerL = -PsDelta(8, (p[35].y - p[30].y) / ny, rest);
+            float dSneerR = -PsDelta(9, (p[31].y - p[30].y) / ny, rest);
+            float dChinLip = PsDelta(10, (p[8].y - outerLo) / ny, rest);
+            bool ready = psGeomInit;
+            psGeomInit = true;
+            if (ready) {
+                if (f.MouthPucker < 0.25f && f.MouthFunnel < 0.25f) {
+                    upperL = Mathf.Clamp01(-dUL * 1.8f);
+                    upperR = Mathf.Clamp01(-dUR * 1.8f);
+                    lowerL = Mathf.Clamp01(dLL * 1.8f - Mathf.Max(0f, f.JawOpen) * 0.55f);
+                    lowerR = Mathf.Clamp01(dLR * 1.8f - Mathf.Max(0f, f.JawOpen) * 0.55f);
+                }
+                jawR = PsPos(dChin, 0.08f, 2.2f);
+                jawL = PsPos(-dChin, 0.08f, 2.2f);
+                jawFwd = PsPos(dFwd, 0.12f, 1.6f);
+                if (openGate > 0.35f && f.MouthPucker < 0.2f) {
+                    rollU = Mathf.Max(Mathf.Clamp01(-dRU * 2.5f), press * 0.35f);
+                    rollLo = Mathf.Max(Mathf.Clamp01(-dRL * 2.5f), press * 0.35f);
+                }
+                sneerL = Mathf.Clamp01(dSneerL * 2.2f);
+                sneerR = Mathf.Clamp01(dSneerR * 2.2f);
+                if (openGate > 0.5f)
+                    shrugLo = Mathf.Clamp01(-dChinLip * 2f);
+            }
+        }
+
+        SetPSLR("MOUTHUPPERUP", upperL, upperR);
+        SetPSLR("MOUTHLOWERDOWN", lowerL, lowerR);
+        SetPS("JAWLEFT", jawL);
+        SetPS("JAWRIGHT", jawR);
+        SetPS("JAWFORWARD", jawFwd);
+        SetPS("MOUTHROLLUPPER", rollU);
+        SetPS("MOUTHROLLLOWER", rollLo);
+        SetPS("TONGUEOUT", 0f);
+
+        float dimple = 1f - Mathf.Clamp01(f.MouthOpen / 0.25f);
+        SetPSLR("MOUTHDIMPLE", f.MouthCornerUpDownLeft > 0.15f ? f.MouthCornerUpDownLeft * 0.45f * dimple * PS_WEAK : 0f, f.MouthCornerUpDownRight > 0.15f ? f.MouthCornerUpDownRight * 0.45f * dimple * PS_WEAK : 0f);
+        SetPS("MOUTHSHRUGUPPER", Mathf.Max(upperL, upperR) * 0.5f * PS_WEAK);
+        SetPS("MOUTHSHRUGLOWER", shrugLo * PS_WEAK);
+        float sqL = (f.EyebrowUpDownLeft < 0.2f && f.EyeLeft < 0.1f && f.EyeLeft > -0.6f) ? -f.EyeLeft : 0f;
+        float sqR = (f.EyebrowUpDownRight < 0.2f && f.EyeRight < 0.1f && f.EyeRight > -0.6f) ? -f.EyeRight : 0f;
+        SetPSLR("CHEEKSQUINT", sqL * Mathf.Clamp01(f.MouthCornerUpDownLeft) * PS_WEAK, sqR * Mathf.Clamp01(f.MouthCornerUpDownRight) * PS_WEAK);
+        SetPSLR("NOSESNEER", Mathf.Clamp01(sneerL + Mathf.Max(0f, f.EyebrowQuirkLeft) * 0.35f) * PS_WEAK, Mathf.Clamp01(sneerR + Mathf.Max(0f, f.EyebrowQuirkRight) * 0.35f) * PS_WEAK);
+    }
+
     void UpdatePerfectSync() {
         if (openSeeData == null || lastPerfectSync >= openSeeData.time)
             return;
         lastPerfectSync = openSeeData.time;
-        if (useCameraPerfectSync && proxy.HasPerfectSync()) {
-            float upDownStrength = (openSeeData.features.EyebrowUpDownLeft + openSeeData.features.EyebrowUpDownRight) / 2f;
-            if (upDownStrength > 0f)
-                proxy.SetPerfectSync("BROWINNERUP", upDownStrength * 0.8f, lastPerfectSync);
-            else
-                proxy.SetPerfectSync("BROWINNERUP", 0, lastPerfectSync);
-
-            if (openSeeData.features.EyebrowUpDownLeft < 0.2f) {
-                proxy.SetPerfectSync("BROWDOWNLEFT", -openSeeData.features.EyebrowUpDownLeft * 0.5f, lastPerfectSync);
-                if (openSeeData.features.EyeLeft < 0.1f && openSeeData.features.EyeLeft > -0.6f) {
-                    proxy.SetPerfectSync("EYESQUINTLEFT", -openSeeData.features.EyeLeft, lastPerfectSync);
-                    proxy.SetPerfectSync("EYEBLINKLEFT", 0, lastPerfectSync);
-                } else if (openSeeData.features.EyeLeft <= -0.6f) {
-                    proxy.SetPerfectSync("EYEBLINKLEFT", -openSeeData.features.EyeLeft * 1.5f, lastPerfectSync);
-                    proxy.SetPerfectSync("EYESQUINTLEFT", 0, lastPerfectSync);
-                } else {
-                    proxy.SetPerfectSync("EYESQUINTLEFT", 0, lastPerfectSync);
-                    proxy.SetPerfectSync("EYEBLINKLEFT", 0, lastPerfectSync);
-                }
-            } else {
-                proxy.SetPerfectSync("BROWDOWNLEFT", 0, lastPerfectSync);
-                proxy.SetPerfectSync("EYESQUINTLEFT", 0, lastPerfectSync);
-                if (openSeeData.features.EyeLeft <= -0.3f)
-                    proxy.SetPerfectSync("EYEBLINKLEFT", -openSeeData.features.EyeLeft * 1.5f, lastPerfectSync);
-                else
-                    proxy.SetPerfectSync("EYEBLINKLEFT", 0, lastPerfectSync);
-            }
-            
-            if (openSeeData.features.EyebrowUpDownRight < 0.2f) {
-                proxy.SetPerfectSync("BROWDOWNRIGHT", -openSeeData.features.EyebrowUpDownRight * 0.5f, lastPerfectSync);
-                if (openSeeData.features.EyeRight < 0.1f && openSeeData.features.EyeRight > -0.6f) {
-                    proxy.SetPerfectSync("EYESQUINTRIGHT", -openSeeData.features.EyeRight, lastPerfectSync);
-                    proxy.SetPerfectSync("EYEBLINKRIGHT", 0, lastPerfectSync);
-                } else if (openSeeData.features.EyeRight <= -0.6f) {
-                    proxy.SetPerfectSync("EYEBLINKRIGHT", -openSeeData.features.EyeRight * 1.5f, lastPerfectSync);
-                    proxy.SetPerfectSync("EYESQUINTRIGHT", 0, lastPerfectSync);
-                } else {
-                    proxy.SetPerfectSync("EYESQUINTRIGHT", 0, lastPerfectSync);
-                    proxy.SetPerfectSync("EYEBLINKRIGHT", 0, lastPerfectSync);
-                }
-            } else {
-                proxy.SetPerfectSync("BROWDOWNRIGHT", 0, lastPerfectSync);
-                proxy.SetPerfectSync("EYESQUINTRIGHT", 0, lastPerfectSync);
-                if (openSeeData.features.EyeRight <= -0.3f)
-                    proxy.SetPerfectSync("EYEBLINKRIGHT", -openSeeData.features.EyeRight * 1.5f, lastPerfectSync);
-                else
-                    proxy.SetPerfectSync("EYEBLINKRIGHT", 0, lastPerfectSync);
-            }
-
-            if (openSeeData.features.EyebrowSteepnessLeft < 0.2f)
-                proxy.SetPerfectSync("BROWOUTERUPLEFT", -openSeeData.features.EyebrowSteepnessLeft, lastPerfectSync);
-            else
-                proxy.SetPerfectSync("BROWOUTERUPLEFT", 0, lastPerfectSync);
-            
-            if (openSeeData.features.EyebrowSteepnessRight < 0.2f)
-                proxy.SetPerfectSync("BROWOUTERUPRIGHT", -openSeeData.features.EyebrowSteepnessRight, lastPerfectSync);
-            else
-                proxy.SetPerfectSync("BROWOUTERUPRIGHT", 0, lastPerfectSync);
-
-            if (openSeeData.features.EyeLeft > 0.5f)
-                proxy.SetPerfectSync("EYEWIDELEFT", openSeeData.features.EyeLeft * 0.7f, lastPerfectSync);
-            else
-                proxy.SetPerfectSync("EYEWIDELEFT", 0, lastPerfectSync);
-            
-            if (openSeeData.features.EyeRight > 0.5f)
-                proxy.SetPerfectSync("EYEWIDERIGHT", openSeeData.features.EyeRight * 0.7f, lastPerfectSync);
-            else
-                proxy.SetPerfectSync("EYEWIDERIGHT", 0, lastPerfectSync);
-            
-            if (trackMouth) {
-                if (openSeeData.features.MouthPucker > 0.0f)
-                    proxy.SetPerfectSync("MOUTHPUCKER", openSeeData.features.MouthPucker, lastPerfectSync);
-                else
-                    proxy.SetPerfectSync("MOUTHPUCKER", 0, lastPerfectSync);
-                
-                if (openSeeData.features.JawOpen > 0.0f)
-                    proxy.SetPerfectSync("JAWOPEN", openSeeData.features.JawOpen, lastPerfectSync);
-                else
-                    proxy.SetPerfectSync("JAWOPEN", 0, lastPerfectSync);
-
-                if (openSeeData.features.MouthOpen < -0.0f)
-                    proxy.SetPerfectSync("MOUTHCLOSE", openSeeData.features.MouthOpen, lastPerfectSync);
-                else
-                    proxy.SetPerfectSync("MOUTHCLOSE", 0, lastPerfectSync);
-
-                if (openSeeData.features.MouthFunnel > 0.0f)
-                    proxy.SetPerfectSync("MOUTHFUNNEL", openSeeData.features.MouthFunnel, lastPerfectSync);
-                else
-                    proxy.SetPerfectSync("MOUTHFUNNEL", 0, lastPerfectSync);
-
-                // MouthPressLipOpen is VBridger/Live2D, not ARKit MouthPress L/R.
-                
-                if (openSeeData.features.MouthOffsetX < -0.3f)
-                    proxy.SetPerfectSync("MOUTHLEFT", -openSeeData.features.MouthOffsetX * 0.5f, lastPerfectSync);
-                else
-                    proxy.SetPerfectSync("MOUTHLEFT", 0, lastPerfectSync);
-
-                if (openSeeData.features.MouthOffsetX > 0.3f)
-                    proxy.SetPerfectSync("MOUTHRIGHT", openSeeData.features.MouthOffsetX * 0.5f, lastPerfectSync);
-                else
-                    proxy.SetPerfectSync("MOUTHRIGHT", 0, lastPerfectSync);
-
-                if (openSeeData.features.CheekPuff > 0.0f)
-                    proxy.SetPerfectSync("CHEEKPUFF", openSeeData.features.CheekPuff, lastPerfectSync);
-                else
-                    proxy.SetPerfectSync("CHEEKPUFF", 0, lastPerfectSync);
-
-                if (openSeeData.features.MouthCornerUpDownLeft > 0.3f)
-                    proxy.SetPerfectSync("MOUTHSMILELEFT", openSeeData.features.MouthCornerUpDownLeft * 0.5f, lastPerfectSync);
-                else if (openSeeData.features.MouthCornerUpDownLeft < -0.3f)
-                    proxy.SetPerfectSync("MOUTHFROWNLEFT", -openSeeData.features.MouthCornerUpDownLeft, lastPerfectSync);
-                else {
-                    proxy.SetPerfectSync("MOUTHSMILELEFT", 0, lastPerfectSync);
-                    proxy.SetPerfectSync("MOUTHFROWNLEFT", 0, lastPerfectSync);
-                }
-
-                if (openSeeData.features.MouthCornerUpDownRight > 0.3f)
-                    proxy.SetPerfectSync("MOUTHSMILERIGHT", openSeeData.features.MouthCornerUpDownRight * 0.5f, lastPerfectSync);
-                else if (openSeeData.features.MouthCornerUpDownLeft < -0.3f)
-                    proxy.SetPerfectSync("MOUTHFROWNRIGHT", -openSeeData.features.MouthCornerUpDownRight, lastPerfectSync);
-                else {
-                    proxy.SetPerfectSync("MOUTHSMILERIGHT", 0, lastPerfectSync);
-                    proxy.SetPerfectSync("MOUTHFROWNRIGHT", 0, lastPerfectSync);
-                }
-            }
-        }
+        if (!useCameraPerfectSync || !proxy.HasPerfectSync())
+            return;
+        var f = openSeeData.features;
+        SetPS("BROWINNERUP", Mathf.Max(0f, (f.EyebrowUpDownLeft + f.EyebrowUpDownRight) * 0.4f));
+        ApplyPsBlink("LEFT", f.EyebrowUpDownLeft, f.EyeLeft);
+        ApplyPsBlink("RIGHT", f.EyebrowUpDownRight, f.EyeRight);
+        SetPSLR("BROWOUTERUP", f.EyebrowSteepnessLeft < 0.2f ? -f.EyebrowSteepnessLeft : 0f, f.EyebrowSteepnessRight < 0.2f ? -f.EyebrowSteepnessRight : 0f);
+        SetPSLR("EYEWIDE", f.EyeLeft > 0.5f ? f.EyeLeft * 0.7f : 0f, f.EyeRight > 0.5f ? f.EyeRight * 0.7f : 0f);
+        ApplyPerfectSyncEyeLook();
+        if (trackMouth)
+            ApplyPerfectSyncMouth();
     }
     
     void UpdateBrows() {
@@ -1064,6 +1090,8 @@ public class OpenSeeVRMDriver : MonoBehaviour {
             InitCatsData();
         lastAvatar = vrmBlendShapeProxy;
         animator = lastAvatar.gameObject.GetComponent<Animator>();
+        psGeomInit = false;
+        psRest = null;
 
         if (animator != null) {
             haveJawParameter = false;
@@ -1513,7 +1541,7 @@ public class OpenSeeVRMDriver : MonoBehaviour {
             lookLeftRight = -lookLeftRight;
         
         if (leftEye == null && rightEye == null) {
-            if (gazeTracking) {
+            if (gazeTracking && (!useCameraPerfectSync || !proxy.HasPerfectSync())) {
                 if (lookUpDown > 0f) {
                     proxy.AccumulateValue(BlendShapeKey.CreateFromPreset(BlendShapePreset.LookUp), gazeFactor.x * lookUpDown);
                 } else {
