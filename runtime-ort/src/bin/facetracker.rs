@@ -5,8 +5,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use clap::Parser;
 use osf_ort::{
-    draw_tracking, dump_symmetric_points, encode_faces, list_cameras, mirror_bgr, model_base_path,
-    FacePacket, FilterKind, InputSource, Tracker, TrackerConfig, VideoOut, VizWindow,
+    draw_tracking, dump_symmetric_points, encode_faces_into, list_cameras, model_base_path,
+    FacePacket, FilterKind, InputSource, PipedInput, Tracker, TrackerConfig, VideoOut, VizWindow,
     PACKET_FRAME_SIZE,
 };
 
@@ -106,7 +106,7 @@ fn main() -> Result<()> {
         return run_benchmark(&args);
     }
 
-    let mut input = InputSource::open(
+    let src = InputSource::open(
         &args.capture,
         args.raw_rgb != 0,
         args.width,
@@ -114,11 +114,12 @@ fn main() -> Result<()> {
         args.fps,
         args.repeat_video != 0,
     )?;
+    let is_video = src.is_video;
+    let mut input = PipedInput::start(src);
     let sock = UdpSocket::bind("0.0.0.0:0").context("udp bind")?;
     let dest = format!("{}:{}", args.ip, args.port);
     let filter: FilterKind = args.filter.parse().context("--filter")?;
-    let pace =
-        (args.fps > 0 && !input.is_video).then(|| Duration::from_secs_f64(1.0 / args.fps as f64));
+    let pace = (args.fps > 0 && !is_video).then(|| Duration::from_secs_f64(1.0 / args.fps as f64));
 
     let mut tracker = None;
     let mut viz = None;
@@ -128,24 +129,27 @@ fn main() -> Result<()> {
     let mut total_tracking_time = 0.0;
     let mut tracking_frames = 0u64;
 
+    let mut udp_buf = Vec::with_capacity(PACKET_FRAME_SIZE);
     loop {
         let tick = Instant::now();
-        let Some(mut frame) = input.read()? else {
-            if args.repeat_video != 0 && input.is_video {
-                input = InputSource::open(
+        let Some(mut frame) = input.next() else {
+            if args.repeat_video != 0 && is_video {
+                if let Ok(src) = InputSource::open(
                     &args.capture,
                     args.raw_rgb != 0,
                     args.width,
                     args.height,
                     args.fps,
                     true,
-                )?;
-                continue;
+                ) {
+                    input = PipedInput::start(src);
+                    continue;
+                }
             }
             break;
         };
         if args.mirror_input {
-            frame = mirror_bgr(&frame);
+            frame.flip_h_in_place();
         }
         let tnow = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -228,9 +232,9 @@ fn main() -> Result<()> {
             })
             .collect();
         if !packets.is_empty() && packets.len() < 40 {
-            let bytes = encode_faces(&packets);
-            if bytes.len() % PACKET_FRAME_SIZE == 0 {
-                let _ = sock.send_to(&bytes, &dest);
+            encode_faces_into(&mut udp_buf, &packets);
+            if udp_buf.len() % PACKET_FRAME_SIZE == 0 {
+                let _ = sock.send_to(&udp_buf, &dest);
             }
         }
 
@@ -260,6 +264,7 @@ fn main() -> Result<()> {
                 std::thread::sleep(rest);
             }
         }
+        input.recycle(frame);
     }
 
     if !args.dump_points.is_empty() {

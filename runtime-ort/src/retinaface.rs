@@ -3,9 +3,9 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use half::f16;
 
-use crate::decode::TensorF16;
-use crate::preprocess::{retina_nchw, BgrImage};
+use crate::preprocess::{retina_nchw_into, BgrImage};
 use crate::session::OrtModel;
 
 pub struct RetinaFace {
@@ -14,7 +14,8 @@ pub struct RetinaFace {
     min_conf: f32,
     nms_threshold: f32,
     top_k: usize,
-    pending: Option<BgrImage>,
+    buf: BgrImage,
+    queued: bool,
     ready: Option<Vec<[f32; 4]>>,
 }
 
@@ -74,25 +75,75 @@ fn parse_priors(path: &Path) -> Result<Vec<[f32; 4]>> {
         .collect())
 }
 
-fn flatten4(t: &TensorF16) -> Vec<[f32; 4]> {
-    let d: Vec<f32> = t.data.iter().map(|x| x.to_f32()).collect();
-    d.chunks_exact(4)
-        .map(|c| [c[0], c[1], c[2], c[3]])
+fn flatten4(data: &[f16]) -> Vec<[f32; 4]> {
+    data.chunks_exact(4)
+        .map(|c| [c[0].to_f32(), c[1].to_f32(), c[2].to_f32(), c[3].to_f32()])
         .collect()
 }
 
-fn flatten_conf(t: &TensorF16) -> Vec<f32> {
-    let d: Vec<f32> = t.data.iter().map(|x| x.to_f32()).collect();
-    let shape = &t.shape;
-    if shape.len() >= 2 && *shape.last().unwrap_or(&1) == 2 {
-        d.chunks_exact(2).map(|c| c[1]).collect()
-    } else if d.len() >= 2 {
-        d.chunks_exact(d.len() / (d.len() / 2).max(1))
-            .map(|c| *c.last().unwrap_or(&0.0))
-            .collect()
+fn flatten_conf(data: &[f16]) -> Vec<f32> {
+    if data.len() >= 2 && data.len() % 2 == 0 {
+        data.chunks_exact(2).map(|c| c[1].to_f32()).collect()
     } else {
-        d
+        data.iter().map(|x| x.to_f32()).collect()
     }
+}
+
+fn run_detect(
+    model: &mut OrtModel,
+    frame: &BgrImage,
+    priors: &[[f32; 4]],
+    min_conf: f32,
+    nms_threshold: f32,
+    top_k: usize,
+) -> Result<Vec<[f32; 4]>> {
+    let w = frame.width as f32;
+    let h = frame.height as f32;
+    let shape = [1i64, 3, 640, 640];
+    model.run_prep(
+        &shape,
+        |buf| retina_nchw_into(frame, buf),
+        |outs| {
+            let loc_t = flatten4(outs[0]);
+            let conf_t = if outs.len() > 1 {
+                flatten_conf(outs[1])
+            } else {
+                vec![1.0; loc_t.len()]
+            };
+            let n = priors.len().min(loc_t.len()).min(conf_t.len());
+            let boxes = decode_boxes(&loc_t[..n], &priors[..n]);
+            let mut dets = Vec::new();
+            for i in 0..n {
+                let score = conf_t[i];
+                if score <= min_conf {
+                    continue;
+                }
+                dets.push([
+                    boxes[i][0] * w,
+                    boxes[i][1] * h,
+                    boxes[i][2] * w,
+                    boxes[i][3] * h,
+                    score,
+                ]);
+            }
+            let keep = nms(&dets, nms_threshold);
+            let mut out_boxes = Vec::new();
+            for &i in keep.iter().take(top_k) {
+                let mut x1 = dets[i][0];
+                let mut y1 = dets[i][1];
+                let mut bw = dets[i][2] - dets[i][0];
+                let mut bh = dets[i][3] - dets[i][1];
+                let ux = bw * 0.15;
+                let uy = bh * 0.2;
+                x1 -= ux;
+                y1 -= uy;
+                bw += ux * 2.0;
+                bh += uy * 2.0;
+                out_boxes.push([x1, y1, bw, bh]);
+            }
+            Ok(out_boxes)
+        },
+    )
 }
 
 impl RetinaFace {
@@ -102,74 +153,50 @@ impl RetinaFace {
         threads: usize,
         top_k: usize,
     ) -> Result<Self> {
-        let model = OrtModel::load(model_path, threads.max(1))?;
-        let priors = parse_priors(prior_path.as_ref())?;
         Ok(Self {
-            model,
-            priors,
+            model: OrtModel::load(model_path, threads.max(1))?,
+            priors: parse_priors(prior_path.as_ref())?,
             min_conf: 0.4,
             nms_threshold: 0.4,
             top_k: top_k.max(1),
-            pending: None,
+            buf: BgrImage::zeros(0, 0),
+            queued: false,
             ready: None,
         })
     }
 
     pub fn detect(&mut self, frame: &BgrImage) -> Result<Vec<[f32; 4]>> {
-        let w = frame.width as f32;
-        let h = frame.height as f32;
-        let input = retina_nchw(frame);
-        let out = self.model.run(&input)?;
-        let loc_t = flatten4(&out[0]);
-        let conf_t = if out.len() > 1 {
-            flatten_conf(&out[1])
-        } else {
-            vec![1.0; loc_t.len()]
-        };
-        let n = self.priors.len().min(loc_t.len()).min(conf_t.len());
-        let boxes = decode_boxes(&loc_t[..n], &self.priors[..n]);
-        let mut dets = Vec::new();
-        for i in 0..n {
-            let score = conf_t[i];
-            if score <= self.min_conf {
-                continue;
-            }
-            dets.push([
-                boxes[i][0] * w,
-                boxes[i][1] * h,
-                boxes[i][2] * w,
-                boxes[i][3] * h,
-                score,
-            ]);
-        }
-        let keep = nms(&dets, self.nms_threshold);
-        let mut out_boxes = Vec::new();
-        for &i in keep.iter().take(self.top_k) {
-            let mut x1 = dets[i][0];
-            let mut y1 = dets[i][1];
-            let mut bw = dets[i][2] - dets[i][0];
-            let mut bh = dets[i][3] - dets[i][1];
-            let ux = bw * 0.15;
-            let uy = bh * 0.2;
-            x1 -= ux;
-            y1 -= uy;
-            bw += ux * 2.0;
-            bh += uy * 2.0;
-            out_boxes.push([x1, y1, bw, bh]);
-        }
-        Ok(out_boxes)
+        run_detect(
+            &mut self.model,
+            frame,
+            &self.priors,
+            self.min_conf,
+            self.nms_threshold,
+            self.top_k,
+        )
     }
 
     pub fn background_detect(&mut self, frame: &BgrImage) {
-        if self.pending.is_some() || self.ready.is_some() {
+        if self.queued || self.ready.is_some() {
             return;
         }
-        self.pending = Some(frame.clone());
+        self.buf.resize_buffer(frame.width, frame.height);
+        self.buf.data.copy_from_slice(&frame.data);
+        self.queued = true;
     }
 
     pub fn get_results(&mut self) -> Vec<[f32; 4]> {
-        if let Some(frame) = self.pending.take() {
-            self.ready = self.detect(&frame).ok();
+        if self.queued {
+            self.queued = false;
+            self.ready = run_detect(
+                &mut self.model,
+                &self.buf,
+                &self.priors,
+                self.min_conf,
+                self.nms_threshold,
+                self.top_k,
+            )
+            .ok();
         }
         self.ready.take().unwrap_or_default()
     }

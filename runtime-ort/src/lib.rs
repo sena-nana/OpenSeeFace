@@ -24,11 +24,11 @@ pub use adaptive::{
     center_2x, det_window, face_on_224, nme, pick_lm, AdaptiveCfg, AdaptiveState, DetWindow,
     FAST_LM,
 };
-pub use capture::{list_cameras, mirror_bgr, InputSource, VideoOut};
+pub use capture::{list_cameras, mirror_bgr, InputSource, PipedInput, VideoOut};
 pub use crop::{stable_landmark_bbox, CropSmoothState, CropTrack};
 pub use decode::{
-    decode_landmarks, detect_faces, detect_faces_n, landmark_bbox, mean_conf, LmSpec, TensorF16,
-    EYE_IDX,
+    decode_landmarks, decode_landmarks_data, detect_faces, detect_faces_n, landmark_bbox,
+    mean_conf, LmSpec, TensorF16, EYE_IDX,
 };
 pub use enhance::{enhance_bgr, enhance_bgr_in_place, EnhanceCfg, HeMode};
 pub use features::FEATURE_NAMES;
@@ -38,12 +38,12 @@ pub use gpu_pre::GpuTracker;
 pub use metrics::{cosine, max_abs, mean_abs, model_path, read_f32_le, rss, Latency, Rss};
 pub use pnp::Camera;
 pub use preprocess::{
-    crop_box, crop_box_pad, crop_img, face_crop, imagenet_nchw, iou, nchw, paste_bgr, resize_bgr,
-    retina_nchw, synth_canvas, BgrImage, ColorNorm,
+    crop_box, crop_box_pad, crop_img, face_crop, imagenet_nchw, imagenet_nchw_roi_into, iou, nchw,
+    paste_bgr, resize_bgr, retina_nchw, synth_canvas, BgrImage, ColorNorm,
 };
 pub use session::{Device, OrtModel};
 pub use tracker::{model_base_path, FaceInfo, Tracker, TrackerConfig};
-pub use udp::{encode_face, encode_faces, FacePacket, PACKET_FRAME_SIZE};
+pub use udp::{encode_face, encode_faces, encode_faces_into, FacePacket, PACKET_FRAME_SIZE};
 pub use viz::{draw_tracking, dump_symmetric_points, VizWindow};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -102,5 +102,31 @@ mod tests {
         let got = resize_bgr(&im, 2, 2);
         assert_eq!(got.width, 2);
         assert_eq!(got.data, im.data);
+    }
+
+    #[test]
+    fn nchw_roi_matches_crop() {
+        let mut im = BgrImage::zeros(40, 30);
+        for i in 0..im.data.len() {
+            im.data[i] = (i % 251) as u8;
+        }
+        let crop = crop_img(&im, 5, 7, 21, 23);
+        let a = imagenet_nchw(&crop, 16);
+        let mut b = vec![half::f16::ZERO; 3 * 16 * 16];
+        imagenet_nchw_roi_into(&im, 5, 7, 21, 23, 16, &mut b);
+        for (x, y) in a.data.iter().zip(b.iter()) {
+            assert_eq!(x.to_bits(), y.to_bits());
+        }
+    }
+
+    #[test]
+    fn flip_h_reverses_rows() {
+        let im = BgrImage {
+            width: 2,
+            height: 1,
+            data: vec![1, 2, 3, 4, 5, 6],
+        };
+        let got = im.flip_h();
+        assert_eq!(got.data, vec![4, 5, 6, 1, 2, 3]);
     }
 }

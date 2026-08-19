@@ -18,6 +18,11 @@ pub struct InputSource {
 }
 
 enum Inner {
+    Safe(SafeInner),
+    Camera(CameraCap),
+}
+
+enum SafeInner {
     Raw {
         width: u32,
         height: u32,
@@ -33,7 +38,6 @@ enum Inner {
         width: u32,
         height: u32,
     },
-    Camera(CameraCap),
 }
 
 struct CameraCap {
@@ -51,11 +55,11 @@ impl InputSource {
     ) -> Result<Self> {
         if raw_rgb {
             return Ok(Self {
-                inner: Inner::Raw {
+                inner: Inner::Safe(SafeInner::Raw {
                     width,
                     height,
                     stdin: std::io::stdin(),
-                },
+                }),
                 name: "stdin".into(),
                 width,
                 height,
@@ -70,11 +74,11 @@ impl InputSource {
                     width: im.width,
                     height: im.height,
                     name: capture.to_string(),
-                    inner: Inner::Still {
+                    inner: Inner::Safe(SafeInner::Still {
                         frame: im,
                         done: false,
                         repeat,
-                    },
+                    }),
                     is_camera: false,
                     is_video: false,
                 });
@@ -82,11 +86,11 @@ impl InputSource {
             let (w, h) = probe_video(path).unwrap_or((width, height));
             let child = spawn_ffmpeg(path)?;
             return Ok(Self {
-                inner: Inner::Ffmpeg {
+                inner: Inner::Safe(SafeInner::Ffmpeg {
                     child,
                     width: w,
                     height: h,
-                },
+                }),
                 name: capture.to_string(),
                 width: w,
                 height: h,
@@ -108,76 +112,83 @@ impl InputSource {
     }
 
     pub fn read(&mut self) -> Result<Option<BgrImage>> {
+        let mut buf = BgrImage::zeros(0, 0);
+        if self.read_into(&mut buf)? {
+            Ok(Some(buf))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Fill `dst`, reusing its allocation when the size is unchanged.
+    pub fn read_into(&mut self, dst: &mut BgrImage) -> Result<bool> {
         match &mut self.inner {
-            Inner::Raw {
-                width,
-                height,
-                stdin,
-            } => {
-                let n = (*width as usize) * (*height as usize) * 3;
-                let mut buf = vec![0u8; n];
-                if stdin.read_exact(&mut buf).is_err() {
-                    return Ok(None);
-                }
-                Ok(Some(BgrImage {
-                    width: *width,
-                    height: *height,
-                    data: buf,
-                }))
-            }
-            Inner::Still {
-                frame,
-                done,
-                repeat,
-            } => {
-                if *done && !*repeat {
-                    return Ok(None);
-                }
-                *done = true;
-                Ok(Some(frame.clone()))
-            }
-            Inner::Ffmpeg {
-                child,
-                width,
-                height,
-            } => {
-                let n = (*width as usize) * (*height as usize) * 3;
-                let mut buf = vec![0u8; n];
-                let Some(out) = child.stdout.as_mut() else {
-                    return Ok(None);
-                };
-                if out.read_exact(&mut buf).is_err() {
-                    return Ok(None);
-                }
-                Ok(Some(BgrImage {
-                    width: *width,
-                    height: *height,
-                    data: buf,
-                }))
-            }
+            Inner::Safe(safe) => safe.read_into(dst),
             Inner::Camera(c) => {
                 let frame = c.cam.frame().context("camera frame")?;
                 let decoded = frame.decode_image::<nokhwa::pixel_format::RgbFormat>()?;
                 let (w, h) = (decoded.width(), decoded.height());
-                let mut data = Vec::with_capacity((w * h * 3) as usize);
-                for p in decoded.pixels() {
-                    data.extend_from_slice(&[p[2], p[1], p[0]]);
-                }
+                let mut raw = decoded.into_raw();
+                crate::preprocess::rgb_to_bgr_in_place(&mut raw);
+                dst.width = w;
+                dst.height = h;
+                dst.data = raw;
                 self.width = w;
                 self.height = h;
-                Ok(Some(BgrImage {
-                    width: w,
-                    height: h,
-                    data,
-                }))
+                Ok(true)
             }
         }
     }
 }
 
-impl Drop for InputSource {
+impl SafeInner {
+    fn read_into(&mut self, dst: &mut BgrImage) -> Result<bool> {
+        match self {
+            SafeInner::Raw {
+                width,
+                height,
+                stdin,
+            } => {
+                dst.resize_buffer(*width, *height);
+                if stdin.read_exact(&mut dst.data).is_err() {
+                    return Ok(false);
+                }
+                Ok(true)
+            }
+            SafeInner::Still {
+                frame,
+                done,
+                repeat,
+            } => {
+                if *done && !*repeat {
+                    return Ok(false);
+                }
+                *done = true;
+                dst.resize_buffer(frame.width, frame.height);
+                dst.data.copy_from_slice(&frame.data);
+                Ok(true)
+            }
+            SafeInner::Ffmpeg {
+                child,
+                width,
+                height,
+            } => {
+                dst.resize_buffer(*width, *height);
+                let Some(out) = child.stdout.as_mut() else {
+                    return Ok(false);
+                };
+                if out.read_exact(&mut dst.data).is_err() {
+                    return Ok(false);
+                }
+                Ok(true)
+            }
+        }
+    }
+}
+
+impl Drop for SafeInner {
     fn drop(&mut self) {
-        if let Inner::Ffmpeg { child, .. } = &mut self.inner {
+        if let SafeInner::Ffmpeg { child, .. } = self {
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -296,4 +307,117 @@ impl Drop for VideoOut {
 
 pub fn mirror_bgr(frame: &BgrImage) -> BgrImage {
     frame.flip_h()
+}
+
+/// Capture thread + two recycled BGR buffers so I/O overlaps with inference.
+/// Camera backends are not `Send`, so they reuse a buffer on the calling thread.
+pub struct PipedInput {
+    inner: PipedInner,
+}
+
+enum PipedInner {
+    Thread {
+        rx: std::sync::mpsc::Receiver<Option<BgrImage>>,
+        recycle: Option<std::sync::mpsc::SyncSender<BgrImage>>,
+        join: Option<std::thread::JoinHandle<()>>,
+    },
+    Local {
+        src: InputSource,
+        buf: BgrImage,
+    },
+}
+
+impl PipedInput {
+    pub fn start(src: InputSource) -> Self {
+        if matches!(src.inner, Inner::Camera(_)) {
+            let (w, h) = (src.width.max(1), src.height.max(1));
+            return Self {
+                inner: PipedInner::Local {
+                    buf: BgrImage::zeros(w, h),
+                    src,
+                },
+            };
+        }
+        let InputSource {
+            inner,
+            width,
+            height,
+            ..
+        } = src;
+        let Inner::Safe(mut safe) = inner else {
+            unreachable!();
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let (rec_tx, rec_rx) = std::sync::mpsc::sync_channel(2);
+        let w = width.max(1);
+        let h = height.max(1);
+        let _ = rec_tx.send(BgrImage::zeros(w, h));
+        let _ = rec_tx.send(BgrImage::zeros(w, h));
+        let join = std::thread::Builder::new()
+            .name("osf-capture".into())
+            .spawn(move || loop {
+                let mut buf = match rec_rx.recv() {
+                    Ok(b) => b,
+                    Err(_) => break,
+                };
+                match safe.read_into(&mut buf) {
+                    Ok(true) => {
+                        if tx.send(Some(buf)).is_err() {
+                            break;
+                        }
+                    }
+                    _ => {
+                        let _ = tx.send(None);
+                        break;
+                    }
+                }
+            })
+            .expect("capture thread");
+        Self {
+            inner: PipedInner::Thread {
+                rx,
+                recycle: Some(rec_tx),
+                join: Some(join),
+            },
+        }
+    }
+
+    pub fn next(&mut self) -> Option<BgrImage> {
+        match &mut self.inner {
+            PipedInner::Thread { rx, .. } => rx.recv().ok().flatten(),
+            PipedInner::Local { src, buf } => {
+                if src.read_into(buf).ok()? {
+                    let mut out = BgrImage::zeros(0, 0);
+                    std::mem::swap(&mut out, buf);
+                    Some(out)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    pub fn recycle(&mut self, buf: BgrImage) {
+        match &mut self.inner {
+            PipedInner::Thread { recycle, .. } => {
+                if let Some(tx) = recycle {
+                    let _ = tx.try_send(buf);
+                }
+            }
+            PipedInner::Local { buf: slot, .. } => {
+                *slot = buf;
+            }
+        }
+    }
+}
+
+impl Drop for PipedInput {
+    fn drop(&mut self) {
+        if let PipedInner::Thread { recycle, join, .. } = &mut self.inner {
+            recycle.take();
+            if let Some(h) = join.take() {
+                let _ = h.join();
+            }
+        }
+    }
 }

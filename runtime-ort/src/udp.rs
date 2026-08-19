@@ -22,6 +22,12 @@ pub struct FacePacket {
 
 pub fn encode_face(f: &FacePacket) -> Vec<u8> {
     let mut p = Vec::with_capacity(PACKET_FRAME_SIZE);
+    encode_face_append(&mut p, f);
+    debug_assert_eq!(p.len(), PACKET_FRAME_SIZE);
+    p
+}
+
+fn encode_face_append(p: &mut Vec<u8>, f: &FacePacket) {
     p.extend_from_slice(&f.time.to_le_bytes());
     p.extend_from_slice(&f.id.to_le_bytes());
     p.extend_from_slice(&f.width.to_le_bytes());
@@ -39,12 +45,13 @@ pub fn encode_face(f: &FacePacket) -> Vec<u8> {
     for v in f.translation {
         p.extend_from_slice(&v.to_le_bytes());
     }
-    let mut lms = f.lms.clone();
-    lms.resize(68, [0.0, 0.0, 0.0]);
-    for pt in &lms[..68] {
+    let zero = [0.0f32, 0.0, 0.0];
+    for i in 0..68 {
+        let pt = f.lms.get(i).unwrap_or(&zero);
         p.extend_from_slice(&pt[2].to_le_bytes());
     }
-    for pt in &lms[..68] {
+    for i in 0..68 {
+        let pt = f.lms.get(i).unwrap_or(&zero);
         p.extend_from_slice(&pt[1].to_le_bytes());
         p.extend_from_slice(&pt[0].to_le_bytes());
     }
@@ -56,16 +63,20 @@ pub fn encode_face(f: &FacePacket) -> Vec<u8> {
     for v in f.features {
         p.extend_from_slice(&v.to_le_bytes());
     }
-    debug_assert_eq!(p.len(), PACKET_FRAME_SIZE);
-    p
 }
 
 pub fn encode_faces(faces: &[FacePacket]) -> Vec<u8> {
     let mut out = Vec::with_capacity(PACKET_FRAME_SIZE * faces.len());
-    for f in faces {
-        out.extend_from_slice(&encode_face(f));
-    }
+    encode_faces_into(&mut out, faces);
     out
+}
+
+pub fn encode_faces_into(out: &mut Vec<u8>, faces: &[FacePacket]) {
+    out.clear();
+    out.reserve(PACKET_FRAME_SIZE * faces.len());
+    for f in faces {
+        encode_face_append(out, f);
+    }
 }
 
 #[cfg(test)]

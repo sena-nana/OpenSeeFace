@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use crate::decode::LmSpec;
-#[cfg(feature = "gpu")]
+#[cfg(all(feature = "gpu", not(target_os = "macos")))]
 use crate::decode::{decode_landmarks, detect_faces};
 use crate::enhance::EnhanceCfg;
 #[cfg(feature = "gpu")]
@@ -24,10 +24,12 @@ use crate::preprocess::crop_slice;
 #[cfg(all(feature = "gpu", target_os = "macos"))]
 use crate::preprocess::resize_bgr;
 use crate::preprocess::BgrImage;
+#[cfg(all(feature = "gpu", not(target_os = "macos")))]
+use crate::session::collect_f16;
 #[cfg(feature = "gpu")]
 use crate::session::Device;
 #[cfg(feature = "gpu")]
-use crate::session::{collect_f16, make_session, oe};
+use crate::session::{make_session, oe};
 #[cfg(feature = "gpu")]
 use anyhow::Context;
 use anyhow::{bail, Result};
@@ -39,8 +41,10 @@ use ort::memory::Allocator;
 use ort::session::IoBinding;
 #[cfg(feature = "gpu")]
 use ort::session::Session;
-#[cfg(feature = "gpu")]
+#[cfg(all(feature = "gpu", not(target_os = "macos")))]
 use ort::value::Tensor;
+#[cfg(all(feature = "gpu", target_os = "macos"))]
+use ort::value::TensorRef;
 #[cfg(all(feature = "gpu", not(target_os = "macos")))]
 use ort::value::ValueType;
 
@@ -210,25 +214,21 @@ impl CoreMlPipe {
         })
     }
 
-    fn pixels<'a>(&'a mut self, frame: &'a BgrImage) -> Result<&'a [u8]> {
-        self.enhance.run(frame)
-    }
-
     fn detect(&mut self, frame: &BgrImage) -> Result<Vec<[f32; 5]>> {
-        let bytes = self.pixels(frame)?;
+        let name = self.det_name.clone();
         let shape = [1i64, frame.height as i64, frame.width as i64, 3];
-        let t = Tensor::<u8>::from_array((shape.as_slice(), bytes.to_vec())).map_err(oe)?;
-        let outs = self
-            .det
-            .run(ort::inputs![self.det_name.as_str() => t])
-            .map_err(oe)?;
-        let got = collect_f16(&outs)?;
-        Ok(detect_faces(
-            &got[0],
-            &got[1],
+        let bytes = self.enhance.run(frame)?;
+        let t = TensorRef::from_array_view((shape.as_slice(), bytes)).map_err(oe)?;
+        let outs = self.det.run(ort::inputs![name.as_str() => t]).map_err(oe)?;
+        let a = crate::session::output_f16(&outs, 0)?;
+        let b = crate::session::output_f16(&outs, 1)?;
+        Ok(crate::decode::detect_faces_data(
+            a,
+            b,
             frame.width,
             frame.height,
             0.6,
+            1,
         ))
     }
 
@@ -241,7 +241,8 @@ impl CoreMlPipe {
         pad_y: f32,
     ) -> Result<(f32, Vec<[f32; 3]>)> {
         let (x1, y1, x2, y2) = crop_box_pad(frame, det, pad_x, pad_y);
-        let bytes = self.pixels(frame)?;
+        let name = self.lm_name.clone();
+        let bytes = self.enhance.run(frame)?;
         let crop = crop_slice(bytes, frame.width, frame.height, x1, y1, x2, y2);
         if crop.width < 4 || crop.height < 4 {
             bail!("crop too small");
@@ -252,16 +253,14 @@ impl CoreMlPipe {
             resize_bgr(&crop, spec.size, spec.size)
         };
         let shape = [1i64, sized.height as i64, sized.width as i64, 3];
-        let t = Tensor::<u8>::from_array((shape.as_slice(), sized.data)).map_err(oe)?;
-        let outs = self
-            .lm
-            .run(ort::inputs![self.lm_name.as_str() => t])
-            .map_err(oe)?;
-        let got = collect_f16(&outs)?;
+        let t =
+            TensorRef::from_array_view((shape.as_slice(), sized.data.as_slice())).map_err(oe)?;
+        let outs = self.lm.run(ort::inputs![name.as_str() => t]).map_err(oe)?;
+        let data = crate::session::output_f16(&outs, 0)?;
         let scale_x = (x2 - x1) as f32 / spec.size as f32;
         let scale_y = (y2 - y1) as f32 / spec.size as f32;
-        Ok(decode_landmarks(
-            &got[0],
+        Ok(crate::decode::decode_landmarks_data(
+            data,
             [x1 as f32, y1 as f32, scale_x, scale_y],
             spec,
         ))
@@ -273,6 +272,7 @@ struct CudaPipe {
     w: u32,
     h: u32,
     frame: Tensor<u8>,
+    uploaded_ptr: usize,
     pre_det: Session,
     pre_det_name: String,
     det: Session,
@@ -378,6 +378,7 @@ impl CudaPipe {
             w: frame.width,
             h: frame.height,
             frame: frame_t,
+            uploaded_ptr: frame.data.as_ptr() as usize,
             pre_det_name: in_name(&pre_det),
             pre_det,
             det_in: in_name(&det),
@@ -399,12 +400,17 @@ impl CudaPipe {
         })
     }
 
-    fn upload_frame(&mut self, frame: &BgrImage) -> Result<()> {
+    fn upload_frame(&mut self, frame: &BgrImage, force: bool) -> Result<()> {
         if frame.width != self.w || frame.height != self.h {
             bail!("frame size changed");
         }
+        let key = frame.data.as_ptr() as usize;
+        if !force && key == self.uploaded_ptr {
+            return Ok(());
+        }
         let (_, buf) = self.frame.extract_tensor_mut();
         buf.copy_from_slice(&frame.data);
+        self.uploaded_ptr = key;
         self.enhanced = false;
         Ok(())
     }
@@ -443,7 +449,7 @@ impl CudaPipe {
     }
 
     fn detect(&mut self, frame: &BgrImage) -> Result<Vec<[f32; 5]>> {
-        self.upload_frame(frame)?;
+        self.upload_frame(frame, true)?;
         self.ensure_enhanced()?;
         let mut pre_bind = self.pre_det.create_binding().map_err(oe)?;
         pre_bind
@@ -479,7 +485,7 @@ impl CudaPipe {
         pad_x: f32,
         pad_y: f32,
     ) -> Result<(f32, Vec<[f32; 3]>)> {
-        self.upload_frame(frame)?;
+        self.upload_frame(frame, false)?;
         self.ensure_enhanced()?;
         let (x1, y1, x2, y2) = crop_box_pad(frame, det, pad_x, pad_y);
         if x2 - x1 < 4 || y2 - y1 < 4 {
@@ -493,8 +499,8 @@ impl CudaPipe {
             let (_, e) = self.ends.extract_tensor_mut();
             e.copy_from_slice(&[1, y2 as i64, x2 as i64, 3]);
         }
-        let mut pre_bind = self.pre_lm.create_binding().map_err(oe)?;
         let names = self.pre_lm_names.clone();
+        let mut pre_bind = self.pre_lm.create_binding().map_err(oe)?;
         for n in &names {
             match n.as_str() {
                 "starts" => pre_bind.bind_input(n.clone(), &self.starts).map_err(oe)?,

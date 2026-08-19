@@ -5,13 +5,13 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 use crate::crop::{stable_landmark_bbox, CropSmoothState};
-use crate::decode::{decode_landmarks, detect_faces_n, LmSpec};
+use crate::decode::{decode_landmarks_data, detect_faces_data, LmSpec};
 use crate::features::FeatureExtractor;
 use crate::filter::{FilterCfg, FilterKind, FilterQuality, OutputFilter};
 use crate::gaze::get_eye_state;
 use crate::geom::{clamp_to_im, group_rects};
 use crate::pnp::{adjust_3d, estimate_depth, Camera, CONTOUR_PTS, CONTOUR_PTS_T, FACE_3D};
-use crate::preprocess::{crop_img, imagenet_nchw, BgrImage};
+use crate::preprocess::{imagenet_nchw_into, imagenet_nchw_roi_into, BgrImage};
 use crate::retinaface::RetinaFace;
 use crate::session::OrtModel;
 
@@ -114,6 +114,18 @@ impl FaceInfo {
             .iter()
             .map(|&i| self.face_3d[i])
             .collect();
+    }
+
+    fn snapshot_output(&self) -> Self {
+        let mut o = self.clone();
+        o.update_counts = [[0.0; 2]; 66];
+        o.features = FeatureExtractor::new(0.0);
+        o.crop_smooth = CropSmoothState::default();
+        o.output_filter = OutputFilter::new(FilterCfg {
+            kind: FilterKind::None,
+            ..FilterCfg::default()
+        });
+        o
     }
 
     fn reset(&mut self, model_type: i32, max_feature_updates: f32) {
@@ -359,24 +371,24 @@ impl Tracker {
     }
 
     fn detect_heatmap(&mut self, frame: &BgrImage) -> Vec<[f32; 4]> {
-        let im = imagenet_nchw(frame, 224);
-        let Ok(out) = self.det.run(&im) else {
+        let shape = [1i64, 3, 224, 224];
+        let w = frame.width;
+        let h = frame.height;
+        let thresh = self.detection_threshold;
+        let max_faces = self.max_faces;
+        let Ok(dets) = self.det.run_prep(
+            &shape,
+            |buf| imagenet_nchw_into(frame, 224, buf),
+            |outs| {
+                if outs.len() < 2 {
+                    return Ok(Vec::new());
+                }
+                Ok(detect_faces_data(outs[0], outs[1], w, h, thresh, max_faces))
+            },
+        ) else {
             return Vec::new();
         };
-        if out.len() < 2 {
-            return Vec::new();
-        }
-        detect_faces_n(
-            &out[0],
-            &out[1],
-            frame.width,
-            frame.height,
-            self.detection_threshold,
-            self.max_faces,
-        )
-        .into_iter()
-        .map(|d| [d[0], d[1], d[2], d[3]])
-        .collect()
+        dets.into_iter().map(|d| [d[0], d[1], d[2], d[3]]).collect()
     }
 
     fn assign_face_info(&mut self, results: Vec<(f32, Vec<[f32; 3]>, [[f32; 4]; 2], f32)>) {
@@ -518,18 +530,29 @@ impl Tracker {
             }
             let scale_x = (x2 - x1) as f32 / res;
             let scale_y = (y2 - y1) as f32 / res;
-            let crop = crop_img(frame, x1, y1, x2, y2);
-            let tensor = imagenet_nchw(&crop, self.spec.size);
             let bonus = if j >= bonus_cutoff { 0.0 } else { 0.1 };
-            crops.push((tensor, [x1 as f32, y1 as f32, scale_x, scale_y], bonus));
+            crops.push((
+                [x1 as f32, y1 as f32, scale_x, scale_y],
+                bonus,
+                x1,
+                y1,
+                x2,
+                y2,
+            ));
         }
 
         let mut raw = Vec::new();
-        for (tensor, crop, bonus) in &crops {
-            let Ok(out) = self.lm.run(tensor) else {
+        let spec = self.spec;
+        let size = spec.size;
+        let shape = [1i64, 3, size as i64, size as i64];
+        for (crop, bonus, x1, y1, x2, y2) in &crops {
+            let Ok((conf, lms)) = self.lm.run_prep(
+                &shape,
+                |buf| imagenet_nchw_roi_into(frame, *x1, *y1, *x2, *y2, size, buf),
+                |outs| Ok(decode_landmarks_data(outs[0], *crop, spec)),
+            ) else {
                 continue;
             };
-            let (conf, lms) = decode_landmarks(&out[0], *crop, self.spec);
             let (conf, lms) = self.remap_lms(conf, lms);
             if conf <= self.threshold {
                 continue;
@@ -664,7 +687,7 @@ impl Tracker {
                 .or_else(|| fi.crop_smooth.last_box())
                 .unwrap_or([0.0, 0.0, 1.0, 1.0]);
             detected.push(next);
-            let mut out = fi.clone();
+            let mut out = fi.snapshot_output();
             fi.output_filter.apply(
                 &mut out.euler,
                 &mut out.translation,

@@ -219,18 +219,15 @@ impl OrtModel {
         Ok(specs)
     }
 
-    fn bind(&mut self, input: &TensorF16) -> Result<()> {
-        if self
-            .bound
-            .as_ref()
-            .is_some_and(|b| b.input_shape == input.shape)
-        {
-            return self.write_input(input);
+    fn ensure_bound(&mut self, shape: &[i64]) -> Result<()> {
+        if self.bound.as_ref().is_some_and(|b| b.input_shape == shape) {
+            return Ok(());
         }
-        let batch = input.shape.first().copied().unwrap_or(1);
+        let batch = shape.first().copied().unwrap_or(1);
         let mut specs = self.output_specs(batch)?;
         if specs.iter().any(|(_, s)| s.iter().any(|d| *d <= 0)) {
-            let probe = self.run_unbound(input)?;
+            let dummy = TensorF16::zeros(shape.to_vec());
+            let probe = self.run_unbound(&dummy)?;
             specs = self
                 .session
                 .outputs()
@@ -240,34 +237,30 @@ impl OrtModel {
                 .collect();
         }
         let (in_alloc, out_alloc) = self.allocs()?;
-        let mut input_t = Tensor::<f16>::new(&in_alloc, input.shape.clone()).map_err(oe)?;
-        {
-            let (_, buf) = input_t.extract_tensor_mut();
-            buf.copy_from_slice(&input.data);
-        }
+        let input_t = Tensor::<f16>::new(&in_alloc, shape).map_err(oe)?;
         let mut binding = self.session.create_binding().map_err(oe)?;
         binding
             .bind_input(self.input_name.clone(), &input_t)
             .map_err(oe)?;
-        for (name, shape) in specs {
+        for (name, out_shape) in specs {
             binding
-                .bind_output(name, Tensor::<f16>::new(&out_alloc, shape).map_err(oe)?)
+                .bind_output(name, Tensor::<f16>::new(&out_alloc, out_shape).map_err(oe)?)
                 .map_err(oe)?;
         }
         self.bound = Some(BoundIo {
             binding,
             input: input_t,
-            input_shape: input.shape.clone(),
+            input_shape: shape.to_vec(),
         });
         Ok(())
     }
 
-    fn write_input(&mut self, input: &TensorF16) -> Result<()> {
+    fn refill_input(&mut self, prep: impl FnOnce(&mut [f16])) -> Result<()> {
         let name = self.input_name.clone();
         let bound = self.bound.as_mut().context("unbound")?;
         {
             let (_, buf) = bound.input.extract_tensor_mut();
-            buf.copy_from_slice(&input.data);
+            prep(buf);
         }
         bound.binding.bind_input(name, &bound.input).map_err(oe)
     }
@@ -292,12 +285,30 @@ impl OrtModel {
         unsafe { ort::Error::result_from_status(status) }.map_err(oe)
     }
 
+    /// Write preprocess into the bound input, run, then decode from output slices.
+    pub fn run_prep<R>(
+        &mut self,
+        shape: &[i64],
+        prep: impl FnOnce(&mut [f16]),
+        then: impl FnOnce(&[&[f16]]) -> Result<R>,
+    ) -> Result<R> {
+        self.ensure_bound(shape)?;
+        self.refill_input(prep)?;
+        let OrtModel { session, bound, .. } = self;
+        let outs = session
+            .run_binding(&bound.as_ref().context("unbound")?.binding)
+            .map_err(oe)?;
+        let result = decode_outputs(&outs, then)?;
+        Ok(result)
+    }
+
     pub fn run(&mut self, input: &TensorF16) -> Result<Vec<TensorF16>> {
-        self.bind(input)?;
+        self.ensure_bound(&input.shape)?;
+        self.refill_input(|buf| buf.copy_from_slice(&input.data))?;
         let OrtModel { session, bound, .. } = self;
         collect_f16(
             &session
-                .run_binding(&bound.as_ref().unwrap().binding)
+                .run_binding(&bound.as_ref().context("unbound")?.binding)
                 .map_err(oe)?,
         )
     }
@@ -316,4 +327,24 @@ pub(crate) fn collect_f16(outputs: &ort::session::SessionOutputs<'_>) -> Result<
         bail!("empty model output");
     }
     Ok(out)
+}
+
+pub(crate) fn output_f16<'s>(
+    outputs: &'s ort::session::SessionOutputs<'_>,
+    i: usize,
+) -> Result<&'s [f16]> {
+    let (_, data) = outputs[i].try_extract_tensor::<f16>().map_err(oe)?;
+    Ok(data)
+}
+
+fn decode_outputs<R>(
+    outs: &ort::session::SessionOutputs<'_>,
+    then: impl FnOnce(&[&[f16]]) -> Result<R>,
+) -> Result<R> {
+    let a = output_f16(outs, 0)?;
+    if outs.len() == 1 {
+        return then(&[a]);
+    }
+    let b = output_f16(outs, 1)?;
+    then(&[a, b])
 }

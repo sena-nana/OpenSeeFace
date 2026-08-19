@@ -7,12 +7,12 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use clap::Parser;
 use osf_ort::{
-    center_2x, cosine, crop_box, crop_box_pad, crop_img, decode_landmarks, det_window,
-    detect_faces, enhance_bgr, face_crop, imagenet_nchw, iou, max_abs, mean_abs, mean_conf,
-    model_path, nme, paste_bgr, pick_lm, read_f32_le, resize_bgr, retina_nchw, rss, synth_canvas,
-    unwrap_deg, xywh_iou, AdaptiveCfg, AdaptiveState, BgrImage, CropTrack, DetWindow, Device,
-    EnhanceCfg, FilterCfg, FilterKind, FilterQuality, GpuTracker, Latency, LmSpec, OrtModel,
-    OutputFilter, TensorF16, Tracker, TrackerConfig, EYE_IDX, FAST_LM, VERSION,
+    center_2x, cosine, crop_box, crop_box_pad, crop_img, det_window, detect_faces, enhance_bgr,
+    face_crop, imagenet_nchw, iou, max_abs, mean_abs, mean_conf, model_path, nme, paste_bgr,
+    pick_lm, read_f32_le, resize_bgr, retina_nchw, rss, synth_canvas, unwrap_deg, xywh_iou,
+    AdaptiveCfg, AdaptiveState, BgrImage, CropTrack, DetWindow, Device, EnhanceCfg, FilterCfg,
+    FilterKind, FilterQuality, GpuTracker, Latency, LmSpec, OrtModel, OutputFilter, TensorF16,
+    Tracker, TrackerConfig, EYE_IDX, FAST_LM, VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -826,30 +826,23 @@ fn run_landmarks(
     if x2 - x1 < 4 || y2 - y1 < 4 {
         anyhow::bail!("crop too small");
     }
-    let crop = crop_img(frame, x1, y1, x2, y2);
-    let lin = imagenet_nchw(&crop, spec.size);
+    let crop = [
+        x1 as f32,
+        y1 as f32,
+        (x2 - x1) as f32 / spec.size as f32,
+        (y2 - y1) as f32 / spec.size as f32,
+    ];
     let pre_ms = t.elapsed().as_secs_f64() * 1000.0;
     let t = Instant::now();
-    let out = lm.run(&lin)?;
+    let size = spec.size;
+    let shape = [1i64, 3, size as i64, size as i64];
+    let decoded = lm.run_prep(
+        &shape,
+        |buf| osf_ort::imagenet_nchw_roi_into(frame, x1, y1, x2, y2, size, buf),
+        |outs| Ok(osf_ort::decode_landmarks_data(outs[0], crop, spec)),
+    )?;
     let lm_ms = t.elapsed().as_secs_f64() * 1000.0;
-    let t = Instant::now();
-    let decoded = decode_landmarks(
-        &out[0],
-        [
-            x1 as f32,
-            y1 as f32,
-            (x2 - x1) as f32 / spec.size as f32,
-            (y2 - y1) as f32 / spec.size as f32,
-        ],
-        spec,
-    );
-    Ok((
-        decoded.0,
-        decoded.1,
-        pre_ms,
-        lm_ms,
-        t.elapsed().as_secs_f64() * 1000.0,
-    ))
+    Ok((decoded.0, decoded.1, pre_ms, lm_ms, 0.0))
 }
 
 fn lat(warmup: u32, rows: &[Row], f: impl Fn(&Row) -> f64) -> Latency {

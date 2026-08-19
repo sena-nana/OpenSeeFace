@@ -1,9 +1,10 @@
 //! Gaze / pupil from `mnv3_gaze32_split_opt.onnx`.
 
 use anyhow::Result;
+use half::f16;
 
 use crate::geom::{clamp_to_im, compensate, logit, rotate};
-use crate::preprocess::{crop_img, imagenet_nchw, resize_bgr, BgrImage};
+use crate::preprocess::{crop_img, imagenet_nchw_into, BgrImage};
 use crate::session::OrtModel;
 
 fn extract_face(frame: &BgrImage, lms: &[[f32; 3]]) -> (BgrImage, Vec<[f32; 2]>, [f32; 2]) {
@@ -44,12 +45,14 @@ fn extract_face(frame: &BgrImage, lms: &[[f32; 3]]) -> (BgrImage, Vec<[f32; 2]>,
 }
 
 struct EyePrep {
-    tensor: crate::decode::TensorF16,
     x1: f32,
     y1: f32,
+    w: u32,
+    h: u32,
     scale: [f32; 2],
     reference: [f32; 2],
     angle: f32,
+    flip: bool,
 }
 
 fn prepare_eye(face: &BgrImage, corners: [[f32; 2]; 2], flip: bool) -> Option<EyePrep> {
@@ -66,25 +69,42 @@ fn prepare_eye(face: &BgrImage, corners: [[f32; 2]; 2], flip: bool) -> Option<Ey
     if x2 <= x1 || y2 <= y1 {
         return None;
     }
-    let rotated = face.rotate_about(a, (c1[0], c1[1]));
-    let mut im = crop_img(&rotated, x1, y1, x2, y2);
-    if im.width < 2 || im.height < 2 {
-        return None;
-    }
-    if flip {
-        im = im.flip_h();
-    }
-    let scale = [(x2 - x1) as f32 / 32.0, (y2 - y1) as f32 / 32.0];
-    im = resize_bgr(&im, 32, 32);
-    let tensor = imagenet_nchw(&im, 32);
     Some(EyePrep {
-        tensor,
         x1: x1 as f32,
         y1: y1 as f32,
-        scale,
+        w: (x2 - x1) as u32,
+        h: (y2 - y1) as u32,
+        scale: [(x2 - x1) as f32 / 32.0, (y2 - y1) as f32 / 32.0],
         reference: c1,
         angle: a,
+        flip,
     })
+}
+
+/// Inverse of `rotate_about` over the eye box only, then ImageNet NCHW at 32×32.
+fn eye_nchw_into(face: &BgrImage, p: &EyePrep, dst: &mut [f16]) {
+    let (cw, ch) = (p.w, p.h);
+    if cw < 2 || ch < 2 {
+        dst.fill(f16::ZERO);
+        return;
+    }
+    let (cos, sin) = (p.angle.cos(), p.angle.sin());
+    let (cx, cy) = (p.reference[0], p.reference[1]);
+    let (ix1, iy1) = (p.x1 as i32, p.y1 as i32);
+    let mut crop = BgrImage::zeros(cw, ch);
+    for y in 0..ch as i32 {
+        for x in 0..cw as i32 {
+            let dx = (ix1 + x) as f32 - cx;
+            let dy = (iy1 + y) as f32 - cy;
+            let pix = face.sample(cos * dx + sin * dy + cx, -sin * dx + cos * dy + cy);
+            let i = ((y as u32 * cw + x as u32) * 3) as usize;
+            crop.data[i..i + 3].copy_from_slice(&pix);
+        }
+    }
+    if p.flip {
+        crop.flip_h_in_place();
+    }
+    imagenet_nchw_into(&crop, 32, dst);
 }
 
 /// Returns `[open, row, col, conf]` per eye (right, left), matching Python `eye_state`.
@@ -107,22 +127,35 @@ pub fn get_eye_state(
     let (Some(right), Some(left)) = (right, left) else {
         return Ok(dummy);
     };
-    let mut both = right.tensor.clone();
-    both.shape[0] = 2;
-    both.data.extend_from_slice(&left.tensor.data);
-    let out = match gaze.run(&both) {
-        Ok(o) => o,
-        Err(_) => return Ok(dummy),
-    };
-    let data = out[0].to_f32();
+    let plane = 3 * 32 * 32;
+    Ok(gaze
+        .run_prep(
+            &[2, 3, 32, 32],
+            |buf| {
+                let n = plane.min(buf.len() / 2);
+                eye_nchw_into(&face, &right, &mut buf[..n]);
+                eye_nchw_into(&face, &left, &mut buf[n..n + n]);
+            },
+            |outs| Ok(decode_eyes(outs[0], &right, &left, offset, dummy)),
+        )
+        .unwrap_or(dummy))
+}
+
+fn decode_eyes(
+    raw: &[f16],
+    right: &EyePrep,
+    left: &EyePrep,
+    offset: [f32; 2],
+    dummy: [[f32; 4]; 2],
+) -> [[f32; 4]; 2] {
+    let data: Vec<f32> = raw.iter().map(|x| x.to_f32()).collect();
     let cells = 8 * 8;
     let per_eye = 3 * cells;
     let mut state = dummy;
-    let preps = [&right, &left];
+    let preps = [right, left];
     for i in 0..2 {
         let base = i * per_eye;
         if base + per_eye > data.len() {
-            // maybe [2,3,8,8]
             let n = data.len() / 2;
             let ebase = i * n;
             if ebase + 3 * cells > data.len() {
@@ -156,5 +189,5 @@ pub fn get_eye_state(
             state[i] = [1.0, 0.0, 0.0, 0.0];
         }
     }
-    Ok(state)
+    state
 }

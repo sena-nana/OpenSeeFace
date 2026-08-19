@@ -107,10 +107,21 @@ pub fn detect_faces_n(
     thresh: f32,
     max_faces: usize,
 ) -> Vec<[f32; 5]> {
+    detect_faces_data(&outputs.data, &maxpool.data, fw, fh, thresh, max_faces)
+}
+
+pub(crate) fn detect_faces_data(
+    outputs: &[f16],
+    maxpool: &[f16],
+    fw: u32,
+    fh: u32,
+    thresh: f32,
+    max_faces: usize,
+) -> Vec<[f32; 5]> {
     let plane = 56 * 56;
-    let mut heat: Vec<f32> = outputs.data[..plane].iter().map(|x| x.to_f32()).collect();
+    let mut heat: Vec<f32> = outputs[..plane].iter().map(|x| x.to_f32()).collect();
     for i in 0..plane {
-        if (heat[i] - maxpool.data[i].to_f32()).abs() > 1e-6 {
+        if (heat[i] - maxpool[i].to_f32()).abs() > 1e-6 {
             heat[i] = 0.0;
         }
     }
@@ -129,7 +140,7 @@ pub fn detect_faces_n(
         }
         let y = (i / 56) as f32;
         let x = (i % 56) as f32;
-        let r = outputs.data[plane + i].to_f32() * 112.0;
+        let r = outputs[plane + i].to_f32() * 112.0;
         dets.push([
             (x * 4.0 - r) * sx,
             (y * 4.0 - r) * sy,
@@ -142,10 +153,13 @@ pub fn detect_faces_n(
 }
 
 pub fn decode_landmarks(t: &TensorF16, crop: [f32; 4], spec: LmSpec) -> (f32, Vec<[f32; 3]>) {
+    decode_landmarks_data(&t.data, crop, spec)
+}
+
+pub fn decode_landmarks_data(data: &[f16], crop: [f32; 4], spec: LmSpec) -> (f32, Vec<[f32; 3]>) {
     let c0 = spec.points;
     let g = spec.grid() as usize;
     let cells = g * g;
-    let data = &t.data;
     let res = spec.size as f32 - 1.0;
     let mut pts = Vec::with_capacity(c0);
     let mut sum = 0.0f32;
