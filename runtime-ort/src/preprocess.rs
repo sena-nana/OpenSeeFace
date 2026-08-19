@@ -227,18 +227,9 @@ fn apply_lut_roi(
     norm: &ColorNorm,
     data: &mut [f16],
 ) {
-    let n = (cw * ch) as usize;
-    let src = norm.src;
-    let lut = &norm.lut;
-    for y in 0..ch {
-        for x in 0..cw {
-            let p = (((y0 + y) * src_w + (x0 + x)) * 3) as usize;
-            let o = (y * cw + x) as usize;
-            data[o] = lut[0][src_bgr[p + src[0]] as usize];
-            data[n + o] = lut[1][src_bgr[p + src[1]] as usize];
-            data[2 * n + o] = lut[2][src_bgr[p + src[2]] as usize];
-        }
-    }
+    crate::simd::apply_affine_roi(
+        src_bgr, src_w, x0, y0, cw, ch, norm.src, norm.scale, norm.bias, data,
+    );
 }
 
 fn bilinear_nchw(
@@ -253,43 +244,9 @@ fn bilinear_nchw(
     norm: &ColorNorm,
     data: &mut [f16],
 ) {
-    let n = (dst_w * dst_h) as usize;
-    let src = norm.src;
-    let lut = &norm.lut;
-    let fx = cw as f32 / dst_w as f32;
-    let fy = ch as f32 / dst_h as f32;
-    let last_x = cw - 1;
-    let last_y = ch - 1;
-    for y in 0..dst_h {
-        let sy = (y as f32 + 0.5) * fy - 0.5;
-        let iy0 = sy.floor().clamp(0.0, last_y as f32) as u32;
-        let iy1 = (iy0 + 1).min(last_y);
-        let wy = (sy - iy0 as f32).clamp(0.0, 1.0);
-        let gy0 = y0 + iy0;
-        let gy1 = y0 + iy1;
-        for x in 0..dst_w {
-            let sx = (x as f32 + 0.5) * fx - 0.5;
-            let ix0 = sx.floor().clamp(0.0, last_x as f32) as u32;
-            let ix1 = (ix0 + 1).min(last_x);
-            let wx = (sx - ix0 as f32).clamp(0.0, 1.0);
-            let gx0 = x0 + ix0;
-            let gx1 = x0 + ix1;
-            let i00 = ((gy0 * src_w + gx0) * 3) as usize;
-            let i10 = ((gy0 * src_w + gx1) * 3) as usize;
-            let i01 = ((gy1 * src_w + gx0) * 3) as usize;
-            let i11 = ((gy1 * src_w + gx1) * 3) as usize;
-            let o = (y * dst_w + x) as usize;
-            for c in 0..3 {
-                let s = src[c];
-                let v = src_bgr[i00 + s] as f32 * (1.0 - wx) * (1.0 - wy)
-                    + src_bgr[i10 + s] as f32 * wx * (1.0 - wy)
-                    + src_bgr[i01 + s] as f32 * (1.0 - wx) * wy
-                    + src_bgr[i11 + s] as f32 * wx * wy;
-                let u = v.round().clamp(0.0, 255.0) as u8 as usize;
-                data[c * n + o] = lut[c][u];
-            }
-        }
-    }
+    crate::simd::bilinear_nchw(
+        src_bgr, src_w, x0, y0, cw, ch, dst_w, dst_h, norm.src, norm.scale, norm.bias, data,
+    );
 }
 
 fn clamp_roi(bgr: &BgrImage, x1: i32, y1: i32, x2: i32, y2: i32) -> (u32, u32, u32, u32) {
@@ -432,34 +389,7 @@ pub(crate) fn resize_roi_into(
         }
         return;
     }
-    let fx = cw as f32 / dw as f32;
-    let fy = ch as f32 / dh as f32;
-    let y_max = (ch - 1) as f32;
-    let x_max = (cw - 1) as f32;
-    for y in 0..dh {
-        let sy = (y as f32 + 0.5) * fy - 0.5;
-        let y0 = sy.floor().clamp(0.0, y_max) as u32;
-        let y1s = (y0 + 1).min(ch - 1);
-        let wy = (sy - y0 as f32).clamp(0.0, 1.0);
-        for x in 0..dw {
-            let sx = (x as f32 + 0.5) * fx - 0.5;
-            let x0 = sx.floor().clamp(0.0, x_max) as u32;
-            let x1s = (x0 + 1).min(cw - 1);
-            let wx = (sx - x0 as f32).clamp(0.0, 1.0);
-            let i00 = (((y1 + y0) * width + x1 + x0) * 3) as usize;
-            let i10 = (((y1 + y0) * width + x1 + x1s) * 3) as usize;
-            let i01 = (((y1 + y1s) * width + x1 + x0) * 3) as usize;
-            let i11 = (((y1 + y1s) * width + x1 + x1s) * 3) as usize;
-            let o = ((y * dw + x) * 3) as usize;
-            for c in 0..3 {
-                let v = src[i00 + c] as f32 * (1.0 - wx) * (1.0 - wy)
-                    + src[i10 + c] as f32 * wx * (1.0 - wy)
-                    + src[i01 + c] as f32 * (1.0 - wx) * wy
-                    + src[i11 + c] as f32 * wx * wy;
-                dst[o + c] = v.round().clamp(0.0, 255.0) as u8;
-            }
-        }
-    }
+    crate::simd::resize_bilinear(src, width, x1, y1, cw, ch, dw, dh, dst);
 }
 
 /// Padded detection crop, matching `benchmarks/scenarios.py` `face_crop`.
@@ -536,9 +466,7 @@ pub(crate) fn retina_nchw_into(bgr: &BgrImage, dst: &mut [f16]) {
 
 /// In-place RGB→BGR swizzle of packed 8-bit pixels.
 pub(crate) fn rgb_to_bgr_in_place(data: &mut [u8]) {
-    for px in data.chunks_exact_mut(3) {
-        px.swap(0, 2);
-    }
+    crate::simd::rgb_to_bgr_in_place(data);
 }
 
 /// Padded face crop in image coordinates, matching the Python tracker.

@@ -137,11 +137,7 @@ pub fn enhance_bgr_in_place(img: &mut BgrImage, cfg: &EnhanceCfg) {
         return;
     }
     if cfg.blend < 1.0 {
-        let a = cfg.blend.clamp(0.0, 1.0);
-        let b = 1.0 - a;
-        for (o, s) in img.data.iter_mut().zip(orig.iter()) {
-            *o = clamp_u8(*o as f32 * a + *s as f32 * b);
-        }
+        crate::simd::blend_u8(&mut img.data, &orig, cfg.blend.clamp(0.0, 1.0));
     }
 }
 
@@ -292,64 +288,11 @@ fn policy(kind: SceneKind) -> EnhanceCfg {
 }
 
 fn box3_bgr(data: &mut [u8], width: u32, height: u32) {
-    if width < 2 || height < 2 {
-        return;
-    }
-    let src = data.to_vec();
-    let w = width as i32;
-    let h = height as i32;
-    for y in 0..h {
-        for x in 0..w {
-            let mut b = 0u32;
-            let mut g = 0u32;
-            let mut r = 0u32;
-            let mut n = 0u32;
-            for dy in -1..=1 {
-                let yy = (y + dy).clamp(0, h - 1) as u32;
-                for dx in -1..=1 {
-                    let xx = (x + dx).clamp(0, w - 1) as u32;
-                    let i = ((yy * width + xx) * 3) as usize;
-                    b += src[i] as u32;
-                    g += src[i + 1] as u32;
-                    r += src[i + 2] as u32;
-                    n += 1;
-                }
-            }
-            let o = ((y as u32 * width + x as u32) * 3) as usize;
-            data[o] = (b / n) as u8;
-            data[o + 1] = (g / n) as u8;
-            data[o + 2] = (r / n) as u8;
-        }
-    }
+    crate::simd::box3_bgr(data, width, height);
 }
 
 fn gray_world(bgr: &mut [u8]) {
-    let n = bgr.len() / 3;
-    if n == 0 {
-        return;
-    }
-    let mut sb = 0.0f64;
-    let mut sg = 0.0f64;
-    let mut sr = 0.0f64;
-    for p in bgr.chunks_exact(3) {
-        sb += p[0] as f64;
-        sg += p[1] as f64;
-        sr += p[2] as f64;
-    }
-    let inv = 1.0 / n as f64;
-    let mb = (sb * inv) as f32;
-    let mg = (sg * inv) as f32;
-    let mr = (sr * inv) as f32;
-    let gray = (mb + mg + mr) / 3.0;
-    let gain = |m: f32| gray / m.max(1e-3);
-    let gb = gain(mb);
-    let gg = gain(mg);
-    let gr = gain(mr);
-    for p in bgr.chunks_exact_mut(3) {
-        p[0] = clamp_u8(p[0] as f32 * gb);
-        p[1] = clamp_u8(p[1] as f32 * gg);
-        p[2] = clamp_u8(p[2] as f32 * gr);
-    }
+    crate::simd::gray_world(bgr);
 }
 
 pub(crate) fn tile_grid(width: u32, height: u32, tiles: u32) -> (u32, u32, u32, u32) {
@@ -453,65 +396,9 @@ pub(crate) fn clahe_luts(
     (tx, ty, tw, th, luts)
 }
 
-fn map_y(
-    luts: &[[u8; HIST]],
-    tx: u32,
-    ty: u32,
-    tw: u32,
-    th: u32,
-    x: u32,
-    y: u32,
-    bin: usize,
-) -> f32 {
-    let fx = x as f32 / tw as f32 - 0.5;
-    let fy = y as f32 / th as f32 - 0.5;
-    let tx1 = fx.floor() as i32;
-    let ty1 = fy.floor() as i32;
-    let wx = fx - tx1 as f32;
-    let wy = fy - ty1 as f32;
-    let clamp_t = |t: i32, n: u32| t.clamp(0, n as i32 - 1) as u32;
-    let xa = clamp_t(tx1, tx);
-    let xb = clamp_t(tx1 + 1, tx);
-    let ya = clamp_t(ty1, ty);
-    let yb = clamp_t(ty1 + 1, ty);
-    let lut = |txx: u32, tyy: u32| luts[(tyy * tx + txx) as usize][bin] as f32;
-    lut(xa, ya) * (1.0 - wy) * (1.0 - wx)
-        + lut(xb, ya) * (1.0 - wy) * wx
-        + lut(xa, yb) * wy * (1.0 - wx)
-        + lut(xb, yb) * wy * wx
-}
-
-fn yuv_from_bgr(b: f32, g: f32, r: f32) -> (f32, f32, f32) {
-    let y = 0.114 * b + 0.587 * g + 0.299 * r;
-    let cb = 128.0 - 0.168736 * r - 0.331264 * g + 0.5 * b;
-    let cr = 128.0 + 0.5 * r - 0.418688 * g - 0.081312 * b;
-    (y, cb, cr)
-}
-
-fn bgr_from_yuv(y: f32, cb: f32, cr: f32) -> (f32, f32, f32) {
-    let b = y + 1.772 * (cb - 128.0);
-    let g = y - 0.344136 * (cb - 128.0) - 0.714136 * (cr - 128.0);
-    let r = y + 1.402 * (cr - 128.0);
-    (b, g, r)
-}
-
 fn clahe_y(bgr: &mut [u8], width: u32, height: u32, cfg: &EnhanceCfg) {
     let (tx, ty, tw, th, luts) = clahe_luts(bgr, width, height, cfg);
-    for y in 0..height {
-        for x in 0..width {
-            let i = ((y * width + x) * 3) as usize;
-            let b = bgr[i] as f32;
-            let g = bgr[i + 1] as f32;
-            let r = bgr[i + 2] as f32;
-            let (yv, cb, cr) = yuv_from_bgr(b, g, r);
-            let bin = yv.round().clamp(0.0, 255.0) as usize;
-            let y2 = map_y(&luts, tx, ty, tw, th, x, y, bin);
-            let (b2, g2, r2) = bgr_from_yuv(y2, cb, cr);
-            bgr[i] = clamp_u8(b2);
-            bgr[i + 1] = clamp_u8(g2);
-            bgr[i + 2] = clamp_u8(r2);
-        }
-    }
+    crate::simd::clahe_remap(bgr, width, height, tx, ty, tw, th, &luts);
 }
 
 #[cfg(test)]

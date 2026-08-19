@@ -8,12 +8,12 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use osf_ort::{
     center_2x, cosine, crop_box, crop_box_pad, crop_img, det_window, detect_faces, ear_2d,
-    enhance_bgr, face_crop, imagenet_nchw, iou, max_abs, mean_abs,
-    mean_conf, model_path, nme, paint_synthetic_glasses, paste_bgr, pick_lm, read_f32_le, resize_bgr,
-    retina_nchw, rss, synth_canvas, unwrap_deg, xywh_iou, AdaptiveCfg, AdaptiveState, BgrImage,
-    CropTrack, DetWindow, Device, EnhanceCfg, FilterCfg, FilterKind, FilterQuality, GpuTracker,
-    Latency, LmSpec, OrtModel, OutputFilter, TensorF16, Tracker, TrackerConfig, EYE_IDX, FAST_LM,
-    VERSION,
+    enhance_bgr, face_crop, imagenet_nchw, imagenet_nchw_roi_into, iou, max_abs, mean_abs,
+    mean_conf, model_path, nme, paint_synthetic_glasses, paste_bgr, pick_lm, read_f32_le,
+    resize_bgr, retina_nchw, rss, simd_backend, synth_canvas, unwrap_deg, xywh_iou, AdaptiveCfg,
+    AdaptiveState, BgrImage, CropTrack, DetWindow, Device, EnhanceCfg, FilterCfg, FilterKind,
+    FilterQuality, GpuTracker, Latency, LmSpec, OrtModel, OutputFilter, TensorF16, Tracker,
+    TrackerConfig, EYE_IDX, FAST_LM, VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -34,7 +34,7 @@ struct Args {
     /// cpu | gpu (CoreML on Apple, CUDA on NVIDIA)
     #[arg(long, default_value = "cpu")]
     device: String,
-    /// micro | realistic | all | scale | enhance | crop | filter | glasses
+    /// micro | realistic | all | scale | enhance | crop | filter | glasses | pre
     #[arg(long, default_value = "micro")]
     suite: String,
     #[arg(long)]
@@ -77,6 +77,8 @@ struct Report {
     pipeline: Option<Pipeline>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     scenarios: HashMap<String, ScenarioReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preprocess: Option<PreprocessReport>,
 }
 
 #[derive(Serialize)]
@@ -87,6 +89,15 @@ struct ModelReport {
     latency: Latency,
     resources_after_infer: osf_ort::Rss,
     accuracy: Option<Acc>,
+}
+
+#[derive(Serialize)]
+struct PreprocessReport {
+    simd: String,
+    src_w: u32,
+    src_h: u32,
+    full_224: Latency,
+    roi_112: Latency,
 }
 
 #[derive(Serialize)]
@@ -191,13 +202,52 @@ fn main() -> Result<()> {
         run_glasses_suite(&args, spec, device, &path)?;
         return Ok(());
     }
+    if args.suite == "pre" {
+        let frame = if args.image.is_file() {
+            BgrImage::load(&args.image)?
+        } else {
+            synth_canvas(1280, 720)
+        };
+        let preprocess = bench_preprocess(&frame, args.warmup, args.iters);
+        eprintln!(
+            "preprocess simd={} {}x{} 224 p50={:.3}ms  roi112 p50={:.3}ms",
+            preprocess.simd,
+            preprocess.src_w,
+            preprocess.src_h,
+            preprocess.full_224.p50_ms,
+            preprocess.roi_112.p50_ms
+        );
+        let report = Report {
+            backend: "ort-rust",
+            crate_version: VERSION,
+            device: device.as_str().into(),
+            ort_dylib: std::env::var("ORT_DYLIB_PATH").ok(),
+            threads: args.threads,
+            models: HashMap::new(),
+            pipeline: None,
+            scenarios: HashMap::new(),
+            preprocess: Some(preprocess),
+        };
+        let json = serde_json::to_string_pretty(&report)?;
+        if let Some(p) = &args.out {
+            if let Some(dir) = p.parent() {
+                fs::create_dir_all(dir)?;
+            }
+            fs::write(p, &json)?;
+        } else {
+            println!("{json}");
+        }
+        return Ok(());
+    }
     let run_micro = args.suite == "micro" || args.suite == "all";
     let run_real = args.suite == "realistic" || args.suite == "all";
     let mut models = HashMap::new();
     let mut pipe = None;
+    let mut preprocess = None;
 
     if run_micro {
         let frame = BgrImage::load(&args.image)?;
+        preprocess = Some(bench_preprocess(&frame, args.warmup, args.iters));
         let dump = |name: &str| args.ref_dir.as_ref().map(|d| d.join(name));
         let load = |name: &str, shape: Vec<i64>, fb: TensorF16| -> Result<TensorF16> {
             match dump(name) {
@@ -288,6 +338,7 @@ fn main() -> Result<()> {
         models,
         pipeline: pipe,
         scenarios,
+        preprocess,
     };
     let json = serde_json::to_string_pretty(&report)?;
     if let Some(p) = &args.out {
@@ -299,6 +350,49 @@ fn main() -> Result<()> {
         println!("{json}");
     }
     Ok(())
+}
+
+fn bench_preprocess(frame: &BgrImage, warmup: u32, iters: u32) -> PreprocessReport {
+    let src = if frame.width == 1280 && frame.height == 720 {
+        frame.clone()
+    } else {
+        resize_bgr(frame, 1280, 720)
+    };
+    let mut buf224 = vec![half::f16::ZERO; 3 * 224 * 224];
+    let mut buf112 = vec![half::f16::ZERO; 3 * 112 * 112];
+    let time_ms = |f: &mut dyn FnMut()| -> Vec<f64> {
+        for _ in 0..warmup {
+            f();
+        }
+        (0..iters)
+            .map(|_| {
+                let t = Instant::now();
+                f();
+                t.elapsed().as_secs_f64() * 1000.0
+            })
+            .collect()
+    };
+    let s224 = time_ms(&mut || {
+        imagenet_nchw_roi_into(
+            &src,
+            0,
+            0,
+            src.width as i32,
+            src.height as i32,
+            224,
+            &mut buf224,
+        );
+    });
+    let s112 = time_ms(&mut || {
+        imagenet_nchw_roi_into(&src, 440, 160, 840, 560, 112, &mut buf112);
+    });
+    PreprocessReport {
+        simd: simd_backend().into(),
+        src_w: src.width,
+        src_h: src.height,
+        full_224: Latency::from_samples(warmup, &s224),
+        roi_112: Latency::from_samples(warmup, &s112),
+    }
 }
 
 fn bench(
@@ -1199,14 +1293,9 @@ fn run_seq_ex(
     let mut rows = Vec::with_capacity(seq.frames.len());
     let mut gaze = None;
     if do_gaze {
-        let p = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../models/mnv3_gaze32_split_opt.onnx");
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../models/mnv3_gaze32_split_opt.onnx");
         let p2 = PathBuf::from("models/mnv3_gaze32_split_opt.onnx");
-        let path = if p.is_file() {
-            p
-        } else {
-            p2
-        };
+        let path = if p.is_file() { p } else { p2 };
         if path.is_file() {
             gaze = OrtModel::open(path, 1, Device::Cpu, 2).ok();
         }
@@ -2573,10 +2662,7 @@ fn glasses_scene(name: &str, rows: &[Row], control: Option<&[Row]>) -> GlassesSc
     if let Some(ctl) = control {
         for (a, b) in rows.iter().zip(ctl.iter()) {
             if let (Some(x), Some(y)) = (a.box5, b.box5) {
-                iou.push(xywh_iou(
-                    [x[0], x[1], x[2], x[3]],
-                    [y[0], y[1], y[2], y[3]],
-                ));
+                iou.push(xywh_iou([x[0], x[1], x[2], x[3]], [y[0], y[1], y[2], y[3]]));
             }
         }
     }
@@ -2663,16 +2749,7 @@ fn run_glasses_suite(args: &Args, _spec: LmSpec, device: Device, out: &Path) -> 
         .transpose()?;
 
     let bare_rows = if let Some(g) = gpu.as_mut() {
-        run_seq_ex(
-            None,
-            Some(g),
-            spec,
-            &bare,
-            None,
-            EnhanceCfg::off(),
-            0,
-            true,
-        )?
+        run_seq_ex(None, Some(g), spec, &bare, None, EnhanceCfg::off(), 0, true)?
     } else {
         run_seq_ex(
             Some(&mut pipe),
@@ -2750,10 +2827,7 @@ fn run_glasses_suite(args: &Args, _spec: LmSpec, device: Device, out: &Path) -> 
     for s in &scenes {
         print_glasses_scene(s);
     }
-    let report = GlassesReport {
-        frames: n,
-        scenes,
-    };
+    let report = GlassesReport { frames: n, scenes };
     if let Some(dir) = out.parent() {
         fs::create_dir_all(dir)?;
     }
