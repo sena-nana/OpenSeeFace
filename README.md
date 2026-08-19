@@ -4,7 +4,7 @@
 
 This project is a facial landmark tracking library based on MobileNetV3. Tracking runs in Rust (`runtime-ort` / `facetracker`) on the shipped ONNX models via [ort](https://github.com/pykeio/ort). There are four models, with different speed to tracking quality trade-offs.
 
-It is **not** a stand-alone avatar puppeteering program. [VSeeFace](https://www.vseeface.icu/), [VTube Studio](https://denchisoft.com/), and a [Godot renderer](https://github.com/virtual-puppet-project/vpuppr) consume the UDP stream. Unity scripts here are a compatibility layer.
+It is **not** a stand-alone avatar puppeteering program. [VSeeFace](https://www.vseeface.icu/), [VTube Studio](https://denchisoft.com/), and a [Godot renderer](https://github.com/virtual-puppet-project/vpuppr) consume the OpenSee UDP stream. Unity VRM apps (EVMC4U / UniVRM) consume [VMC Protocol](https://protocol.vmc.info/) OSC from the same tracker.
 
 If anyone is curious, the name is a silly pun on the open seas and seeing faces. There's no deeper meaning.
 
@@ -20,7 +20,7 @@ I ran OpenSeeFace on a sample clip from the video presentation for [3D Face Reco
 
 # Usage
 
-The tracker is the `facetracker` CLI in `runtime-ort`. It reads a webcam, still, or video file, and writes one 1809-byte OpenSee packet per face to UDP (`127.0.0.1:11573` by default): 20 expression features. Slots 14–19 are `MouthPucker`, `MouthOffsetX` (positive = person's right), `CheekPuff`, `JawOpen`, `MouthFunnel`, and `MouthPressLipOpen` (landmark heuristic: +teeth / −thinner closed lips; no tongue). Unity still reads older 1785-byte / 14-feature, 1797-byte / 17-feature, and 1805-byte / 19-feature packets. Tracking can run on a different machine from the consumer.
+The tracker is the `facetracker` CLI in `runtime-ort`. It reads a webcam, still, or video file, and writes one 1809-byte OpenSee packet per face to UDP (`127.0.0.1:11573` by default): 20 expression features. Slots 14–19 are `MouthPucker`, `MouthOffsetX` (positive = person's right), `CheekPuff`, `JawOpen`, `MouthFunnel`, and `MouthPressLipOpen` (landmark heuristic: +teeth / −thinner closed lips; no tongue). It also sends VMC OSC (`127.0.0.1:39539` by default) with head/eye/jaw bones and VRM blendshapes. Tracking can run on a different machine from the consumer. `--vmc 0` disables VMC.
 
 If you downloaded a release on Windows, run `facetracker.exe` from the `Binary` folder (`run.bat` is a short camera demo). From source:
 
@@ -47,11 +47,21 @@ CPU is the default. GPU (CoreML on Apple, CUDA on NVIDIA) uses the same loop; de
 * Lower tracking quality mainly means more rigid tracking, making it harder to detect blinking and eyebrow motion.
 * Depending on the frame rate, face tracking can easily use up a whole CPU core. At 30fps for a single face, it should still use less than 100% of one core on a decent CPU. If tracking uses too much CPU, try lowering the frame rate. A frame rate of 20 is probably fine and anything above 30 should rarely be necessary.
 * Once all `--faces` slots are filled, full-frame detection is skipped. The next crop comes from the previous frame's landmarks (eyes+nose fit). Detection runs again only after a lost face, or every `--scan-every` frames when fewer faces are tracked than `--faces`. Set `--faces` no higher than the number of faces you are actually tracking.
-* `--filter` (default `one-euro`) smooths UDP pose and 2D landmarks after PnP. Strength follows landmark confidence, PnP stability, and motion speed. `--filter none` keeps raw measurements. Crop tracking and expression features are unchanged. If Unity `OpenSeeIKTarget.smooth` is also on, lower it to 0–0.1 to avoid double smoothing. A/B notes: [benchmarks/filter-eval.md](benchmarks/filter-eval.md).
+* `--filter` (default `one-euro`) smooths UDP pose and 2D landmarks after PnP. Strength follows landmark confidence, PnP stability, and motion speed. `--filter none` keeps raw measurements. Crop tracking and expression features are unchanged. A/B notes: [benchmarks/filter-eval.md](benchmarks/filter-eval.md).
 
-# Unity compatibility
+# VRM / Unity (VMC)
 
-The binary is still named `facetracker` and sends the 1809-byte OpenSee packet, so `Unity/OpenSeeLauncher.cs` can start it. `--benchmark` / `--priority` are accepted for that launcher. Receiver scripts are in `Unity/` and `Examples/`; copy `OpenSee.trackingData` before use (it is written from another thread). Sample project: [OpenSeeFaceSample](https://github.com/emilianavt/OpenSeeFaceSample).
+`facetracker` maps tracking to VRM in-process and sends [VMC Protocol](https://protocol.vmc.info/) to `127.0.0.1:39539`. Point Unity at that port with [EVMC4U](https://github.com/HATSUNE-Miku/EVMC4U) (or any VMC receiver) and a UniVRM avatar. The tracker does not load `.vrm` files; unknown blendshape names are ignored by the receiver.
+
+Default `--vrm-perfect-sync 1` sends ARKit names (`JawOpen`, `MouthPucker`, `EyeBlinkLeft`, …) and skips overlapping VRM 0.x visemes/blinks/looks. `--vrm-perfect-sync 0` sends VRM 0.x presets (`A` `I` `U` `E` `O`, `Blink_L` / `Blink_R`, `Look*`). `Brows up` / `Brows down` are sent in both modes. Head pose is calibrated on the first successful face.
+
+OVRLipSync visemes and SVM expression labels use **OSF extension OSC** (`/OSF/Ext/...`), not the Oculus or ThunderSVM binaries:
+
+* **Outbound** (in the VMC bundle): `/OSF/Ext/Visemes` (15 floats, [OVRLipSync.Viseme](https://developer.oculus.com/documentation/unity/unity-ovrlipsync/) order: sil, PP, FF, TH, DD, kk, CH, SS, nn, RR, aa, E, ih, oh, ou), `/OSF/Ext/Expression` `name` `weight`, `/OSF/Ext/Audio`.
+* **Inbound** (`0.0.0.0:39540` by default, `--osf-ext-listen 0` to disable): the same addresses. A live sidecar viseme (not `sil`) maps through the CATS table to A/I/U/E/O; `sil` falls back to camera mouth. Live `/OSF/Ext/Expression` overrides the built-in heuristic (smile → `fun`, raised brows → `surprise`, lowered brows → `angry`).
+
+    cargo run --release --manifest-path runtime-ort/Cargo.toml --bin facetracker -- -c 0 --vmc-port 39539
+    cargo run --release --manifest-path runtime-ort/Cargo.toml --bin facetracker -- -c 0 --vrm-perfect-sync 0
 
 # Models
 

@@ -1,6 +1,6 @@
 //! Official OpenSee UDP packet: 1809 bytes / face, 20 expression features.
 //! Slots 14–19 are `mouth_pucker`, `mouth_offset_x`, `cheek_puff`, `jaw_open`,
-//! `mouth_funnel`, `mouth_press_lip_open`. Unity still accepts 1785-byte
+//! `mouth_funnel`, `mouth_press_lip_open`. Older receivers still accept 1785-byte
 //! (14-feature), 1797-byte (17-feature), and 1805-byte (19-feature) packets.
 
 use crate::features::FeatureVec;

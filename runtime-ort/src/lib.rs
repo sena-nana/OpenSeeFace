@@ -6,6 +6,7 @@ mod crop;
 mod decode;
 mod enhance;
 mod enhance_gpu;
+mod ext;
 mod features;
 mod filter;
 mod gaze;
@@ -20,6 +21,8 @@ mod session;
 mod tracker;
 mod udp;
 mod viz;
+mod vmc;
+mod vrm;
 
 pub use adaptive::{
     center_2x, det_window, face_on_224, nme, pick_lm, AdaptiveCfg, AdaptiveState, DetWindow,
@@ -32,6 +35,7 @@ pub use decode::{
     mean_conf, LmSpec, TensorF16, EYE_IDX,
 };
 pub use enhance::{enhance_bgr, enhance_bgr_in_place, EnhanceCfg, HeMode};
+pub use ext::{ExtListener, ExtState, VISEME_COUNT, VISEME_NAMES};
 pub use features::{
     FeatureVec, FEATURE_COUNT, FEATURE_NAMES, FEAT_CHEEK_PUFF, FEAT_JAW_OPEN, FEAT_MOUTH_FUNNEL,
     FEAT_MOUTH_OFFSET_X, FEAT_MOUTH_PRESS_LIP_OPEN, FEAT_MOUTH_PUCKER,
@@ -53,6 +57,8 @@ pub use udp::{
     PACKET_FRAME_SIZE_LEGACY,
 };
 pub use viz::{draw_tracking, dump_symmetric_points, VizWindow};
+pub use vmc::encode_vmc;
+pub use vrm::{VrmCfg, VrmDriver, VrmFrame};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

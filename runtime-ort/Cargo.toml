@@ -32,6 +32,7 @@ nalgebra = "0.33"
 nokhwa = { version = "0.10", default-features = false, features = ["input-native"] }
 ort = { version = "2.0.0-rc.13", features = ["half"] }
 rand = "0.8"
+rosc = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

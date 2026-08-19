@@ -5,9 +5,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use clap::Parser;
 use osf_ort::{
-    draw_tracking, dump_symmetric_points, encode_faces_into, list_cameras, model_base_path, Device,
-    FacePacket, FilterKind, InputSource, PipedInput, Tracker, TrackerConfig, VideoOut, VizWindow,
-    PACKET_FRAME_SIZE,
+    draw_tracking, dump_symmetric_points, encode_faces_into, encode_vmc, list_cameras,
+    model_base_path, Device, ExtListener, FacePacket, FilterKind, InputSource, PipedInput, Tracker,
+    TrackerConfig, VideoOut, VizWindow, VrmCfg, VrmDriver, PACKET_FRAME_SIZE,
 };
 
 #[derive(Parser, Debug)]
@@ -91,6 +91,21 @@ struct Args {
     #[arg(long, hide = true)]
     #[allow(dead_code)]
     priority: Option<i32>,
+    /// Send VMC Protocol (OSC) for Unity EVMC4U / UniVRM. 0 disables.
+    #[arg(long, default_value_t = 1)]
+    vmc: i32,
+    #[arg(long, default_value = "127.0.0.1")]
+    vmc_ip: String,
+    #[arg(long, default_value_t = 39539)]
+    vmc_port: u16,
+    /// ARKit Perfect Sync blendshapes. 0 = VRM 0.x presets (A/I/U/E/O, Blink, Look*).
+    #[arg(long, default_value_t = 1)]
+    vrm_perfect_sync: i32,
+    #[arg(long, default_value_t = 0)]
+    vrm_mirror: i32,
+    /// Listen for `/OSF/Ext/Visemes` and `/OSF/Ext/Expression` (OVRLipSync / SVM sidecar). 0 disables.
+    #[arg(long, default_value_t = 39540)]
+    osf_ext_listen: u16,
 }
 
 /// Analog eye openness for the tracker console (`eye_blink` in 0..=1).
@@ -136,8 +151,27 @@ fn main() -> Result<()> {
     let mut input = PipedInput::start(src)?;
     let sock = UdpSocket::bind("0.0.0.0:0").context("udp bind")?;
     let dest = format!("{}:{}", args.ip, args.port);
+    let vmc_dest = format!("{}:{}", args.vmc_ip, args.vmc_port);
     let filter: FilterKind = args.filter.parse().context("--filter")?;
     let pace = (args.fps > 0 && !is_video).then(|| Duration::from_secs_f64(1.0 / args.fps as f64));
+    let mut vrm = VrmDriver::new(VrmCfg {
+        perfect_sync: args.vrm_perfect_sync != 0,
+        mirror: args.vrm_mirror != 0,
+        ..VrmCfg::default()
+    });
+    let mut ext_listen = if args.osf_ext_listen != 0 {
+        match ExtListener::bind(([0, 0, 0, 0], args.osf_ext_listen).into()) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                if args.silent == 0 {
+                    eprintln!("OSF ext listen :{} failed: {e}", args.osf_ext_listen);
+                }
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let mut tracker = None;
     let mut viz = None;
@@ -252,6 +286,19 @@ fn main() -> Result<()> {
             encode_faces_into(&mut udp_buf, &packets);
             if udp_buf.len() % PACKET_FRAME_SIZE == 0 {
                 let _ = sock.send_to(&udp_buf, &dest);
+            }
+        }
+        if args.vmc != 0 {
+            if let Some(pkt) = packets
+                .iter()
+                .find(|p| p.success)
+                .or_else(|| packets.first())
+            {
+                if let Some(frame) = vrm.update_with(pkt, ext_listen.as_mut().map(|l| l.poll())) {
+                    if let Ok(buf) = encode_vmc(&frame) {
+                        let _ = sock.send_to(&buf, &vmc_dest);
+                    }
+                }
             }
         }
 

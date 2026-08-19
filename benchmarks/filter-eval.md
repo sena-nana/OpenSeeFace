@@ -16,4 +16,4 @@ Default One Euro scales `mincutoff` by landmark confidence and PnP stability (`s
 
 Quality scale vs speed-only: −9% static jitter, NME unchanged, no extra step lag. Kalman lags a head-turn; EMA missed a 30% jitter gate.
 
-**Keep:** `one-euro` (default) and `none`. Live filter writes only the result clone (not crop/PnP). Unity `OpenSeeIKTarget.smooth` should drop to 0–0.1 if the tracker filter is on.
+**Keep:** `one-euro` (default) and `none`. Live filter writes only the result clone (not crop/PnP).
