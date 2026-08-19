@@ -93,6 +93,21 @@ struct Args {
     priority: Option<i32>,
 }
 
+/// Analog eye openness for the tracker console (`eye_blink` in 0..=1).
+/// Glyphs: O open, o half, - slit, x shut.
+fn format_eye_open(open: f32) -> String {
+    let g = if open > 0.75 {
+        'O'
+    } else if open > 0.40 {
+        'o'
+    } else if open > 0.15 {
+        '-'
+    } else {
+        'x'
+    };
+    format!("{g} {open:.2}")
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     if args.list_cameras > 0 {
@@ -207,15 +222,13 @@ fn main() -> Result<()> {
             .iter()
             .map(|f| {
                 if args.silent == 0 {
-                    let r = if f.eye_blink[0] > 0.30 { "O" } else { "-" };
-                    let l = if f.eye_blink[1] > 0.30 { "O" } else { "-" };
                     println!(
-                        "Confidence[{}]: {:.4} / 3D fitting error: {:.4} / Eyes: {}, {}",
+                        "Confidence[{}]: {:.4} / 3D fitting error: {:.4} / Eyes L,R: {}, {}",
                         f.id + args.face_id_offset,
                         f.conf,
                         f.pnp_error,
-                        l,
-                        r
+                        format_eye_open(f.eye_blink[1]),
+                        format_eye_open(f.eye_blink[0]),
                     );
                 }
                 FacePacket {
@@ -321,4 +334,17 @@ fn run_benchmark(args: &Args) -> Result<()> {
         println!("{}", 1.0 / (total / 100.0));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_eye_open;
+
+    #[test]
+    fn eye_console_shows_analog_levels() {
+        assert_eq!(format_eye_open(0.95), "O 0.95");
+        assert_eq!(format_eye_open(0.52), "o 0.52");
+        assert_eq!(format_eye_open(0.22), "- 0.22");
+        assert_eq!(format_eye_open(0.05), "x 0.05");
+    }
 }

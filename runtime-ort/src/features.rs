@@ -1,4 +1,7 @@
 //! Expression features + remedian, matching `tracker.py` / `remedian.py`.
+//!
+//! Eye openness (`eye_l` / `eye_r`) uses a continuous calibrator instead of
+//! the original 15% snap-to-closed path, which jumped on half-open lids.
 
 use crate::geom::{angle, rotate};
 
@@ -201,9 +204,75 @@ impl Feature {
     }
 }
 
+/// Landmark EAR at a fully shut lid (~8% of the open-eye median).
+const EYE_CLOSED_FRAC: f32 = 0.08;
+const EYE_ALPHA: f32 = 0.6;
+/// Ignore blinks / held squints when updating the open-eye baseline.
+const EYE_MEDIAN_GATE: f32 = 0.70;
+
+/// Continuous eye openness. Mouth / brow features keep [`Feature`].
+struct EyeFeature {
+    median: Remedian,
+    last: f32,
+    current_median: f32,
+    max_feature_updates: f32,
+    first_seen: f32,
+    updating: bool,
+}
+
+impl EyeFeature {
+    fn new(max_feature_updates: f32) -> Self {
+        Self {
+            median: Remedian::new(),
+            last: 0.0,
+            current_median: 0.0,
+            max_feature_updates,
+            first_seen: -1.0,
+            updating: true,
+        }
+    }
+
+    fn update(&mut self, x: f32, now: f32) -> f32 {
+        if self.max_feature_updates > 0.0 && self.first_seen < 0.0 {
+            self.first_seen = now;
+        }
+        let updating = self.updating
+            && (self.max_feature_updates == 0.0
+                || now - self.first_seen < self.max_feature_updates);
+        if updating {
+            if self.current_median.abs() < 1e-8 || x >= self.current_median * EYE_MEDIAN_GATE {
+                self.median.add(x);
+                self.current_median = self.median.median();
+            }
+        } else {
+            self.updating = false;
+        }
+        let new = eye_value(x, self.current_median);
+        self.last = self.last * EYE_ALPHA + new * (1.0 - EYE_ALPHA);
+        self.last
+    }
+}
+
+/// Open median → 0, shut (`EYE_CLOSED_FRAC`) → −1. Half-open and a lid slit stay analog.
+fn eye_value(x: f32, median: f32) -> f32 {
+    if median.abs() < 1e-8 || x >= median {
+        0.0
+    } else {
+        ((x - median) / (median * (1.0 - EYE_CLOSED_FRAC))).clamp(-1.0, 0.0)
+    }
+}
+
+/// Vertical lid gap over inter-corner width after aligning the eye horizontally.
+fn eye_aspect(outer: [f32; 2], inner: [f32; 2], lids: [[f32; 2]; 4]) -> (f32, f32) {
+    let (alpha, f_pts) = FeatureExtractor::align_points(outer, inner, &lids);
+    let gap = ((f_pts[0][1] + f_pts[1][1]) / 2.0 - (f_pts[2][1] + f_pts[3][1]) / 2.0).abs();
+    let eye_w = (inner[0] - outer[0]).hypot(inner[1] - outer[1]).max(1e-6);
+    (alpha, gap / eye_w)
+}
+
 pub struct FeatureExtractor {
-    eye_l: Feature,
-    eye_r: Feature,
+    eye_l: EyeFeature,
+    eye_r: EyeFeature,
     eyebrow_updown_l: Feature,
     eyebrow_updown_r: Feature,
     eyebrow_quirk_l: Feature,
@@ -221,8 +290,8 @@ pub struct FeatureExtractor {
 impl FeatureExtractor {
     pub fn new(max_feature_updates: f32) -> Self {
         Self {
-            eye_l: Feature::new(0.15, max_feature_updates),
-            eye_r: Feature::new(0.15, max_feature_updates),
+            eye_l: EyeFeature::new(max_feature_updates),
+            eye_r: EyeFeature::new(max_feature_updates),
             eyebrow_updown_l: Feature::new(0.15, max_feature_updates),
             eyebrow_updown_r: Feature::new(0.15, max_feature_updates),
             eyebrow_quirk_l: Feature::new(0.05, max_feature_updates),
@@ -271,12 +340,10 @@ impl FeatureExtractor {
         let ny = norm_distance_y.abs().max(1e-6);
         let nx = norm_distance_x.abs().max(1e-6);
 
-        let (a1, f_pts) = Self::align_points(p(42), p(45), &[p(43), p(44), p(47), p(46)]);
-        let f = ((f_pts[0][1] + f_pts[1][1]) / 2.0 - (f_pts[2][1] + f_pts[3][1]) / 2.0).abs() / ny;
+        let (a1, f) = eye_aspect(p(42), p(45), [p(43), p(44), p(47), p(46)]);
         let eye_l = self.eye_l.update(f, now);
 
-        let (a2, f_pts) = Self::align_points(p(36), p(39), &[p(37), p(38), p(41), p(40)]);
-        let f = ((f_pts[0][1] + f_pts[1][1]) / 2.0 - (f_pts[2][1] + f_pts[3][1]) / 2.0).abs() / ny;
+        let (a2, f) = eye_aspect(p(36), p(39), [p(37), p(38), p(41), p(40)]);
         let eye_r = self.eye_r.update(f, now);
 
         let (steep_l, quirk_l, steep_r, quirk_r) = if full {
@@ -349,5 +416,109 @@ impl FeatureExtractor {
             eye_l, eye_r, steep_l, up_l, quirk_l, steep_r, up_r, quirk_r, m_ud_l, m_io_l, m_ud_r,
             m_io_r, mouth_open, mouth_wide,
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn feed(eye: &mut EyeFeature, x: f32, n: u32) -> f32 {
+        let mut v = 0.0;
+        for i in 0..n {
+            v = eye.update(x, i as f32 * 0.03);
+        }
+        v
+    }
+
+    #[test]
+    fn lid_close_is_continuous() {
+        let m = 1.0;
+        let half = eye_value(0.55, m);
+        let slit = eye_value(0.25, m);
+        let shut = eye_value(0.08, m);
+        assert!(half < -0.2 && half > slit);
+        assert!(slit < -0.5 && slit > shut);
+        assert!((shut + 1.0).abs() < 1e-5);
+        assert_eq!(eye_value(1.0, m), 0.0);
+    }
+
+    #[test]
+    fn squint_does_not_snap_like_legacy() {
+        let mut old = Feature::new(0.15, 0.0);
+        let mut eye = EyeFeature::new(0.0);
+        for i in 0..80 {
+            let t = i as f32 * 0.03;
+            old.update(1.0, t);
+            eye.update(1.0, t);
+        }
+        let mut seed = 1u32;
+        let mut old_cross = 0;
+        let mut prev_old = 0.0;
+        let mut new_vals = Vec::new();
+        for i in 0..80 {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let n = (seed >> 8) as f32 / u32::MAX as f32 * 2.0 - 1.0;
+            let x = 0.55 * (1.0 + 0.05 * n);
+            let t = (80 + i) as f32 * 0.03;
+            let o = old.update(x, t);
+            if (prev_old > -0.1 && o < -0.7) || (prev_old < -0.7 && o > -0.1) {
+                old_cross += 1;
+            }
+            prev_old = o;
+            new_vals.push(eye.update(x, t));
+        }
+        assert!(old_cross > 0, "legacy Feature should bounce 0/-1");
+        for v in &new_vals[8..] {
+            assert!(*v < -0.2 && *v > -0.8, "half-open snapped: {v}");
+        }
+    }
+
+    #[test]
+    fn blink_reaches_shut_then_opens() {
+        let mut eye = EyeFeature::new(0.0);
+        feed(&mut eye, 1.0, 80);
+        let shut = feed(&mut eye, 0.10, 8);
+        assert!(shut < -0.85, "blink {shut}");
+        let open = feed(&mut eye, 1.0, 20);
+        assert!(open.abs() < 0.2, "recover {open}");
+    }
+
+    #[test]
+    fn extractor_uses_eye_width_and_holds_squint() {
+        let (_, ear) = eye_aspect(
+            [0.0, 0.0],
+            [2.0, 0.0],
+            [[0.5, 0.4], [1.5, 0.4], [1.5, 0.0], [0.5, 0.0]],
+        );
+        assert!((ear - 0.2).abs() < 1e-5);
+
+        let mut pts = vec![[0.0; 3]; 66];
+        pts[0] = [0.45, 0.30, 0.0];
+        pts[16] = [-0.45, 0.30, 0.0];
+        pts[27] = [0.0, 0.29, 0.0];
+        pts[28] = [0.0, 0.19, 0.0];
+        pts[29] = [0.0, 0.10, 0.0];
+        let set_eye = |pts: &mut [[f32; 3]], outer: usize, sign: f32, lid: f32| {
+            pts[outer] = [sign * 0.32, 0.30, 0.0];
+            pts[outer + 1] = [sign * 0.27, 0.30 + 0.04 * lid, 0.0];
+            pts[outer + 2] = [sign * 0.18, 0.30 + 0.04 * lid, 0.0];
+            pts[outer + 3] = [sign * 0.13, 0.28, 0.0];
+            pts[outer + 4] = [sign * 0.18, 0.26, 0.0];
+            pts[outer + 5] = [sign * 0.27, 0.26, 0.0];
+        };
+        let mut ext = FeatureExtractor::new(0.0);
+        set_eye(&mut pts, 36, 1.0, 1.0);
+        set_eye(&mut pts, 42, -1.0, 1.0);
+        for _ in 0..80 {
+            ext.update(&pts, false);
+        }
+        set_eye(&mut pts, 36, 1.0, 0.45);
+        set_eye(&mut pts, 42, -1.0, 0.45);
+        for _ in 0..20 {
+            let f = ext.update(&pts, false);
+            assert!(f[0] < -0.05 && f[0] > -0.95);
+            assert!(f[1] < -0.05 && f[1] > -0.95);
+        }
     }
 }

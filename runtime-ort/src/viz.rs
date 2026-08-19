@@ -34,10 +34,10 @@ pub fn draw_tracking(
             );
         }
         for (pt_num, pt) in f.lms.iter().enumerate() {
-            if pt_num == 66 && (f.eye_blink[0] < 0.30 || pt[2] < 0.20) {
+            if pt_num == 66 && (f.eye_blink[0] < 0.15 || pt[2] < 0.20) {
                 continue;
             }
-            if pt_num == 67 && (f.eye_blink[1] < 0.30 || pt[2] < 0.20) {
+            if pt_num == 67 && (f.eye_blink[1] < 0.15 || pt[2] < 0.20) {
                 continue;
             }
             let x = (pt[0] + 0.5) as i32;
