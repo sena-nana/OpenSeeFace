@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use clap::Parser;
 use osf_ort::{
-    draw_tracking, dump_symmetric_points, encode_faces_into, list_cameras, model_base_path,
+    draw_tracking, dump_symmetric_points, encode_faces_into, list_cameras, model_base_path, Device,
     FacePacket, FilterKind, InputSource, PipedInput, Tracker, TrackerConfig, VideoOut, VizWindow,
     PACKET_FRAME_SIZE,
 };
@@ -82,6 +82,9 @@ struct Args {
     filter_mincutoff: f32,
     #[arg(long, default_value_t = 0.007)]
     filter_beta: f32,
+    /// cpu | gpu (CoreML on Apple, CUDA on NVIDIA). GPU needs `--features gpu`.
+    #[arg(long, default_value_t = Device::Cpu)]
+    device: Device,
     #[arg(long, default_value_t = 0, hide = true)]
     benchmark: i32,
     /// OpenSeeLauncher sends this with `--benchmark`; ignored.
@@ -177,6 +180,7 @@ fn main() -> Result<()> {
                 filter,
                 filter_mincutoff: args.filter_mincutoff,
                 filter_beta: args.filter_beta,
+                device: args.device,
                 ..TrackerConfig::default()
             })?);
             if args.visualize != 0 {
@@ -305,6 +309,7 @@ fn run_benchmark(args: &Args) -> Result<()> {
             max_feature_updates: 900.0,
             static_model: args.no_3d_adapt == 1,
             filter: FilterKind::None,
+            device: args.device,
             ..TrackerConfig::default()
         })?;
         let mut total = 0.0;

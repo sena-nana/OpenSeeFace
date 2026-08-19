@@ -11,9 +11,9 @@ use std::path::PathBuf;
 #[cfg(feature = "gpu")]
 use std::process::Command;
 
-use crate::decode::LmSpec;
 #[cfg(all(feature = "gpu", not(target_os = "macos")))]
-use crate::decode::{decode_landmarks, detect_faces};
+use crate::decode::decode_landmarks_data;
+use crate::decode::LmSpec;
 use crate::enhance::EnhanceCfg;
 #[cfg(feature = "gpu")]
 use crate::enhance_gpu::GpuEnhance;
@@ -24,8 +24,6 @@ use crate::preprocess::crop_slice;
 #[cfg(all(feature = "gpu", target_os = "macos"))]
 use crate::preprocess::resize_bgr;
 use crate::preprocess::BgrImage;
-#[cfg(all(feature = "gpu", not(target_os = "macos")))]
-use crate::session::collect_f16;
 #[cfg(feature = "gpu")]
 use crate::session::Device;
 #[cfg(feature = "gpu")]
@@ -79,7 +77,7 @@ fn ensure_pre_models(models_dir: &Path) -> Result<PathBuf> {
     let ok = run("uv", &["run", "python"]).or_else(|_| run("python3", &[]))?;
     if !ok || !out.join("imagenet_224.onnx").is_file() {
         bail!(
-            "failed to generate GPU preprocess graphs in {} (need Python + onnx)",
+            "failed to generate GPU preprocess graphs in {} (need Python + onnx). Run runtime-ort/scripts/wrap_preprocess.py or use --device cpu",
             out.display()
         );
     }
@@ -94,21 +92,37 @@ fn in_name(s: &Session) -> String {
         .unwrap_or_else(|| "input".into())
 }
 
+#[cfg(feature = "gpu")]
+#[derive(Clone)]
+struct GpuCfg {
+    models_dir: PathBuf,
+    spec: LmSpec,
+    threads: usize,
+    enhance: EnhanceCfg,
+    threshold: f32,
+    max_faces: usize,
+    width: u32,
+    height: u32,
+}
+
+#[cfg(not(feature = "gpu"))]
+fn need_gpu<T>() -> Result<T> {
+    bail!("GPU requested; rebuild with `--features gpu` or use `--device cpu`")
+}
+
 /// GPU pipeline: preprocess on the EP; only small tensors come back to the CPU.
 pub struct GpuTracker {
     #[cfg(all(feature = "gpu", target_os = "macos"))]
     pipe: CoreMlPipe,
     #[cfg(all(feature = "gpu", not(target_os = "macos")))]
     pipe: CudaPipe,
+    #[cfg(feature = "gpu")]
+    cfg: GpuCfg,
     #[cfg(not(feature = "gpu"))]
     _no_gpu: (),
 }
 
 impl GpuTracker {
-    pub fn open(models_dir: &Path, spec: LmSpec, threads: usize, frame: &BgrImage) -> Result<Self> {
-        Self::with_enhance(models_dir, spec, threads, frame, EnhanceCfg::off())
-    }
-
     pub fn with_enhance(
         models_dir: &Path,
         spec: LmSpec,
@@ -116,24 +130,83 @@ impl GpuTracker {
         frame: &BgrImage,
         enhance: EnhanceCfg,
     ) -> Result<Self> {
+        Self::open(models_dir, spec, threads, frame, enhance, 0.6, 1)
+    }
+
+    pub(crate) fn open(
+        models_dir: &Path,
+        spec: LmSpec,
+        threads: usize,
+        frame: &BgrImage,
+        enhance: EnhanceCfg,
+        threshold: f32,
+        max_faces: usize,
+    ) -> Result<Self> {
         #[cfg(not(feature = "gpu"))]
         {
-            let _ = (models_dir, spec, threads, frame, enhance);
-            bail!("GPU requested; rebuild with `--features gpu`");
+            let _ = (
+                models_dir, spec, threads, frame, enhance, threshold, max_faces,
+            );
+            need_gpu()
         }
-        #[cfg(all(feature = "gpu", target_os = "macos"))]
+        #[cfg(feature = "gpu")]
+        Self::from_cfg(
+            GpuCfg {
+                models_dir: models_dir.to_path_buf(),
+                spec,
+                threads,
+                enhance,
+                threshold,
+                max_faces: max_faces.max(1),
+                width: frame.width,
+                height: frame.height,
+            },
+            frame,
+        )
+    }
+
+    #[cfg(feature = "gpu")]
+    fn from_cfg(cfg: GpuCfg, frame: &BgrImage) -> Result<Self> {
+        let pre = ensure_pre_models(&cfg.models_dir)?;
+        #[cfg(target_os = "macos")]
         {
-            let pre = ensure_pre_models(models_dir)?;
             Ok(Self {
-                pipe: CoreMlPipe::open(&pre, spec, threads, frame, enhance)?,
+                pipe: CoreMlPipe::open(&pre, cfg.spec, cfg.threads, frame, cfg.enhance)?,
+                cfg,
             })
         }
-        #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+        #[cfg(not(target_os = "macos"))]
         {
-            let pre = ensure_pre_models(models_dir)?;
             Ok(Self {
-                pipe: CudaPipe::open(models_dir, &pre, spec, threads, frame, enhance)?,
+                pipe: CudaPipe::open(
+                    &cfg.models_dir,
+                    &pre,
+                    cfg.spec,
+                    cfg.threads,
+                    frame,
+                    cfg.enhance,
+                )?,
+                cfg,
             })
+        }
+    }
+
+    pub fn set_size(&mut self, width: u32, height: u32) -> Result<()> {
+        #[cfg(not(feature = "gpu"))]
+        {
+            let _ = (width, height);
+            need_gpu()
+        }
+        #[cfg(feature = "gpu")]
+        {
+            if width == self.cfg.width && height == self.cfg.height {
+                return Ok(());
+            }
+            let mut cfg = self.cfg.clone();
+            cfg.width = width;
+            cfg.height = height;
+            *self = Self::from_cfg(cfg, &BgrImage::zeros(width, height))?;
+            Ok(())
         }
     }
 
@@ -141,10 +214,11 @@ impl GpuTracker {
         #[cfg(not(feature = "gpu"))]
         {
             let _ = frame;
-            bail!("GPU requested; rebuild with `--features gpu`");
+            need_gpu()
         }
         #[cfg(feature = "gpu")]
-        self.pipe.detect(frame)
+        self.pipe
+            .detect(frame, self.cfg.threshold, self.cfg.max_faces)
     }
 
     pub fn landmarks(
@@ -158,10 +232,31 @@ impl GpuTracker {
         #[cfg(not(feature = "gpu"))]
         {
             let _ = (frame, det, spec, pad_x, pad_y);
-            bail!("GPU requested; rebuild with `--features gpu`");
+            need_gpu()
         }
         #[cfg(feature = "gpu")]
-        self.pipe.landmarks(frame, det, spec, pad_x, pad_y)
+        {
+            let (x1, y1, x2, y2) = crop_box_pad(frame, det, pad_x, pad_y);
+            self.pipe.landmarks_roi(frame, x1, y1, x2, y2, spec)
+        }
+    }
+
+    pub(crate) fn landmarks_roi(
+        &mut self,
+        frame: &BgrImage,
+        x1: i32,
+        y1: i32,
+        x2: i32,
+        y2: i32,
+        spec: LmSpec,
+    ) -> Result<(f32, Vec<[f32; 3]>)> {
+        #[cfg(not(feature = "gpu"))]
+        {
+            let _ = (frame, x1, y1, x2, y2, spec);
+            need_gpu()
+        }
+        #[cfg(feature = "gpu")]
+        self.pipe.landmarks_roi(frame, x1, y1, x2, y2, spec)
     }
 }
 
@@ -186,7 +281,10 @@ impl CoreMlPipe {
         let fused_det = pre.join("mnv3_detection_opt.onnx");
         let fused_lm = pre.join(spec.file);
         if !fused_det.is_file() || !fused_lm.is_file() {
-            bail!("fused CoreML graphs not in {}", pre.display());
+            bail!(
+                "fused CoreML graphs not in {} (run runtime-ort/scripts/wrap_preprocess.py or use --device cpu)",
+                pre.display()
+            );
         }
         let (det, _) = make_session(
             &fused_det,
@@ -214,7 +312,12 @@ impl CoreMlPipe {
         })
     }
 
-    fn detect(&mut self, frame: &BgrImage) -> Result<Vec<[f32; 5]>> {
+    fn detect(
+        &mut self,
+        frame: &BgrImage,
+        threshold: f32,
+        max_faces: usize,
+    ) -> Result<Vec<[f32; 5]>> {
         let name = self.det_name.clone();
         let shape = [1i64, frame.height as i64, frame.width as i64, 3];
         let bytes = self.enhance.run(frame)?;
@@ -227,20 +330,20 @@ impl CoreMlPipe {
             b,
             frame.width,
             frame.height,
-            0.6,
-            1,
+            threshold,
+            max_faces,
         ))
     }
 
-    fn landmarks(
+    fn landmarks_roi(
         &mut self,
         frame: &BgrImage,
-        det: &[f32; 5],
+        x1: i32,
+        y1: i32,
+        x2: i32,
+        y2: i32,
         spec: LmSpec,
-        pad_x: f32,
-        pad_y: f32,
     ) -> Result<(f32, Vec<[f32; 3]>)> {
-        let (x1, y1, x2, y2) = crop_box_pad(frame, det, pad_x, pad_y);
         let name = self.lm_name.clone();
         let bytes = self.enhance.run(frame)?;
         let crop = crop_slice(bytes, frame.width, frame.height, x1, y1, x2, y2);
@@ -448,7 +551,12 @@ impl CudaPipe {
         Ok(())
     }
 
-    fn detect(&mut self, frame: &BgrImage) -> Result<Vec<[f32; 5]>> {
+    fn detect(
+        &mut self,
+        frame: &BgrImage,
+        threshold: f32,
+        max_faces: usize,
+    ) -> Result<Vec<[f32; 5]>> {
         self.upload_frame(frame, true)?;
         self.ensure_enhanced()?;
         let mut pre_bind = self.pre_det.create_binding().map_err(oe)?;
@@ -467,27 +575,29 @@ impl CudaPipe {
             .map_err(oe)?;
         Self::bind_f16_outs(&self.det, &mut det_bind, &self.pin_out)?;
         let det_out = self.det.run_binding(&det_bind).map_err(oe)?;
-        let got = collect_f16(&det_out)?;
-        Ok(detect_faces(
-            &got[0],
-            &got[1],
+        let a = crate::session::output_f16(&det_out, 0)?;
+        let b = crate::session::output_f16(&det_out, 1)?;
+        Ok(crate::decode::detect_faces_data(
+            a,
+            b,
             frame.width,
             frame.height,
-            0.6,
+            threshold,
+            max_faces,
         ))
     }
 
-    fn landmarks(
+    fn landmarks_roi(
         &mut self,
         frame: &BgrImage,
-        det: &[f32; 5],
+        x1: i32,
+        y1: i32,
+        x2: i32,
+        y2: i32,
         spec: LmSpec,
-        pad_x: f32,
-        pad_y: f32,
     ) -> Result<(f32, Vec<[f32; 3]>)> {
         self.upload_frame(frame, false)?;
         self.ensure_enhanced()?;
-        let (x1, y1, x2, y2) = crop_box_pad(frame, det, pad_x, pad_y);
         if x2 - x1 < 4 || y2 - y1 < 4 {
             bail!("crop too small");
         }
@@ -518,11 +628,11 @@ impl CudaPipe {
         lm_bind.bind_input(self.lm_in.clone(), &nchw).map_err(oe)?;
         Self::bind_f16_outs(&self.lm, &mut lm_bind, &self.pin_out)?;
         let lm_out = self.lm.run_binding(&lm_bind).map_err(oe)?;
-        let got = collect_f16(&lm_out)?;
+        let data = crate::session::output_f16(&lm_out, 0)?;
         let scale_x = (x2 - x1) as f32 / spec.size as f32;
         let scale_y = (y2 - y1) as f32 / spec.size as f32;
-        Ok(decode_landmarks(
-            &got[0],
+        Ok(decode_landmarks_data(
+            data,
             [x1 as f32, y1 as f32, scale_x, scale_y],
             spec,
         ))

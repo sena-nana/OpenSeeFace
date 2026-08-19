@@ -4,6 +4,7 @@
 //! buffers so ORT can DMA without an extra pageable copy. Intermediate device
 //! tensors for the detect→landmark pipeline live in `gpu_pre`.
 
+use std::fmt;
 use std::path::Path;
 use std::str::FromStr;
 use std::time::Instant;
@@ -41,6 +42,12 @@ impl Device {
     }
 }
 
+impl fmt::Display for Device {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl FromStr for Device {
     type Err = anyhow::Error;
 
@@ -59,7 +66,7 @@ pub(crate) fn oe(e: impl std::fmt::Display) -> anyhow::Error {
 
 pub(crate) fn gpu_eps() -> Result<Vec<ort::ep::ExecutionProviderDispatch>> {
     #[cfg(not(feature = "gpu"))]
-    bail!("GPU requested; rebuild with `--features gpu`");
+    bail!("GPU requested; rebuild with `--features gpu` or use `--device cpu`");
 
     #[cfg(feature = "gpu")]
     {
@@ -80,7 +87,7 @@ pub(crate) fn gpu_eps() -> Result<Vec<ort::ep::ExecutionProviderDispatch>> {
             eps.push(ort::ep::CUDA::default().build().error_on_failure());
         }
         if eps.is_empty() {
-            bail!("GPU requested but no GPU execution provider is available");
+            bail!("GPU requested but no GPU execution provider is available; use --device cpu");
         }
         Ok(eps)
     }

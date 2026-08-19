@@ -1,7 +1,11 @@
 #!/bin/bash
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-cargo build --release --manifest-path "$ROOT/runtime-ort/Cargo.toml" --bin facetracker
+SCRIPT="$ROOT/runtime-ort/scripts/wrap_preprocess.py"
+uv run python "$SCRIPT" --models-dir "$ROOT/models" \
+  || python3 "$SCRIPT" --models-dir "$ROOT/models" \
+  || echo "warning: could not generate models/pre (need Python + onnx); --device gpu can generate them at first run" >&2
+cargo build --release --features gpu --manifest-path "$ROOT/runtime-ort/Cargo.toml" --bin facetracker
 mkdir -p "$ROOT/dist/facetracker"
 BIN="$ROOT/runtime-ort/target/release/facetracker"
 if [[ -f "$BIN.exe" ]]; then
