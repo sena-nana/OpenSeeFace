@@ -20,7 +20,7 @@ I ran OpenSeeFace on a sample clip from the video presentation for [3D Face Reco
 
 # Usage
 
-The tracker is the `facetracker` CLI in `runtime-ort`. It reads a webcam, still, or video file, and writes one 1805-byte OpenSee packet per face to UDP (`127.0.0.1:11573` by default): 19 expression features. Slots 14–18 are `MouthPucker`, `MouthOffsetX` (positive = person's right), `CheekPuff`, `JawOpen`, and `MouthFunnel`. Unity still reads older 1785-byte / 14-feature and 1797-byte / 17-feature packets. Tracking can run on a different machine from the consumer.
+The tracker is the `facetracker` CLI in `runtime-ort`. It reads a webcam, still, or video file, and writes one 1809-byte OpenSee packet per face to UDP (`127.0.0.1:11573` by default): 20 expression features. Slots 14–19 are `MouthPucker`, `MouthOffsetX` (positive = person's right), `CheekPuff`, `JawOpen`, `MouthFunnel`, and `MouthPressLipOpen` (landmark heuristic: +teeth / −thinner closed lips; no tongue). Unity still reads older 1785-byte / 14-feature, 1797-byte / 17-feature, and 1805-byte / 19-feature packets. Tracking can run on a different machine from the consumer.
 
 If you downloaded a release on Windows, run `facetracker.exe` from the `Binary` folder (`run.bat` is a short camera demo). From source:
 
@@ -51,7 +51,7 @@ CPU is the default. GPU (CoreML on Apple, CUDA on NVIDIA) uses the same loop; de
 
 # Unity compatibility
 
-The binary is still named `facetracker` and sends the 1805-byte OpenSee packet, so `Unity/OpenSeeLauncher.cs` can start it. `--benchmark` / `--priority` are accepted for that launcher. Receiver scripts are in `Unity/` and `Examples/`; copy `OpenSee.trackingData` before use (it is written from another thread). Sample project: [OpenSeeFaceSample](https://github.com/emilianavt/OpenSeeFaceSample).
+The binary is still named `facetracker` and sends the 1809-byte OpenSee packet, so `Unity/OpenSeeLauncher.cs` can start it. `--benchmark` / `--priority` are accepted for that launcher. Receiver scripts are in `Unity/` and `Examples/`; copy `OpenSee.trackingData` before use (it is written from another thread). Sample project: [OpenSeeFaceSample](https://github.com/emilianavt/OpenSeeFaceSample).
 
 # Models
 

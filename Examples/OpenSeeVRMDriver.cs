@@ -901,6 +901,8 @@ public class OpenSeeVRMDriver : MonoBehaviour {
                     proxy.SetPerfectSync("MOUTHFUNNEL", openSeeData.features.MouthFunnel, lastPerfectSync);
                 else
                     proxy.SetPerfectSync("MOUTHFUNNEL", 0, lastPerfectSync);
+
+                // MouthPressLipOpen is VBridger/Live2D, not ARKit MouthPress L/R.
                 
                 if (openSeeData.features.MouthOffsetX < -0.3f)
                     proxy.SetPerfectSync("MOUTHLEFT", -openSeeData.features.MouthOffsetX * 0.5f, lastPerfectSync);

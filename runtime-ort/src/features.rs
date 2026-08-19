@@ -5,7 +5,7 @@
 
 use crate::geom::{angle, rotate};
 
-pub const FEATURE_COUNT: usize = 19;
+pub const FEATURE_COUNT: usize = 20;
 pub type FeatureVec = [f32; FEATURE_COUNT];
 
 pub const FEATURE_NAMES: [&str; FEATURE_COUNT] = [
@@ -28,14 +28,16 @@ pub const FEATURE_NAMES: [&str; FEATURE_COUNT] = [
     "cheek_puff",
     "jaw_open",
     "mouth_funnel",
+    "mouth_press_lip_open",
 ];
 
-/// Official UDP feature slots 14–18.
+/// Official UDP feature slots 14–19.
 pub const FEAT_MOUTH_PUCKER: usize = 14;
 pub const FEAT_MOUTH_OFFSET_X: usize = 15;
 pub const FEAT_CHEEK_PUFF: usize = 16;
 pub const FEAT_JAW_OPEN: usize = 17;
 pub const FEAT_MOUTH_FUNNEL: usize = 18;
+pub const FEAT_MOUTH_PRESS_LIP_OPEN: usize = 19;
 
 /// Bias so [`Feature`] median stays away from 0 (signed offset around rest).
 const OFFSET_BIAS: f32 = 1.0;
@@ -45,6 +47,8 @@ const CHEEK_SMILE_GATE: f32 = 0.3;
 const CHEEK_OPEN_GATE: f32 = 0.5;
 const FUNNEL_NARROW_FRAC: f32 = 0.92;
 const FUNNEL_GAP_MIN: f32 = 0.2;
+const PRESS_W: f32 = 0.8;
+const PRESS_LIP_BIAS: f32 = 6.0;
 
 struct Remedian {
     k: usize,
@@ -393,6 +397,7 @@ pub struct FeatureExtractor {
     cheek_puff: Feature,
     jaw_open: Feature,
     mouth_funnel: Feature,
+    mouth_press_lip_open: Feature,
 }
 
 impl FeatureExtractor {
@@ -417,6 +422,7 @@ impl FeatureExtractor {
             cheek_puff: Feature::new(0.02, max_feature_updates),
             jaw_open: Feature::new_positive(0.15, max_feature_updates),
             mouth_funnel: Feature::new_positive(0.05, max_feature_updates),
+            mouth_press_lip_open: Feature::new(0.05, max_feature_updates),
         }
     }
 
@@ -542,6 +548,34 @@ impl FeatureExtractor {
             mouth_funnel = 0.0;
         }
 
+        let upper_outer = (pts[49][1] + pts[50][1] + pts[51][1]) / 3.0;
+        let lower_outer = (pts[54][1] + pts[55][1] + pts[56][1]) / 3.0;
+        let inner_upper = (pts[59][1] + pts[60][1] + pts[61][1]) / 3.0;
+        let inner_lower = (pts[63][1] + pts[64][1] + pts[65][1]) / 3.0;
+        let mut press_raw = -(pts[30][1] - upper_outer) / ny - (lower_outer - pts[8][1]) / ny
+            + PRESS_W * ((upper_outer - inner_upper) + (inner_lower - lower_outer)) / ny
+            + PRESS_LIP_BIAS;
+        let med = self.mouth_press_lip_open.raw_median();
+        let block_minus = mouth_pucker > CHEEK_SMILE_GATE
+            || mouth_wide > CHEEK_SMILE_GATE
+            || inner_gap > FUNNEL_GAP_MIN
+            || jaw_open > CHEEK_SMILE_GATE;
+        if med.abs() > 1e-6 {
+            if mouth_funnel > 0.0 {
+                press_raw = press_raw.min(med);
+            }
+            if block_minus {
+                press_raw = press_raw.max(med);
+            }
+        }
+        let mut mouth_press_lip_open = self.mouth_press_lip_open.update(press_raw, now);
+        if mouth_funnel > 0.0 {
+            mouth_press_lip_open = mouth_press_lip_open.min(0.0);
+        }
+        if block_minus {
+            mouth_press_lip_open = mouth_press_lip_open.max(0.0);
+        }
+
         let mouth_cx =
             (pts[50][0] + pts[55][0] + pts[58][0] + pts[60][0] + pts[62][0] + pts[64][0]) / 6.0;
         let mouth_offset_x = self.mouth_offset_x.update(mouth_cx / nx + OFFSET_BIAS, now);
@@ -579,6 +613,7 @@ impl FeatureExtractor {
             cheek_puff,
             jaw_open,
             mouth_funnel,
+            mouth_press_lip_open,
         ]
     }
 }
@@ -871,6 +906,32 @@ mod tests {
         p
     }
 
+    fn bare_teeth(pts: &[[f32; 3]], dy: f32) -> Vec<[f32; 3]> {
+        let mut p = pts.to_vec();
+        for i in [48, 49, 50, 51, 52, 59, 60, 61] {
+            p[i][1] += dy;
+        }
+        for i in [53, 54, 55, 56, 57, 63, 64, 65] {
+            p[i][1] -= dy;
+        }
+        p
+    }
+
+    fn press_lips(pts: &[[f32; 3]], collapse: f32) -> Vec<[f32; 3]> {
+        let mut p = pts.to_vec();
+        let ou = (p[49][1] + p[50][1] + p[51][1]) / 3.0;
+        let iu = (p[59][1] + p[60][1] + p[61][1]) / 3.0;
+        let il = (p[63][1] + p[64][1] + p[65][1]) / 3.0;
+        let ol = (p[54][1] + p[55][1] + p[56][1]) / 3.0;
+        for i in [48, 49, 50, 51, 52] {
+            p[i][1] += (iu - ou) * collapse;
+        }
+        for i in [53, 54, 55, 56, 57] {
+            p[i][1] += (il - ol) * collapse;
+        }
+        p
+    }
+
     fn apply_label(rest: &[[f32; 3]], label: MouthLabel, intensity: f32) -> Vec<[f32; 3]> {
         let t = intensity.clamp(0.0, 1.0);
         let target = match label {
@@ -897,6 +958,8 @@ mod tests {
         last_after(ext, &open_mouth(rest, 3.0), 12);
         last_after(ext, &drop_chin(rest, 0.14), 12);
         last_after(ext, &funnel_mouth(rest, 0.55, 2.8), 12);
+        last_after(ext, &bare_teeth(rest, 0.05), 12);
+        last_after(ext, &press_lips(rest, 0.7), 12);
         last_after(ext, rest, 16);
     }
 
@@ -1096,6 +1159,11 @@ mod tests {
             "rest funnel {}",
             f[FEAT_MOUTH_FUNNEL]
         );
+        assert!(
+            f[FEAT_MOUTH_PRESS_LIP_OPEN].abs() < DETECT_TH,
+            "rest press-lip-open {}",
+            f[FEAT_MOUTH_PRESS_LIP_OPEN]
+        );
     }
 
     #[test]
@@ -1119,6 +1187,45 @@ mod tests {
             "chin drop missed jaw {}",
             jaw[FEAT_JAW_OPEN]
         );
+    }
+
+    #[test]
+    fn mouth_press_lip_open_tracks_teeth_not_jaw() {
+        let rest = canonical_face();
+        let mut ext = FeatureExtractor::new(0.0);
+        calibrate_mouth(&mut ext, &rest);
+        let mut seed = 11u32;
+        let slot = FEAT_MOUTH_PRESS_LIP_OPEN;
+        let teeth = read_noisy(&mut ext, &bare_teeth(&rest, 0.05), 16, &mut seed, 0.0035);
+        last_after(&mut ext, &rest, 10);
+        let press = read_noisy(&mut ext, &press_lips(&rest, 0.7), 16, &mut seed, 0.0035);
+        last_after(&mut ext, &rest, 10);
+        let jaw = read_noisy(&mut ext, &drop_chin(&rest, 0.14), 16, &mut seed, 0.0035);
+        last_after(&mut ext, &rest, 10);
+        let funnel = read_noisy(
+            &mut ext,
+            &funnel_mouth(&rest, 0.55, 2.8),
+            16,
+            &mut seed,
+            0.0035,
+        );
+        last_after(&mut ext, &rest, 10);
+        let puck = read_noisy(
+            &mut ext,
+            &pucker_lips(&rest, 0.45, 0.10),
+            16,
+            &mut seed,
+            0.0035,
+        );
+        last_after(&mut ext, &rest, 10);
+        let smile = read_noisy(&mut ext, &smile_mouth(&rest, 1.6), 16, &mut seed, 0.0035);
+
+        assert!(teeth[slot] > DETECT_TH, "teeth {}", teeth[slot]);
+        assert!(press[slot] < -DETECT_TH, "press {}", press[slot]);
+        assert!(jaw[slot] < DETECT_TH, "jaw {}", jaw[slot]);
+        assert!(funnel[slot] < DETECT_TH, "funnel {}", funnel[slot]);
+        assert!(puck[slot].abs() < DETECT_TH, "pucker {}", puck[slot]);
+        assert!(smile[slot] > -DETECT_TH, "smile {}", smile[slot]);
     }
 
     #[test]
@@ -1265,5 +1372,7 @@ mod tests {
         assert!(hf > 0.5 && hfs < 0.15, "hold funnel {hf} std {hfs}");
         assert!(lip[FEAT_JAW_OPEN] < DETECT_TH && lip[FEAT_MOUTH_FUNNEL] < DETECT_TH);
         assert!(puck[FEAT_MOUTH_FUNNEL] < DETECT_TH && smile[FEAT_MOUTH_FUNNEL] < DETECT_TH);
+        assert!(puck[FEAT_MOUTH_PRESS_LIP_OPEN].abs() < DETECT_TH);
+        assert!(smile[FEAT_MOUTH_PRESS_LIP_OPEN] > -DETECT_TH);
     }
 }

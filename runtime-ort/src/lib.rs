@@ -34,7 +34,7 @@ pub use decode::{
 pub use enhance::{enhance_bgr, enhance_bgr_in_place, EnhanceCfg, HeMode};
 pub use features::{
     FeatureVec, FEATURE_COUNT, FEATURE_NAMES, FEAT_CHEEK_PUFF, FEAT_JAW_OPEN, FEAT_MOUTH_FUNNEL,
-    FEAT_MOUTH_OFFSET_X, FEAT_MOUTH_PUCKER,
+    FEAT_MOUTH_OFFSET_X, FEAT_MOUTH_PRESS_LIP_OPEN, FEAT_MOUTH_PUCKER,
 };
 pub use filter::{unwrap_deg, FilterCfg, FilterKind, FilterQuality, OutputFilter};
 pub use geom::xywh_iou;

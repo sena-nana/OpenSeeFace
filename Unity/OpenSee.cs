@@ -18,7 +18,8 @@ public class OpenSee : MonoBehaviour {
     private const int nPoints = 68;
     private const int packetFrameSizeLegacy = 8 + 4 + 2 * 4 + 2 * 4 + 1 + 4 + 3 * 4 + 3 * 4 + 4 * 4 + 4 * 68 + 4 * 2 * 68 + 4 * 3 * 70 + 4 * 14;
     private const int packetFrameSize17 = packetFrameSizeLegacy + 4 * 3;
-    private const int packetFrameSize = packetFrameSizeLegacy + 4 * 5;
+    private const int packetFrameSize19 = packetFrameSizeLegacy + 4 * 5;
+    private const int packetFrameSize = packetFrameSizeLegacy + 4 * 6;
 
     [Header("Tracking data")]
     [Tooltip("This is an informational property that tells you how many packets have been received")]
@@ -108,6 +109,8 @@ public class OpenSee : MonoBehaviour {
             public float JawOpen;
             [Tooltip("This field indicates how funneled the lips are, compared to the median pose.")]
             public float MouthFunnel;
+            [Tooltip("Lip open (+) vs pressed/rolled (-) from landmarks. Heuristic; no tongue.")]
+            public float MouthPressLipOpen;
         }
 
         public OpenSeeData() {
@@ -211,24 +214,34 @@ public class OpenSee : MonoBehaviour {
             features.MouthCornerInOutRight = readFloat(b, ref o);
             features.MouthOpen = readFloat(b, ref o);
             features.MouthWide = readFloat(b, ref o);
-            if (end - o >= 20) {
+            if (end - o >= 24) {
                 features.MouthPucker = readFloat(b, ref o);
                 features.MouthOffsetX = readFloat(b, ref o);
                 features.CheekPuff = readFloat(b, ref o);
                 features.JawOpen = readFloat(b, ref o);
                 features.MouthFunnel = readFloat(b, ref o);
+                features.MouthPressLipOpen = readFloat(b, ref o);
+            } else if (end - o >= 20) {
+                features.MouthPucker = readFloat(b, ref o);
+                features.MouthOffsetX = readFloat(b, ref o);
+                features.CheekPuff = readFloat(b, ref o);
+                features.JawOpen = readFloat(b, ref o);
+                features.MouthFunnel = readFloat(b, ref o);
+                features.MouthPressLipOpen = 0f;
             } else if (end - o >= 12) {
                 features.MouthPucker = readFloat(b, ref o);
                 features.MouthOffsetX = readFloat(b, ref o);
                 features.CheekPuff = readFloat(b, ref o);
                 features.JawOpen = 0f;
                 features.MouthFunnel = 0f;
+                features.MouthPressLipOpen = 0f;
             } else {
                 features.MouthPucker = 0f;
                 features.MouthOffsetX = 0f;
                 features.CheekPuff = 0f;
                 features.JawOpen = 0f;
                 features.MouthFunnel = 0f;
+                features.MouthPressLipOpen = 0f;
             }
         }
     }
@@ -256,6 +269,8 @@ public class OpenSee : MonoBehaviour {
                 int frameSize = 0;
                 if (receivedBytes >= packetFrameSize && receivedBytes % packetFrameSize == 0)
                     frameSize = packetFrameSize;
+                else if (receivedBytes >= packetFrameSize19 && receivedBytes % packetFrameSize19 == 0)
+                    frameSize = packetFrameSize19;
                 else if (receivedBytes >= packetFrameSize17 && receivedBytes % packetFrameSize17 == 0)
                     frameSize = packetFrameSize17;
                 else if (receivedBytes >= packetFrameSizeLegacy && receivedBytes % packetFrameSizeLegacy == 0)
