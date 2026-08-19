@@ -210,7 +210,7 @@ public class OpenSeeExpression : MonoBehaviour
     private string[] classLabels = null;
     private int maxSamples = 1666;
     // rightEyeOpen, leftEyeOpen, translation, rawQuaternion, rawEuler, confidence, points/(width, height), points3D, features
-    private int colsFull = 1 + 1 + 3 + 4 + 3 + /*66 + 2 * 66  +*/ 3 * 66 + 14;
+    private int colsFull = 1 + 1 + 3 + 4 + 3 + /*66 + 2 * 66  +*/ 3 * 66 + 17;
     private int colsBase = 1 + 1 + 3 + 4 + 3;
     private int cols;
     private double lastCapture = 0.0;
@@ -330,7 +330,7 @@ public class OpenSeeExpression : MonoBehaviour
                 }
             }
         if (pointSelection.features)
-            for (int i = 0; i < 14; i++) {
+            for (int i = 0; i < 17; i++) {
                 indexList.Add(colsBase + 66 * 3 + i);
                 cols++;
             }
@@ -410,6 +410,9 @@ public class OpenSeeExpression : MonoBehaviour
         data[12 + 66 * 3 + 11] = t.features.MouthCornerInOutRight;
         data[12 + 66 * 3 + 12] = t.features.MouthOpen;
         data[12 + 66 * 3 + 13] = t.features.MouthWide;
+        data[12 + 66 * 3 + 14] = t.features.MouthPucker;
+        data[12 + 66 * 3 + 15] = t.features.MouthOffsetX;
+        data[12 + 66 * 3 + 16] = t.features.CheekPuff;
         return data;
     }
 

@@ -1,7 +1,13 @@
-//! OpenSee UDP packet (1785 bytes / face). Same layout as Unity `OpenSee.packetFrameSize`.
+//! Official OpenSee UDP packet: 1797 bytes / face, 17 expression features.
+//! Slots 14–16 are `mouth_pucker`, `mouth_offset_x`, `cheek_puff`.
+//! Unity still accepts 1785-byte (14-feature) packets.
 
-/// 8+4+8+8+1+4+12+12+16+272+544+840+56 = 1785
-pub const PACKET_FRAME_SIZE: usize = 1785;
+use crate::features::FeatureVec;
+
+/// 8+4+8+8+1+4+12+12+16+272+544+840+68 = 1797
+pub const PACKET_FRAME_SIZE: usize = 1797;
+/// Older 14-feature packets. Tracker no longer emits these.
+pub const PACKET_FRAME_SIZE_LEGACY: usize = 1785;
 
 #[derive(Clone, Debug)]
 pub struct FacePacket {
@@ -17,7 +23,7 @@ pub struct FacePacket {
     pub translation: [f32; 3],
     pub lms: Vec<[f32; 3]>,
     pub pts_3d: [[f32; 3]; 70],
-    pub features: [f32; 14],
+    pub features: FeatureVec,
 }
 
 pub fn encode_face(f: &FacePacket) -> Vec<u8> {
@@ -82,10 +88,10 @@ pub fn encode_faces_into(out: &mut Vec<u8>, faces: &[FacePacket]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::features::{FEATURE_COUNT, FEAT_CHEEK_PUFF, FEAT_MOUTH_OFFSET_X, FEAT_MOUTH_PUCKER};
 
-    #[test]
-    fn packet_is_1785() {
-        let f = FacePacket {
+    fn sample() -> FacePacket {
+        FacePacket {
             time: 1.0,
             id: 0,
             width: 640.0,
@@ -98,9 +104,13 @@ mod tests {
             translation: [0.0; 3],
             lms: vec![[0.0; 3]; 68],
             pts_3d: [[0.0; 3]; 70],
-            features: [0.0; 14],
-        };
-        assert_eq!(encode_face(&f).len(), PACKET_FRAME_SIZE);
+            features: [0.0; FEATURE_COUNT],
+        }
+    }
+
+    #[test]
+    fn packet_is_1797() {
+        assert_eq!(encode_face(&sample()).len(), PACKET_FRAME_SIZE);
         assert_eq!(
             PACKET_FRAME_SIZE,
             8 + 4
@@ -114,7 +124,24 @@ mod tests {
                 + 4 * 68
                 + 4 * 2 * 68
                 + 4 * 3 * 70
-                + 4 * 14
+                + 4 * FEATURE_COUNT
         );
+        assert_eq!(PACKET_FRAME_SIZE_LEGACY, PACKET_FRAME_SIZE - 4 * 3);
+    }
+
+    #[test]
+    fn extra_features_are_appended() {
+        let mut f = sample();
+        f.features[FEAT_MOUTH_PUCKER] = 0.5;
+        f.features[FEAT_MOUTH_OFFSET_X] = -0.25;
+        f.features[FEAT_CHEEK_PUFF] = 0.8;
+        let bytes = encode_face(&f);
+        let n = bytes.len();
+        let pucker = f32::from_le_bytes(bytes[n - 12..n - 8].try_into().unwrap());
+        let offset = f32::from_le_bytes(bytes[n - 8..n - 4].try_into().unwrap());
+        let puff = f32::from_le_bytes(bytes[n - 4..n].try_into().unwrap());
+        assert_eq!(pucker, 0.5);
+        assert_eq!(offset, -0.25);
+        assert_eq!(puff, 0.8);
     }
 }

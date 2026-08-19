@@ -27,15 +27,18 @@ pub use adaptive::{
 };
 pub use capture::{list_cameras, mirror_bgr, InputSource, PipedInput, VideoOut};
 pub use crop::{stable_landmark_bbox, CropSmoothState, CropTrack};
-pub use glasses::{ear_2d, paint_synthetic_glasses};
 pub use decode::{
     decode_landmarks, decode_landmarks_data, detect_faces, detect_faces_n, landmark_bbox,
     mean_conf, LmSpec, TensorF16, EYE_IDX,
 };
 pub use enhance::{enhance_bgr, enhance_bgr_in_place, EnhanceCfg, HeMode};
-pub use features::FEATURE_NAMES;
+pub use features::{
+    FeatureVec, FEATURE_COUNT, FEATURE_NAMES, FEAT_CHEEK_PUFF, FEAT_MOUTH_OFFSET_X,
+    FEAT_MOUTH_PUCKER,
+};
 pub use filter::{unwrap_deg, FilterCfg, FilterKind, FilterQuality, OutputFilter};
 pub use geom::xywh_iou;
+pub use glasses::{ear_2d, paint_synthetic_glasses};
 pub use gpu_pre::GpuTracker;
 pub use metrics::{cosine, max_abs, mean_abs, model_path, read_f32_le, rss, Latency, Rss};
 pub use pnp::Camera;
@@ -45,7 +48,10 @@ pub use preprocess::{
 };
 pub use session::{Device, OrtModel};
 pub use tracker::{model_base_path, FaceInfo, Tracker, TrackerConfig};
-pub use udp::{encode_face, encode_faces, encode_faces_into, FacePacket, PACKET_FRAME_SIZE};
+pub use udp::{
+    encode_face, encode_faces, encode_faces_into, FacePacket, PACKET_FRAME_SIZE,
+    PACKET_FRAME_SIZE_LEGACY,
+};
 pub use viz::{draw_tracking, dump_symmetric_points, VizWindow};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

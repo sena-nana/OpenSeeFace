@@ -882,8 +882,8 @@ public class OpenSeeVRMDriver : MonoBehaviour {
                 proxy.SetPerfectSync("EYEWIDERIGHT", 0, lastPerfectSync);
             
             if (trackMouth) {
-                if (openSeeData.features.MouthWide < 0.5f)
-                    proxy.SetPerfectSync("MOUTHPUCKER", -openSeeData.features.MouthWide * 0.3f, lastPerfectSync);
+                if (openSeeData.features.MouthPucker > 0.0f)
+                    proxy.SetPerfectSync("MOUTHPUCKER", openSeeData.features.MouthPucker, lastPerfectSync);
                 else
                     proxy.SetPerfectSync("MOUTHPUCKER", 0, lastPerfectSync);
                 
@@ -898,15 +898,20 @@ public class OpenSeeVRMDriver : MonoBehaviour {
                     proxy.SetPerfectSync("MOUTHCLOSE", 0, lastPerfectSync);
                 }
                 
-                if (openSeeData.features.MouthCornerInOutLeft > 0.3f)
-                    proxy.SetPerfectSync("MOUTHLEFT", openSeeData.features.MouthCornerInOutLeft * 0.5f, lastPerfectSync);
+                if (openSeeData.features.MouthOffsetX < -0.3f)
+                    proxy.SetPerfectSync("MOUTHLEFT", -openSeeData.features.MouthOffsetX * 0.5f, lastPerfectSync);
                 else
                     proxy.SetPerfectSync("MOUTHLEFT", 0, lastPerfectSync);
 
-                if (openSeeData.features.MouthCornerInOutRight > 0.3f)
-                    proxy.SetPerfectSync("MOUTHRIGHT", openSeeData.features.MouthCornerInOutRight * 0.5f, lastPerfectSync);
+                if (openSeeData.features.MouthOffsetX > 0.3f)
+                    proxy.SetPerfectSync("MOUTHRIGHT", openSeeData.features.MouthOffsetX * 0.5f, lastPerfectSync);
                 else
                     proxy.SetPerfectSync("MOUTHRIGHT", 0, lastPerfectSync);
+
+                if (openSeeData.features.CheekPuff > 0.0f)
+                    proxy.SetPerfectSync("CHEEKPUFF", openSeeData.features.CheekPuff, lastPerfectSync);
+                else
+                    proxy.SetPerfectSync("CHEEKPUFF", 0, lastPerfectSync);
 
                 if (openSeeData.features.MouthCornerUpDownLeft > 0.3f)
                     proxy.SetPerfectSync("MOUTHSMILELEFT", openSeeData.features.MouthCornerUpDownLeft * 0.5f, lastPerfectSync);

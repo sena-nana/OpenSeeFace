@@ -553,7 +553,7 @@ pub fn adjust_3d(
     update_counts: &mut [[f32; 2]; 66],
     feature_level: i32,
     features: &mut crate::features::FeatureExtractor,
-    current_features: &mut [f32; 14],
+    current_features: &mut crate::features::FeatureVec,
     eye_blink: &mut [f32; 2],
 ) {
     if conf < 0.4 || pnp_error > 300.0 {
@@ -672,7 +672,7 @@ fn apply_features(
     pts_3d: &[[f32; 3]; 70],
     feature_level: i32,
     features: &mut crate::features::FeatureExtractor,
-    current_features: &mut [f32; 14],
+    current_features: &mut crate::features::FeatureVec,
     eye_blink: &mut [f32; 2],
     eye_conf: Option<f32>,
 ) {

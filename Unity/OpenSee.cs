@@ -16,7 +16,8 @@ public class OpenSee : MonoBehaviour {
     public int listenPort = 11573;
 
     private const int nPoints = 68;
-    private const int packetFrameSize = 8 + 4 + 2 * 4 + 2 * 4 + 1 + 4 + 3 * 4 + 3 * 4 + 4 * 4 + 4 * 68 + 4 * 2 * 68 + 4 * 3 * 70 + 4 * 14;
+    private const int packetFrameSizeLegacy = 8 + 4 + 2 * 4 + 2 * 4 + 1 + 4 + 3 * 4 + 3 * 4 + 4 * 4 + 4 * 68 + 4 * 2 * 68 + 4 * 3 * 70 + 4 * 14;
+    private const int packetFrameSize = packetFrameSizeLegacy + 4 * 3;
 
     [Header("Tracking data")]
     [Tooltip("This is an informational property that tells you how many packets have been received")]
@@ -96,6 +97,12 @@ public class OpenSee : MonoBehaviour {
             public float MouthOpen;
             [Tooltip("This field indicates how wide the mouth is, compared to its median pose.")]
             public float MouthWide;
+            [Tooltip("Lip pucker from narrowing plus forward lip Z, relative to the median pose.")]
+            public float MouthPucker;
+            [Tooltip("Signed mouth X offset in head space. Positive is toward the person's right.")]
+            public float MouthOffsetX;
+            [Tooltip("Cheek puff from mid-jaw contour width versus eye width. Heuristic; there are no cheek landmarks.")]
+            public float CheekPuff;
         }
 
         public OpenSeeData() {
@@ -135,6 +142,11 @@ public class OpenSee : MonoBehaviour {
         }
         
         public void readFromPacket(byte[] b, int o) {
+            readFromPacket(b, o, packetFrameSize);
+        }
+
+        public void readFromPacket(byte[] b, int o, int frameSize) {
+            int end = o + frameSize;
             time = System.BitConverter.ToDouble(b, o);
             o += 8;
             id = System.BitConverter.ToInt32(b, o);
@@ -194,6 +206,15 @@ public class OpenSee : MonoBehaviour {
             features.MouthCornerInOutRight = readFloat(b, ref o);
             features.MouthOpen = readFloat(b, ref o);
             features.MouthWide = readFloat(b, ref o);
+            if (end - o >= 12) {
+                features.MouthPucker = readFloat(b, ref o);
+                features.MouthOffsetX = readFloat(b, ref o);
+                features.CheekPuff = readFloat(b, ref o);
+            } else {
+                features.MouthPucker = 0f;
+                features.MouthOffsetX = 0f;
+                features.CheekPuff = 0f;
+            }
         }
     }
 
@@ -217,14 +238,18 @@ public class OpenSee : MonoBehaviour {
         while (!stopReception) {
             try {
                 int receivedBytes = socket.ReceiveFrom(buffer, SocketFlags.None, ref senderRemote);
-                if (receivedBytes < 1 || receivedBytes % packetFrameSize != 0) {
+                int frameSize = 0;
+                if (receivedBytes >= packetFrameSize && receivedBytes % packetFrameSize == 0)
+                    frameSize = packetFrameSize;
+                else if (receivedBytes >= packetFrameSizeLegacy && receivedBytes % packetFrameSizeLegacy == 0)
+                    frameSize = packetFrameSizeLegacy;
+                else
                     continue;
-                }
                 receivedPackets++;
                 int i = 0;
-                for (int offset = 0; offset < receivedBytes; offset += packetFrameSize) {
+                for (int offset = 0; offset < receivedBytes; offset += frameSize) {
                     OpenSeeData newData = new OpenSeeData();
-                    newData.readFromPacket(buffer, offset);
+                    newData.readFromPacket(buffer, offset, frameSize);
                     openSeeDataMap[newData.id] = newData;
                     i++;
                 }

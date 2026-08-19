@@ -5,7 +5,10 @@
 
 use crate::geom::{angle, rotate};
 
-pub const FEATURE_NAMES: [&str; 14] = [
+pub const FEATURE_COUNT: usize = 17;
+pub type FeatureVec = [f32; FEATURE_COUNT];
+
+pub const FEATURE_NAMES: [&str; FEATURE_COUNT] = [
     "eye_l",
     "eye_r",
     "eyebrow_steepness_l",
@@ -20,7 +23,22 @@ pub const FEATURE_NAMES: [&str; 14] = [
     "mouth_corner_inout_r",
     "mouth_open",
     "mouth_wide",
+    "mouth_pucker",
+    "mouth_offset_x",
+    "cheek_puff",
 ];
+
+/// Official UDP feature slots 14–16.
+pub const FEAT_MOUTH_PUCKER: usize = 14;
+pub const FEAT_MOUTH_OFFSET_X: usize = 15;
+pub const FEAT_CHEEK_PUFF: usize = 16;
+
+/// Bias so [`Feature`] median stays away from 0 (signed offset around rest).
+const OFFSET_BIAS: f32 = 1.0;
+const PUCKER_Z_WEIGHT: f32 = 0.5;
+const CHEEK_Z_WEIGHT: f32 = 0.5;
+const CHEEK_SMILE_GATE: f32 = 0.3;
+const CHEEK_OPEN_GATE: f32 = 0.5;
 
 struct Remedian {
     k: usize,
@@ -310,6 +328,9 @@ pub struct FeatureExtractor {
     mouth_corner_inout_r: Feature,
     mouth_open: Feature,
     mouth_wide: Feature,
+    mouth_pucker: Feature,
+    mouth_offset_x: Feature,
+    cheek_puff: Feature,
 }
 
 impl FeatureExtractor {
@@ -329,6 +350,9 @@ impl FeatureExtractor {
             mouth_corner_inout_r: Feature::new(0.02, max_feature_updates),
             mouth_open: Feature::new(0.15, max_feature_updates),
             mouth_wide: Feature::new(0.02, max_feature_updates),
+            mouth_pucker: Feature::new(0.02, max_feature_updates),
+            mouth_offset_x: Feature::new(0.02, max_feature_updates),
+            cheek_puff: Feature::new(0.02, max_feature_updates),
         }
     }
 
@@ -351,16 +375,11 @@ impl FeatureExtractor {
         (alpha, aligned)
     }
 
-    pub fn update(&mut self, pts: &[[f32; 3]], full: bool) -> [f32; 14] {
+    pub fn update(&mut self, pts: &[[f32; 3]], full: bool) -> FeatureVec {
         self.update_ex(pts, full, None)
     }
 
-    pub fn update_ex(
-        &mut self,
-        pts: &[[f32; 3]],
-        full: bool,
-        eye_conf: Option<f32>,
-    ) -> [f32; 14] {
+    pub fn update_ex(&mut self, pts: &[[f32; 3]], full: bool, eye_conf: Option<f32>) -> FeatureVec {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f32())
@@ -442,13 +461,49 @@ impl FeatureExtractor {
             .abs()
             / ny;
         let mouth_open = self.mouth_open.update(f, now);
-        let mouth_wide = self
-            .mouth_wide
-            .update((pts[58][0] - pts[62][0]).abs() / nx, now);
+        let mouth_w = (pts[58][0] - pts[62][0]).abs() / nx;
+        let mouth_wide = self.mouth_wide.update(mouth_w, now);
+
+        let lip_z = (pts[48][2] + pts[52][2] + pts[58][2] + pts[62][2]) / 4.0 - pts[30][2];
+        let mouth_pucker = self
+            .mouth_pucker
+            .update(1.0 - mouth_w + PUCKER_Z_WEIGHT * lip_z, now);
+
+        let mouth_cx =
+            (pts[50][0] + pts[55][0] + pts[58][0] + pts[60][0] + pts[62][0] + pts[64][0]) / 6.0;
+        let mouth_offset_x = self.mouth_offset_x.update(mouth_cx / nx + OFFSET_BIAS, now);
+
+        let eye_span = (pts[36][0] - pts[45][0]).abs().max(1e-6);
+        let cheek_span = ((pts[2][0] - pts[14][0]).abs() + (pts[3][0] - pts[13][0]).abs()) / 2.0;
+        let cheek_z =
+            (pts[2][2] + pts[3][2] + pts[4][2] + pts[12][2] + pts[13][2] + pts[14][2]) / 6.0;
+        let mut cheek_puff = self
+            .cheek_puff
+            .update(cheek_span / eye_span + CHEEK_Z_WEIGHT * cheek_z, now);
+        if mouth_wide > CHEEK_SMILE_GATE || mouth_open > CHEEK_OPEN_GATE {
+            cheek_puff = 0.0;
+        } else {
+            cheek_puff = cheek_puff.max(0.0);
+        }
 
         [
-            eye_l, eye_r, steep_l, up_l, quirk_l, steep_r, up_r, quirk_r, m_ud_l, m_io_l, m_ud_r,
-            m_io_r, mouth_open, mouth_wide,
+            eye_l,
+            eye_r,
+            steep_l,
+            up_l,
+            quirk_l,
+            steep_r,
+            up_r,
+            quirk_r,
+            m_ud_l,
+            m_io_l,
+            m_ud_r,
+            m_io_r,
+            mouth_open,
+            mouth_wide,
+            mouth_pucker,
+            mouth_offset_x,
+            cheek_puff,
         ]
     }
 }
@@ -568,5 +623,371 @@ mod tests {
             open.abs() < 0.2,
             "true-open EAR treated as closed after frame-height: {open}"
         );
+    }
+
+    fn canonical_face() -> Vec<[f32; 3]> {
+        let mut p = vec![[0.0f32; 3]; 66];
+        for i in 0..17 {
+            let t = i as f32 / 16.0;
+            let x = 0.45 * (1.0 - 2.0 * t);
+            let y = 0.30 - (std::f32::consts::PI * t).sin() * 0.90;
+            p[i] = [x, y, -0.72];
+        }
+        p[27] = [0.0, 0.29, -0.14];
+        p[28] = [0.0, 0.19, -0.07];
+        p[29] = [0.0, 0.10, -0.01];
+        p[30] = [0.0, 0.00, 0.00];
+        p[36] = [0.32, 0.30, -0.28];
+        p[37] = [0.27, 0.34, -0.25];
+        p[38] = [0.18, 0.34, -0.24];
+        p[39] = [0.13, 0.28, -0.23];
+        p[40] = [0.18, 0.26, -0.24];
+        p[41] = [0.27, 0.26, -0.25];
+        p[42] = [-0.13, 0.28, -0.23];
+        p[43] = [-0.18, 0.34, -0.24];
+        p[44] = [-0.27, 0.34, -0.25];
+        p[45] = [-0.32, 0.30, -0.28];
+        p[46] = [-0.27, 0.26, -0.25];
+        p[47] = [-0.18, 0.26, -0.24];
+        p[48] = [0.12, -0.21, -0.16];
+        p[49] = [0.04, -0.19, -0.10];
+        p[50] = [0.00, -0.21, -0.08];
+        p[51] = [-0.04, -0.19, -0.10];
+        p[52] = [-0.12, -0.21, -0.16];
+        p[53] = [-0.13, -0.29, -0.19];
+        p[54] = [-0.06, -0.33, -0.16];
+        p[55] = [0.00, -0.34, -0.11];
+        p[56] = [0.06, -0.33, -0.16];
+        p[57] = [0.13, -0.29, -0.19];
+        p[58] = [0.18, -0.24, -0.23];
+        p[59] = [0.08, -0.24, -0.16];
+        p[60] = [0.00, -0.26, -0.10];
+        p[61] = [-0.08, -0.24, -0.16];
+        p[62] = [-0.18, -0.24, -0.23];
+        p[63] = [-0.07, -0.25, -0.18];
+        p[64] = [0.00, -0.26, -0.11];
+        p[65] = [0.07, -0.25, -0.18];
+        p
+    }
+
+    fn last_after(ext: &mut FeatureExtractor, pts: &[[f32; 3]], n: u32) -> FeatureVec {
+        let mut f = [0.0; FEATURE_COUNT];
+        for _ in 0..n {
+            f = ext.update(pts, true);
+        }
+        f
+    }
+
+    fn shift_mouth_x(pts: &[[f32; 3]], dx: f32) -> Vec<[f32; 3]> {
+        let mut p = pts.to_vec();
+        for i in 48..66 {
+            p[i][0] += dx;
+        }
+        p
+    }
+
+    fn pucker_lips(pts: &[[f32; 3]], corner_scale: f32, forward: f32) -> Vec<[f32; 3]> {
+        let mut p = pts.to_vec();
+        p[58][0] *= corner_scale;
+        p[62][0] *= corner_scale;
+        for i in [48, 52, 58, 62] {
+            p[i][2] += forward;
+        }
+        p
+    }
+
+    fn scale_cheeks(pts: &[[f32; 3]], scale: f32, forward: f32) -> Vec<[f32; 3]> {
+        let mut p = pts.to_vec();
+        for i in [2, 3, 4, 12, 13, 14] {
+            p[i][0] *= scale;
+            p[i][2] += forward;
+        }
+        p
+    }
+
+    const DETECT_TH: f32 = 0.3;
+
+    #[derive(Clone, Copy, Debug)]
+    enum MouthLabel {
+        Neutral,
+        Pucker,
+        OffsetRight,
+        OffsetLeft,
+        Puff,
+        Smile,
+        Open,
+    }
+
+    const LABELS: [MouthLabel; 7] = [
+        MouthLabel::Neutral,
+        MouthLabel::Pucker,
+        MouthLabel::OffsetRight,
+        MouthLabel::OffsetLeft,
+        MouthLabel::Puff,
+        MouthLabel::Smile,
+        MouthLabel::Open,
+    ];
+
+    fn lcg(seed: &mut u32) -> f32 {
+        *seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        (*seed >> 8) as f32 / (u32::MAX >> 8) as f32
+    }
+
+    fn jitter(pts: &[[f32; 3]], seed: &mut u32, sigma: f32) -> Vec<[f32; 3]> {
+        pts.iter()
+            .map(|p| {
+                [
+                    p[0] + (lcg(seed) * 2.0 - 1.0) * sigma,
+                    p[1] + (lcg(seed) * 2.0 - 1.0) * sigma,
+                    p[2] + (lcg(seed) * 2.0 - 1.0) * sigma,
+                ]
+            })
+            .collect()
+    }
+
+    fn lerp_pts(a: &[[f32; 3]], b: &[[f32; 3]], t: f32) -> Vec<[f32; 3]> {
+        a.iter()
+            .zip(b.iter())
+            .map(|(p, q)| {
+                [
+                    p[0] + (q[0] - p[0]) * t,
+                    p[1] + (q[1] - p[1]) * t,
+                    p[2] + (q[2] - p[2]) * t,
+                ]
+            })
+            .collect()
+    }
+
+    fn smile_mouth(pts: &[[f32; 3]], corner_scale: f32) -> Vec<[f32; 3]> {
+        let mut p = pts.to_vec();
+        p[58][0] *= corner_scale;
+        p[62][0] *= corner_scale;
+        p
+    }
+
+    fn open_mouth(pts: &[[f32; 3]], gap_scale: f32) -> Vec<[f32; 3]> {
+        let mut p = pts.to_vec();
+        for i in [59, 60, 61] {
+            p[i][1] += 0.04 * (gap_scale - 1.0);
+        }
+        for i in [63, 64, 65, 53, 54, 55, 56, 57] {
+            p[i][1] -= 0.05 * (gap_scale - 1.0);
+        }
+        p
+    }
+
+    fn apply_label(rest: &[[f32; 3]], label: MouthLabel, intensity: f32) -> Vec<[f32; 3]> {
+        let t = intensity.clamp(0.0, 1.0);
+        let target = match label {
+            MouthLabel::Neutral => rest.to_vec(),
+            MouthLabel::Pucker => pucker_lips(rest, 0.45, 0.10),
+            MouthLabel::OffsetRight => shift_mouth_x(rest, 0.12),
+            MouthLabel::OffsetLeft => shift_mouth_x(rest, -0.12),
+            MouthLabel::Puff => scale_cheeks(rest, 1.25, 0.08),
+            MouthLabel::Smile => smile_mouth(rest, 1.6),
+            MouthLabel::Open => open_mouth(rest, 3.0),
+        };
+        lerp_pts(rest, &target, t)
+    }
+
+    fn calibrate_mouth(ext: &mut FeatureExtractor, rest: &[[f32; 3]]) {
+        last_after(ext, rest, 80);
+        last_after(ext, &pucker_lips(rest, 1.5, -0.04), 12);
+        last_after(ext, &pucker_lips(rest, 0.45, 0.10), 12);
+        last_after(ext, &shift_mouth_x(rest, -0.12), 12);
+        last_after(ext, &shift_mouth_x(rest, 0.12), 12);
+        last_after(ext, &scale_cheeks(rest, 0.85, -0.04), 12);
+        last_after(ext, &scale_cheeks(rest, 1.25, 0.08), 12);
+        last_after(ext, &pucker_lips(rest, 0.7, 0.0), 12);
+        last_after(ext, &open_mouth(rest, 3.0), 12);
+        last_after(ext, rest, 16);
+    }
+
+    fn read_noisy(
+        ext: &mut FeatureExtractor,
+        pts: &[[f32; 3]],
+        n: u32,
+        seed: &mut u32,
+        sigma: f32,
+    ) -> FeatureVec {
+        let mut f = [0.0; FEATURE_COUNT];
+        for _ in 0..n {
+            let j = jitter(pts, seed, sigma);
+            f = ext.update(&j, true);
+        }
+        f
+    }
+
+    #[derive(Default, Clone, Copy)]
+    struct Conf {
+        tp: u32,
+        fp: u32,
+        fn_: u32,
+        tn: u32,
+    }
+
+    impl Conf {
+        fn add(&mut self, pred: bool, truth: bool) {
+            match (pred, truth) {
+                (true, true) => self.tp += 1,
+                (true, false) => self.fp += 1,
+                (false, true) => self.fn_ += 1,
+                (false, false) => self.tn += 1,
+            }
+        }
+
+        fn recall(self) -> f32 {
+            let d = self.tp + self.fn_;
+            if d == 0 {
+                1.0
+            } else {
+                self.tp as f32 / d as f32
+            }
+        }
+
+        fn precision(self) -> f32 {
+            let d = self.tp + self.fp;
+            if d == 0 {
+                1.0
+            } else {
+                self.tp as f32 / d as f32
+            }
+        }
+
+        fn fpr(self) -> f32 {
+            let d = self.fp + self.tn;
+            if d == 0 {
+                0.0
+            } else {
+                self.fp as f32 / d as f32
+            }
+        }
+
+        fn accuracy(self) -> f32 {
+            let d = self.tp + self.fp + self.fn_ + self.tn;
+            if d == 0 {
+                1.0
+            } else {
+                (self.tp + self.tn) as f32 / d as f32
+            }
+        }
+    }
+
+    fn detect(f: &FeatureVec) -> (bool, i8, bool) {
+        let pucker = f[FEAT_MOUTH_PUCKER] > DETECT_TH;
+        let offset = if f[FEAT_MOUTH_OFFSET_X] > DETECT_TH {
+            1
+        } else if f[FEAT_MOUTH_OFFSET_X] < -DETECT_TH {
+            -1
+        } else {
+            0
+        };
+        let puff = f[FEAT_CHEEK_PUFF] > DETECT_TH;
+        (pucker, offset, puff)
+    }
+
+    /// Labeled noisy poses: recall / precision / FPR / accuracy for the three new features.
+    #[test]
+    fn mouth_features_detection_accuracy() {
+        const N_ID: u32 = 24;
+        const SIGMA: f32 = 0.0035;
+        let rest0 = canonical_face();
+        let mut pucker_c = Conf::default();
+        let mut offset_c = Conf::default();
+        let mut puff_c = Conf::default();
+        let mut puff_on_smile_fp = 0u32;
+        let mut puff_on_smile_n = 0u32;
+        let mut seed: u32 = 0xC0FFEE;
+
+        for _ in 0..N_ID {
+            let identity = jitter(&rest0, &mut seed, 0.006);
+            let mut ext = FeatureExtractor::new(0.0);
+            calibrate_mouth(&mut ext, &identity);
+            let intensity = 0.85 + 0.15 * lcg(&mut seed);
+            for label in LABELS {
+                let pose = apply_label(&identity, label, intensity);
+                let f = read_noisy(&mut ext, &pose, 16, &mut seed, SIGMA);
+                let (pucker, offset, puff) = detect(&f);
+                pucker_c.add(pucker, matches!(label, MouthLabel::Pucker));
+                let want_off = match label {
+                    MouthLabel::OffsetRight => 1,
+                    MouthLabel::OffsetLeft => -1,
+                    _ => 0,
+                };
+                if want_off != 0 {
+                    offset_c.add(offset == want_off, true);
+                } else {
+                    offset_c.add(offset != 0, false);
+                }
+                puff_c.add(puff, matches!(label, MouthLabel::Puff));
+                if matches!(label, MouthLabel::Smile) {
+                    puff_on_smile_n += 1;
+                    if puff {
+                        puff_on_smile_fp += 1;
+                    }
+                }
+                last_after(&mut ext, &identity, 10);
+            }
+        }
+
+        let smile_puff_fpr = puff_on_smile_fp as f32 / puff_on_smile_n.max(1) as f32;
+        eprintln!(
+            "mouth feature accuracy (ids={N_ID}, th={DETECT_TH}):\n  \
+             pucker recall={:.3} prec={:.3} fpr={:.3} acc={:.3}\n  \
+             offset recall={:.3} prec={:.3} fpr={:.3} acc={:.3}\n  \
+             puff   recall={:.3} prec={:.3} fpr={:.3} acc={:.3} smile_fpr={:.3}",
+            pucker_c.recall(),
+            pucker_c.precision(),
+            pucker_c.fpr(),
+            pucker_c.accuracy(),
+            offset_c.recall(),
+            offset_c.precision(),
+            offset_c.fpr(),
+            offset_c.accuracy(),
+            puff_c.recall(),
+            puff_c.precision(),
+            puff_c.fpr(),
+            puff_c.accuracy(),
+            smile_puff_fpr
+        );
+
+        assert!(
+            pucker_c.recall() >= 0.90 && pucker_c.fpr() <= 0.10 && pucker_c.accuracy() >= 0.90,
+            "pucker recall={} fpr={} acc={}",
+            pucker_c.recall(),
+            pucker_c.fpr(),
+            pucker_c.accuracy()
+        );
+        assert!(
+            offset_c.recall() >= 0.90 && offset_c.fpr() <= 0.10 && offset_c.accuracy() >= 0.90,
+            "offset recall={} fpr={} acc={}",
+            offset_c.recall(),
+            offset_c.fpr(),
+            offset_c.accuracy()
+        );
+        assert!(
+            puff_c.recall() >= 0.85 && puff_c.fpr() <= 0.15 && puff_c.accuracy() >= 0.85,
+            "puff recall={} fpr={} acc={}",
+            puff_c.recall(),
+            puff_c.fpr(),
+            puff_c.accuracy()
+        );
+        assert!(
+            smile_puff_fpr <= 0.10,
+            "cheek puff fired on smile fpr={smile_puff_fpr}"
+        );
+    }
+
+    #[test]
+    fn mouth_features_rest_stays_below_detect_threshold() {
+        let rest = canonical_face();
+        let mut ext = FeatureExtractor::new(0.0);
+        calibrate_mouth(&mut ext, &rest);
+        let mut seed = 7u32;
+        let f = read_noisy(&mut ext, &rest, 20, &mut seed, 0.0035);
+        let (pucker, offset, puff) = detect(&f);
+        assert!(!pucker, "rest pucker {}", f[FEAT_MOUTH_PUCKER]);
+        assert_eq!(offset, 0, "rest offset {}", f[FEAT_MOUTH_OFFSET_X]);
+        assert!(!puff, "rest puff {}", f[FEAT_CHEEK_PUFF]);
     }
 }

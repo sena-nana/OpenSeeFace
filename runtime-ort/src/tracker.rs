@@ -7,7 +7,7 @@ use anyhow::Result;
 use crate::crop::{stable_landmark_bbox, CropSmoothState};
 use crate::decode::{decode_landmarks_data, detect_faces_data, LmSpec};
 use crate::enhance::EnhanceCfg;
-use crate::features::FeatureExtractor;
+use crate::features::{FeatureExtractor, FeatureVec};
 use crate::filter::{FilterCfg, FilterKind, FilterQuality, OutputFilter};
 use crate::gaze::get_eye_state;
 use crate::geom::{clamp_to_im, group_rects};
@@ -59,7 +59,7 @@ pub struct FaceInfo {
     pub pts_3d: [[f32; 3]; 70],
     pub eye_blink: [f32; 2],
     pub bbox: [f32; 4],
-    pub current_features: [f32; 14],
+    pub current_features: FeatureVec,
     pub face_3d: Vec<[f32; 3]>,
     pub contour: Vec<[f32; 3]>,
     pub alive: bool,
@@ -88,7 +88,7 @@ impl FaceInfo {
             pts_3d: [[0.0; 3]; 70],
             eye_blink: [1.0, 1.0],
             bbox: [0.0; 4],
-            current_features: [0.0; 14],
+            current_features: [0.0; crate::features::FEATURE_COUNT],
             face_3d: FACE_3D.to_vec(),
             contour: Vec::new(),
             alive: false,
@@ -145,7 +145,7 @@ impl FaceInfo {
         self.pts_3d = [[0.0; 3]; 70];
         self.eye_blink = [1.0, 1.0];
         self.bbox = [0.0; 4];
-        self.current_features = [0.0; 14];
+        self.current_features = [0.0; crate::features::FEATURE_COUNT];
         if max_feature_updates < 1.0 {
             self.features = FeatureExtractor::new(0.0);
         }
@@ -596,8 +596,7 @@ impl Tracker {
                 continue;
             }
             let eye = if let Some(g) = self.gaze.as_mut() {
-                get_eye_state(g, frame, &lms, self.no_gaze)
-                    .unwrap_or([[1.0, 0.0, 0.0, 0.0]; 2])
+                get_eye_state(g, frame, &lms, self.no_gaze).unwrap_or([[1.0, 0.0, 0.0, 0.0]; 2])
             } else {
                 [[1.0, 0.0, 0.0, 0.0]; 2]
             };
