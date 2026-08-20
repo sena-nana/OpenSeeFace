@@ -54,7 +54,7 @@ pub use preprocess::{
     paste_bgr, resize_bgr, retina_nchw, synth_canvas, BgrImage, ColorNorm,
 };
 pub use session::{Device, OrtModel};
-pub use simd::backend_name as simd_backend;
+pub use simd::{backend_name as simd_backend, set_simd_mode, SimdMode};
 pub use tracker::{model_base_path, FaceInfo, Tracker, TrackerConfig};
 pub use udp::{
     encode_face, encode_faces, encode_faces_into, FacePacket, PACKET_FRAME_SIZE,

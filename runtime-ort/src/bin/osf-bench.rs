@@ -10,10 +10,10 @@ use osf_ort::{
     center_2x, cosine, crop_box, crop_box_pad, crop_img, det_window, detect_faces, ear_2d,
     enhance_bgr, face_crop, imagenet_nchw, imagenet_nchw_roi_into, iou, max_abs, mean_abs,
     mean_conf, model_path, nme, paint_synthetic_glasses, paste_bgr, pick_lm, read_f32_le,
-    resize_bgr, retina_nchw, rss, simd_backend, synth_canvas, unwrap_deg, xywh_iou, AdaptiveCfg,
-    AdaptiveState, BgrImage, CropTrack, DetWindow, Device, EnhanceCfg, FilterCfg, FilterKind,
-    FilterQuality, GpuTracker, Latency, LmSpec, OrtModel, OutputFilter, TensorF16, Tracker,
-    TrackerConfig, EYE_IDX, FAST_LM, VERSION,
+    resize_bgr, retina_nchw, rss, set_simd_mode, simd_backend, synth_canvas, unwrap_deg, xywh_iou,
+    AdaptiveCfg, AdaptiveState, BgrImage, CropTrack, DetWindow, Device, EnhanceCfg, FilterCfg,
+    FilterKind, FilterQuality, GpuTracker, Latency, LmSpec, OrtModel, OutputFilter, SimdMode,
+    TensorF16, Tracker, TrackerConfig, EYE_IDX, FAST_LM, VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +34,9 @@ struct Args {
     /// cpu | gpu (CoreML on Apple, CUDA on NVIDIA)
     #[arg(long, default_value = "cpu")]
     device: String,
+    /// CPU preprocess: auto | on | off. auto = SIMD on x86, scalar on Apple Silicon.
+    #[arg(long, default_value_t = SimdMode::Auto)]
+    simd: SimdMode,
     /// micro | realistic | all | scale | enhance | crop | filter | glasses | pre
     #[arg(long, default_value = "micro")]
     suite: String,
@@ -97,7 +100,9 @@ struct PreprocessReport {
     src_w: u32,
     src_h: u32,
     full_224: Latency,
+    full_224_scalar: Latency,
     roi_112: Latency,
+    roi_112_scalar: Latency,
 }
 
 #[derive(Serialize)]
@@ -175,6 +180,7 @@ struct ScenarioReport {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    set_simd_mode(args.simd);
     let device = Device::from_str(&args.device)?;
     let spec = LmSpec::from_type(args.model)?;
     if args.suite == "scale" {
@@ -208,15 +214,8 @@ fn main() -> Result<()> {
         } else {
             synth_canvas(1280, 720)
         };
-        let preprocess = bench_preprocess(&frame, args.warmup, args.iters);
-        eprintln!(
-            "preprocess simd={} {}x{} 224 p50={:.3}ms  roi112 p50={:.3}ms",
-            preprocess.simd,
-            preprocess.src_w,
-            preprocess.src_h,
-            preprocess.full_224.p50_ms,
-            preprocess.roi_112.p50_ms
-        );
+        let preprocess = bench_preprocess(&frame, args.warmup, args.iters, args.simd);
+        eprint_preprocess(&preprocess);
         let report = Report {
             backend: "ort-rust",
             crate_version: VERSION,
@@ -247,7 +246,7 @@ fn main() -> Result<()> {
 
     if run_micro {
         let frame = BgrImage::load(&args.image)?;
-        preprocess = Some(bench_preprocess(&frame, args.warmup, args.iters));
+        preprocess = Some(bench_preprocess(&frame, args.warmup, args.iters, args.simd));
         let dump = |name: &str| args.ref_dir.as_ref().map(|d| d.join(name));
         let load = |name: &str, shape: Vec<i64>, fb: TensorF16| -> Result<TensorF16> {
             match dump(name) {
@@ -329,6 +328,19 @@ fn main() -> Result<()> {
         HashMap::new()
     };
 
+    if let Some(p) = &preprocess {
+        eprint_preprocess(p);
+    }
+    if let Some(p) = &pipe {
+        eprintln!(
+            "pipeline {}  detect={:.3}ms  landmarks={:.3}ms  e2e={:.3}ms  faces={}",
+            device.as_str(),
+            p.detect_ms,
+            p.landmarks_ms,
+            p.e2e_ms,
+            p.faces
+        );
+    }
     let report = Report {
         backend: "ort-rust",
         crate_version: VERSION,
@@ -352,7 +364,27 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn bench_preprocess(frame: &BgrImage, warmup: u32, iters: u32) -> PreprocessReport {
+fn eprint_preprocess(p: &PreprocessReport) {
+    eprintln!(
+        "preprocess {} vs scalar  {}x{}  224 p50={:.3}/{:.3}ms ({:.2}x)  roi112={:.3}/{:.3}ms ({:.2}x)",
+        p.simd,
+        p.src_w,
+        p.src_h,
+        p.full_224.p50_ms,
+        p.full_224_scalar.p50_ms,
+        p.full_224_scalar.p50_ms / p.full_224.p50_ms.max(1e-9),
+        p.roi_112.p50_ms,
+        p.roi_112_scalar.p50_ms,
+        p.roi_112_scalar.p50_ms / p.roi_112.p50_ms.max(1e-9),
+    );
+}
+
+fn bench_preprocess(
+    frame: &BgrImage,
+    warmup: u32,
+    iters: u32,
+    restore: SimdMode,
+) -> PreprocessReport {
     let src = if frame.width == 1280 && frame.height == 720 {
         frame.clone()
     } else {
@@ -372,26 +404,30 @@ fn bench_preprocess(frame: &BgrImage, warmup: u32, iters: u32) -> PreprocessRepo
             })
             .collect()
     };
-    let s224 = time_ms(&mut || {
-        imagenet_nchw_roi_into(
-            &src,
-            0,
-            0,
-            src.width as i32,
-            src.height as i32,
-            224,
-            &mut buf224,
-        );
-    });
-    let s112 = time_ms(&mut || {
-        imagenet_nchw_roi_into(&src, 440, 160, 840, 560, 112, &mut buf112);
-    });
+    let run224 = |buf: &mut [half::f16]| {
+        imagenet_nchw_roi_into(&src, 0, 0, src.width as i32, src.height as i32, 224, buf);
+        std::hint::black_box(buf[0]);
+    };
+    let run112 = |buf: &mut [half::f16]| {
+        imagenet_nchw_roi_into(&src, 440, 160, 840, 560, 112, buf);
+        std::hint::black_box(buf[0]);
+    };
+    set_simd_mode(SimdMode::On);
+    let s224 = time_ms(&mut || run224(&mut buf224));
+    let s112 = time_ms(&mut || run112(&mut buf112));
+    let simd = simd_backend().to_string();
+    set_simd_mode(SimdMode::Off);
+    let s224s = time_ms(&mut || run224(&mut buf224));
+    let s112s = time_ms(&mut || run112(&mut buf112));
+    set_simd_mode(restore);
     PreprocessReport {
-        simd: simd_backend().into(),
+        simd,
         src_w: src.width,
         src_h: src.height,
         full_224: Latency::from_samples(warmup, &s224),
+        full_224_scalar: Latency::from_samples(warmup, &s224s),
         roi_112: Latency::from_samples(warmup, &s112),
+        roi_112_scalar: Latency::from_samples(warmup, &s112s),
     }
 }
 
@@ -491,6 +527,7 @@ fn cpu_pipeline(args: &Args, frame: &BgrImage, spec: LmSpec, device: Device) -> 
     }
 
     let t0 = Instant::now();
+    let din = imagenet_nchw(frame, 224);
     let dout = det.run(&din)?;
     let dets = detect_faces(&dout[0], &dout[1], frame.width, frame.height, 0.6);
     let detect_ms = t0.elapsed().as_secs_f64() * 1000.0;

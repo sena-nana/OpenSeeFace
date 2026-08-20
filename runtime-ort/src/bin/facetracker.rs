@@ -7,7 +7,8 @@ use clap::Parser;
 use osf_ort::{
     draw_tracking, dump_symmetric_points, encode_faces_into, encode_vmc, list_cameras,
     model_base_path, Device, ExtListener, FacePacket, FilterKind, InputSource, OutputDriver,
-    PipedInput, Tracker, TrackerConfig, VideoOut, VizWindow, VrmCfg, VrmDriver, PACKET_FRAME_SIZE,
+    PipedInput, SimdMode, Tracker, TrackerConfig, VideoOut, VizWindow, VrmCfg, VrmDriver,
+    PACKET_FRAME_SIZE,
 };
 
 #[derive(Parser, Debug)]
@@ -85,6 +86,9 @@ struct Args {
     /// cpu | gpu (CoreML on Apple, CUDA on NVIDIA). GPU needs `--features gpu`.
     #[arg(long, default_value_t = Device::Cpu)]
     device: Device,
+    /// CPU preprocess: auto | on | off. auto = SIMD on x86, scalar on Apple Silicon.
+    #[arg(long, default_value_t = SimdMode::Auto)]
+    simd: SimdMode,
     #[arg(long, default_value_t = 0, hide = true)]
     benchmark: i32,
     /// OpenSeeLauncher sends this with `--benchmark`; ignored.
@@ -125,6 +129,7 @@ fn format_eye_open(open: f32) -> String {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    osf_ort::set_simd_mode(args.simd);
     if args.list_cameras > 0 {
         for (i, name) in list_cameras().context("list cameras")? {
             if args.list_cameras == 1 {

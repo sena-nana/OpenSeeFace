@@ -1,7 +1,9 @@
-//! CPU SIMD dispatch for preprocess and enhance pixel loops.
+//! CPU preprocess: FMA scalar plus optional ISA kernels.
 //!
-//! x86_64 uses runtime `is_x86_feature_detected!` so generic Windows binaries stay
-//! baseline-SSE2. aarch64 always has NEON.
+//! `SimdMode::Auto` uses SIMD on x86 and scalar on aarch64. `--simd on|off` overrides.
+
+use std::str::FromStr;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use half::f16;
 
@@ -13,13 +15,66 @@ mod neon;
 mod x86;
 
 pub(crate) const HIST: usize = 256;
+pub(crate) use scalar::{blend_u8, box3_bgr, clahe_remap, gray_world};
 
-#[inline]
-pub(crate) fn clamp_u8(v: f32) -> u8 {
-    v.round().clamp(0.0, 255.0) as u8
+static MODE: AtomicU8 = AtomicU8::new(SimdMode::Auto as u8);
+
+/// Which CPU preprocess kernel to run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SimdMode {
+    /// SIMD on x86; scalar FMA on aarch64.
+    #[default]
+    Auto = 0,
+    On = 1,
+    Off = 2,
+}
+
+impl std::fmt::Display for SimdMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Auto => "auto",
+            Self::On => "on",
+            Self::Off => "off",
+        })
+    }
+}
+
+impl FromStr for SimdMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(Self::Auto),
+            "on" => Ok(Self::On),
+            "off" => Ok(Self::Off),
+            _ => Err(format!("unknown simd mode {s:?}, expected auto|on|off")),
+        }
+    }
+}
+
+pub fn set_simd_mode(mode: SimdMode) {
+    MODE.store(mode as u8, Ordering::Relaxed);
+}
+
+fn simd_active() -> bool {
+    match MODE.load(Ordering::Relaxed) {
+        x if x == SimdMode::Off as u8 => false,
+        x if x == SimdMode::On as u8 => {
+            cfg!(any(
+                target_arch = "aarch64",
+                target_arch = "x86_64",
+                target_arch = "x86"
+            ))
+        }
+        _ => cfg!(any(target_arch = "x86_64", target_arch = "x86")),
+    }
 }
 
 pub fn backend_name() -> &'static str {
+    if !simd_active() {
+        return "scalar";
+    }
     #[cfg(target_arch = "aarch64")]
     {
         "neon"
@@ -38,6 +93,11 @@ pub fn backend_name() -> &'static str {
     {
         "scalar"
     }
+}
+
+#[inline]
+pub(crate) fn clamp_u8(v: f32) -> u8 {
+    v.round().clamp(0.0, 255.0) as u8
 }
 
 fn run_nchw(
@@ -184,6 +244,31 @@ pub fn bilinear_nchw(
     bias: [f32; 3],
     data: &mut [f16],
 ) {
+    if simd_active() {
+        bilinear_nchw_isa(
+            src_bgr, src_w, x0, y0, cw, ch, dst_w, dst_h, src, scale, bias, data,
+        );
+    } else {
+        scalar::bilinear_nchw(
+            src_bgr, src_w, x0, y0, cw, ch, dst_w, dst_h, src, scale, bias, data,
+        );
+    }
+}
+
+fn bilinear_nchw_isa(
+    src_bgr: &[u8],
+    src_w: u32,
+    x0: u32,
+    y0: u32,
+    cw: u32,
+    ch: u32,
+    dst_w: u32,
+    dst_h: u32,
+    src: [usize; 3],
+    scale: [f32; 3],
+    bias: [f32; 3],
+    data: &mut [f16],
+) {
     #[cfg(target_arch = "aarch64")]
     run_nchw(
         src_bgr,
@@ -233,6 +318,25 @@ pub fn apply_affine_roi(
     bias: [f32; 3],
     data: &mut [f16],
 ) {
+    if simd_active() {
+        apply_affine_roi_isa(src_bgr, src_w, x0, y0, cw, ch, src, scale, bias, data);
+    } else {
+        scalar::apply_affine_roi(src_bgr, src_w, x0, y0, cw, ch, src, scale, bias, data);
+    }
+}
+
+fn apply_affine_roi_isa(
+    src_bgr: &[u8],
+    src_w: u32,
+    x0: u32,
+    y0: u32,
+    cw: u32,
+    ch: u32,
+    src: [usize; 3],
+    scale: [f32; 3],
+    bias: [f32; 3],
+    data: &mut [f16],
+) {
     #[cfg(target_arch = "aarch64")]
     neon::apply_affine_roi(src_bgr, src_w, x0, y0, cw, ch, src, scale, bias, data);
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
@@ -248,6 +352,24 @@ pub fn apply_affine_roi(
 }
 
 pub fn resize_bilinear(
+    src: &[u8],
+    width: u32,
+    x1: u32,
+    y1: u32,
+    cw: u32,
+    ch: u32,
+    dw: u32,
+    dh: u32,
+    dst: &mut [u8],
+) {
+    if simd_active() {
+        resize_bilinear_isa(src, width, x1, y1, cw, ch, dw, dh, dst);
+    } else {
+        scalar::resize_bilinear(src, width, x1, y1, cw, ch, dw, dh, dst);
+    }
+}
+
+fn resize_bilinear_isa(
     src: &[u8],
     width: u32,
     x1: u32,
@@ -293,6 +415,14 @@ pub fn resize_bilinear(
 }
 
 pub fn rgb_to_bgr_in_place(data: &mut [u8]) {
+    if simd_active() {
+        rgb_to_bgr_isa(data);
+    } else {
+        scalar::rgb_to_bgr_in_place(data);
+    }
+}
+
+fn rgb_to_bgr_isa(data: &mut [u8]) {
     #[cfg(target_arch = "aarch64")]
     neon::rgb_to_bgr_in_place(data);
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
@@ -305,31 +435,6 @@ pub fn rgb_to_bgr_in_place(data: &mut [u8]) {
     }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "x86")))]
     scalar::rgb_to_bgr_in_place(data);
-}
-
-pub fn box3_bgr(data: &mut [u8], width: u32, height: u32) {
-    scalar::box3_bgr(data, width, height);
-}
-
-pub fn gray_world(bgr: &mut [u8]) {
-    scalar::gray_world(bgr);
-}
-
-pub fn blend_u8(dst: &mut [u8], src: &[u8], a: f32) {
-    scalar::blend_u8(dst, src, a);
-}
-
-pub fn clahe_remap(
-    bgr: &mut [u8],
-    width: u32,
-    height: u32,
-    tx: u32,
-    ty: u32,
-    tw: u32,
-    th: u32,
-    luts: &[[u8; HIST]],
-) {
-    scalar::clahe_remap(bgr, width, height, tx, ty, tw, th, luts);
 }
 
 #[cfg(test)]
@@ -372,7 +477,7 @@ mod tests {
         let n = ColorNorm::IMAGENET;
         let src = fill(64, 48);
         for (dw, dh) in [(16u32, 16u32), (17, 16), (16, 17), (8, 8)] {
-            let a = run(bilinear_nchw, &src, 64, 48, dw, dh, &n);
+            let a = run(bilinear_nchw_isa, &src, 64, 48, dw, dh, &n);
             let b = run(scalar::bilinear_nchw, &src, 64, 48, dw, dh, &n);
             let err = max_abs_f16(&a, &b);
             assert!(err < 2e-3, "{dw}x{dh} err={err}");
@@ -385,7 +490,7 @@ mod tests {
         let src = fill(40, 30);
         let mut a = vec![f16::ZERO; 3 * 21 * 16];
         let mut b = vec![f16::ZERO; 3 * 21 * 16];
-        apply_affine_roi(&src, 40, 5, 7, 21, 16, n.src, n.scale, n.bias, &mut a);
+        apply_affine_roi_isa(&src, 40, 5, 7, 21, 16, n.src, n.scale, n.bias, &mut a);
         scalar::apply_affine_roi(&src, 40, 5, 7, 21, 16, n.src, n.scale, n.bias, &mut b);
         assert!(max_abs_f16(&a, &b) < 2e-3);
     }
@@ -395,7 +500,7 @@ mod tests {
         let src = fill(40, 30);
         let mut a = vec![0u8; 17 * 16 * 3];
         let mut b = vec![0u8; 17 * 16 * 3];
-        resize_bilinear(&src, 40, 2, 3, 30, 24, 17, 16, &mut a);
+        resize_bilinear_isa(&src, 40, 2, 3, 30, 24, 17, 16, &mut a);
         scalar::resize_bilinear(&src, 40, 2, 3, 30, 24, 17, 16, &mut b);
         let err = a
             .iter()
@@ -410,7 +515,7 @@ mod tests {
     fn rgb_to_bgr_dispatch_matches_scalar() {
         let mut a = fill(19, 5);
         let mut b = a.clone();
-        rgb_to_bgr_in_place(&mut a);
+        rgb_to_bgr_isa(&mut a);
         scalar::rgb_to_bgr_in_place(&mut b);
         assert_eq!(a, b);
     }
