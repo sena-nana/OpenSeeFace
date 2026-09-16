@@ -205,6 +205,7 @@ pub struct Tracker {
     frame_count: i32,
     model_dir: PathBuf,
     last_tick: Option<std::time::Instant>,
+    gpu_error: Option<anyhow::Error>,
 }
 
 pub struct TrackerConfig {
@@ -358,7 +359,13 @@ impl Tracker {
             frame_count: 0,
             model_dir: dir,
             last_tick: None,
+            gpu_error: None,
         })
+    }
+
+    /// A GPU inference failure from the last `predict`; tracking cannot continue.
+    pub fn take_gpu_error(&mut self) -> Option<anyhow::Error> {
+        self.gpu_error.take()
     }
 
     pub fn set_size(&mut self, width: u32, height: u32) {
@@ -421,7 +428,14 @@ impl Tracker {
                 )
                 .unwrap_or_default()
             }
-            DetLm::Gpu(gpu) => gpu.detect(frame).unwrap_or_default(),
+            DetLm::Gpu(gpu) => match gpu.detect(frame) {
+                Ok(dets) => dets,
+                Err(error) => {
+                    // Every later frame would fail the same way; let the caller stop.
+                    self.gpu_error = Some(error);
+                    Vec::new()
+                }
+            },
         };
         dets.into_iter().map(|d| [d[0], d[1], d[2], d[3]]).collect()
     }

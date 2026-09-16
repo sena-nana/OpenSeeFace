@@ -60,19 +60,53 @@ impl FromStr for Device {
     }
 }
 
+fn is_directml(ep: GpuEp) -> bool {
+    #[cfg(windows)]
+    {
+        ep == GpuEp::DirectMl
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = ep;
+        false
+    }
+}
+
 pub(crate) fn oe(e: impl std::fmt::Display) -> anyhow::Error {
     anyhow::anyhow!("{e}")
 }
 
-pub(crate) fn gpu_eps(cuda_graph: bool) -> Result<Vec<ort::ep::ExecutionProviderDispatch>> {
+/// GPU execution provider for a session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GpuEp {
+    /// CoreML on Apple, CUDA elsewhere.
+    Native { cuda_graph: bool },
+    /// Any DirectX 12 GPU; host-memory I/O only.
+    #[cfg(windows)]
+    DirectMl,
+}
+
+pub(crate) fn gpu_eps(ep: GpuEp) -> Result<Vec<ort::ep::ExecutionProviderDispatch>> {
     #[cfg(not(feature = "gpu"))]
     {
-        let _ = cuda_graph;
+        let _ = ep;
         bail!("GPU requested; rebuild with `--features gpu` or use `--device cpu`");
     }
 
     #[cfg(feature = "gpu")]
     {
+        let cuda_graph = match ep {
+            GpuEp::Native { cuda_graph } => cuda_graph,
+            #[cfg(windows)]
+            GpuEp::DirectMl => {
+                if !ort::ep::DirectML::default().is_available().unwrap_or(false) {
+                    bail!(
+                        "GPU requested but no GPU execution provider is available; use --device cpu"
+                    );
+                }
+                return Ok(vec![ort::ep::DirectML::default().build().error_on_failure()]);
+            }
+        };
         #[allow(unused_mut)]
         let mut eps = Vec::new();
         #[cfg(target_os = "macos")]
@@ -109,16 +143,38 @@ pub(crate) fn make_session(
     batch: i64,
     dims: &[(&str, i64)],
 ) -> Result<(Session, f64)> {
-    make_session_cuda(path, threads, device, batch, dims, false)
+    make_session_ep(path, threads, device, batch, dims, GpuEp::Native { cuda_graph: false })
 }
 
-pub(crate) fn make_session_cuda(
+pub(crate) fn make_session_ep(
     path: &Path,
     threads: usize,
     device: Device,
     batch: i64,
     dims: &[(&str, i64)],
-    cuda_graph: bool,
+    ep: GpuEp,
+) -> Result<(Session, f64)> {
+    match build_session(path, threads, device, batch, dims, ep) {
+        // Graph capture needs every node on the CUDA provider; models with
+        // CPU-placed nodes still run on CUDA without it.
+        Err(error)
+            if ep == (GpuEp::Native { cuda_graph: true })
+                && error.to_string().contains("graph capture") =>
+        {
+            let ep = GpuEp::Native { cuda_graph: false };
+            build_session(path, threads, device, batch, dims, ep)
+        }
+        result => result,
+    }
+}
+
+fn build_session(
+    path: &Path,
+    threads: usize,
+    device: Device,
+    batch: i64,
+    dims: &[(&str, i64)],
+    ep: GpuEp,
 ) -> Result<(Session, f64)> {
     let start = Instant::now();
     let mut builder = Session::builder()
@@ -131,7 +187,8 @@ pub(crate) fn make_session_cuda(
         .map_err(oe)?
         .with_parallel_execution(false)
         .map_err(oe)?
-        .with_memory_pattern(true)
+        // DirectML does not support memory patterns.
+        .with_memory_pattern(!is_directml(ep))
         .map_err(oe)?
         .with_log_level(LogLevel::Error)
         .map_err(oe)?;
@@ -139,7 +196,7 @@ pub(crate) fn make_session_cuda(
         builder = builder
             .with_dimension_override("batch_size", batch.max(1))
             .map_err(oe)?
-            .with_execution_providers(gpu_eps(cuda_graph)?)
+            .with_execution_providers(gpu_eps(ep)?)
             .map_err(oe)?;
         for (name, size) in dims {
             builder = builder.with_dimension_override(*name, *size).map_err(oe)?;

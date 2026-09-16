@@ -19,13 +19,11 @@ use crate::enhance::EnhanceCfg;
 use crate::enhance_gpu::GpuEnhance;
 #[cfg(feature = "gpu")]
 use crate::preprocess::crop_box_pad;
-#[cfg(all(feature = "gpu", target_os = "macos"))]
+#[cfg(all(feature = "gpu", any(target_os = "macos", windows)))]
 use crate::preprocess::resize_roi_into;
 use crate::preprocess::BgrImage;
-#[cfg(all(feature = "gpu", target_os = "macos"))]
-use crate::session::make_session;
-#[cfg(all(feature = "gpu", not(target_os = "macos")))]
-use crate::session::make_session_cuda;
+#[cfg(feature = "gpu")]
+use crate::session::{make_session_ep, GpuEp};
 #[cfg(feature = "gpu")]
 use crate::session::Device;
 #[cfg(feature = "gpu")]
@@ -114,9 +112,9 @@ fn need_gpu<T>() -> Result<T> {
 /// GPU pipeline: preprocess on the EP; only small tensors come back to the CPU.
 pub struct GpuTracker {
     #[cfg(all(feature = "gpu", target_os = "macos"))]
-    pipe: CoreMlPipe,
+    pipe: HostPipe,
     #[cfg(all(feature = "gpu", not(target_os = "macos")))]
-    pipe: CudaPipe,
+    pipe: NvPipe,
     #[cfg(feature = "gpu")]
     cfg: GpuCfg,
     #[cfg(not(feature = "gpu"))]
@@ -171,24 +169,42 @@ impl GpuTracker {
         let pre = ensure_pre_models(&cfg.models_dir)?;
         #[cfg(target_os = "macos")]
         {
+            let ep = GpuEp::Native { cuda_graph: false };
             Ok(Self {
-                pipe: CoreMlPipe::open(&pre, cfg.spec, cfg.threads, frame, cfg.enhance)?,
+                pipe: HostPipe::open(&pre, cfg.spec, cfg.threads, frame, cfg.enhance, ep)?,
                 cfg,
             })
         }
         #[cfg(not(target_os = "macos"))]
         {
-            Ok(Self {
-                pipe: CudaPipe::open(
+            let cuda = cuda_runs(&pre).and_then(|()| {
+                CudaPipe::open(
                     &cfg.models_dir,
                     &pre,
                     cfg.spec,
                     cfg.threads,
                     frame,
                     cfg.enhance,
-                )?,
-                cfg,
-            })
+                )
+            });
+            let pipe = match cuda {
+                Ok(pipe) => NvPipe::Cuda(pipe),
+                #[cfg(windows)]
+                Err(error) => {
+                    eprintln!("CUDA cannot run on this GPU ({error:#}); using DirectML");
+                    NvPipe::DirectMl(HostPipe::open(
+                        &pre,
+                        cfg.spec,
+                        cfg.threads,
+                        frame,
+                        cfg.enhance,
+                        GpuEp::DirectMl,
+                    )?)
+                }
+                #[cfg(not(windows))]
+                Err(error) => return Err(error),
+            };
+            Ok(Self { pipe, cfg })
         }
     }
 
@@ -283,8 +299,71 @@ fn pin_alloc(sess: &Session, ty: ort::memory::MemoryType) -> Result<Allocator> {
     .map_err(oe)
 }
 
-#[cfg(all(feature = "gpu", target_os = "macos"))]
-struct CoreMlPipe {
+/// A CUDA provider can load yet ship no kernels for the GPU, which only shows
+/// once a graph runs. Probe with a small preprocess graph in a plain session:
+/// the CUDA-graph pipeline does not fail cleanly in that state.
+#[cfg(all(feature = "gpu", not(target_os = "macos")))]
+fn cuda_runs(pre: &Path) -> Result<()> {
+    let dims = [("height", 8i64), ("width", 8i64)];
+    let (mut session, _) = make_session_ep(
+        &pre.join("imagenet_56.onnx"),
+        1,
+        Device::Gpu,
+        1,
+        &dims,
+        GpuEp::Native { cuda_graph: false },
+    )?;
+    let image = [0u8; 8 * 8 * 3];
+    let tensor = ort::value::TensorRef::from_array_view(([1i64, 8, 8, 3], &image[..])).map_err(oe)?;
+    session
+        .run(ort::inputs!["image" => tensor])
+        .map_err(oe)
+        .context("CUDA probe")?;
+    Ok(())
+}
+
+#[cfg(all(feature = "gpu", not(target_os = "macos")))]
+enum NvPipe {
+    Cuda(CudaPipe),
+    #[cfg(windows)]
+    DirectMl(HostPipe),
+}
+
+#[cfg(all(feature = "gpu", not(target_os = "macos")))]
+impl NvPipe {
+    fn detect(
+        &mut self,
+        frame: &BgrImage,
+        threshold: f32,
+        max_faces: usize,
+    ) -> Result<Vec<[f32; 5]>> {
+        match self {
+            Self::Cuda(pipe) => pipe.detect(frame, threshold, max_faces),
+            #[cfg(windows)]
+            Self::DirectMl(pipe) => pipe.detect(frame, threshold, max_faces),
+        }
+    }
+
+    fn landmarks_roi(
+        &mut self,
+        frame: &BgrImage,
+        x1: i32,
+        y1: i32,
+        x2: i32,
+        y2: i32,
+        spec: LmSpec,
+    ) -> Result<(f32, Vec<[f32; 3]>)> {
+        match self {
+            Self::Cuda(pipe) => pipe.landmarks_roi(frame, x1, y1, x2, y2, spec),
+            #[cfg(windows)]
+            Self::DirectMl(pipe) => pipe.landmarks_roi(frame, x1, y1, x2, y2, spec),
+        }
+    }
+}
+
+/// Fused uint8 NHWC graphs with host-memory I/O (CoreML, DirectML).
+#[cfg(all(feature = "gpu", any(target_os = "macos", windows)))]
+struct HostPipe {
     det: Session,
     det_bind: IoBinding,
     det_name: String,
@@ -296,24 +375,25 @@ struct CoreMlPipe {
     enhance: GpuEnhance,
 }
 
-#[cfg(all(feature = "gpu", target_os = "macos"))]
-impl CoreMlPipe {
+#[cfg(all(feature = "gpu", any(target_os = "macos", windows)))]
+impl HostPipe {
     fn open(
         pre: &Path,
         spec: LmSpec,
         threads: usize,
         frame: &BgrImage,
         enhance: EnhanceCfg,
+        ep: GpuEp,
     ) -> Result<Self> {
         let fused_det = pre.join("mnv3_detection_opt.onnx");
         let fused_lm = pre.join(spec.file);
         if !fused_det.is_file() || !fused_lm.is_file() {
             bail!(
-                "fused CoreML graphs not in {} (run runtime-ort/scripts/wrap_preprocess.py or use --device cpu)",
+                "fused preprocess graphs not in {} (run runtime-ort/scripts/wrap_preprocess.py or use --device cpu)",
                 pre.display()
             );
         }
-        let (det, _) = make_session(
+        let (det, _) = make_session_ep(
             &fused_det,
             threads,
             Device::Gpu,
@@ -322,13 +402,15 @@ impl CoreMlPipe {
                 ("height", frame.height as i64),
                 ("width", frame.width as i64),
             ],
+            ep,
         )?;
-        let (lm, _) = make_session(
+        let (lm, _) = make_session_ep(
             &fused_lm,
             threads,
             Device::Gpu,
             1,
             &[("height", spec.size as i64), ("width", spec.size as i64)],
+            ep,
         )?;
         let alloc = Allocator::default();
         let det_in = Tensor::<u8>::new(&alloc, [1i64, frame.height as i64, frame.width as i64, 3])
@@ -362,7 +444,7 @@ impl CoreMlPipe {
         threshold: f32,
         max_faces: usize,
     ) -> Result<Vec<[f32; 5]>> {
-        let CoreMlPipe {
+        let HostPipe {
             enhance,
             det_in,
             det_bind,
@@ -401,7 +483,7 @@ impl CoreMlPipe {
         if x2 - x1 < 4 || y2 - y1 < 4 {
             bail!("crop too small");
         }
-        let CoreMlPipe {
+        let HostPipe {
             enhance,
             lm_in,
             lm_bind,
@@ -482,15 +564,17 @@ impl CudaPipe {
             ("height", frame.height as i64),
             ("width", frame.width as i64),
         ];
-        let (det, _) = make_session_cuda(&fused_det, threads, Device::Gpu, 1, &hw, true)?;
-        let (pre_lm, _) = make_session_cuda(&crop, threads, Device::Gpu, 1, &hw, false)?;
-        let (lm, _) = make_session_cuda(
+        let graph = GpuEp::Native { cuda_graph: true };
+        let plain = GpuEp::Native { cuda_graph: false };
+        let (det, _) = make_session_ep(&fused_det, threads, Device::Gpu, 1, &hw, graph)?;
+        let (pre_lm, _) = make_session_ep(&crop, threads, Device::Gpu, 1, &hw, plain)?;
+        let (lm, _) = make_session_ep(
             &crate::metrics::model_path(models_dir, spec.file),
             threads,
             Device::Gpu,
             1,
             &[],
-            true,
+            graph,
         )?;
         let pin_in = pin_alloc(&det, MemoryType::CPUInput)?;
         let pin_out = pin_alloc(&det, MemoryType::CPUOutput)?;

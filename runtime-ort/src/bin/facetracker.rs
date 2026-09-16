@@ -251,6 +251,9 @@ fn main() -> Result<()> {
 
         let t0 = Instant::now();
         let faces = tracker.predict(&frame);
+        if let Some(error) = tracker.take_gpu_error() {
+            return Err(error.context("GPU inference failed"));
+        }
         if !faces.is_empty() {
             let dt = t0.elapsed().as_secs_f64();
             total_tracking_time += dt;
