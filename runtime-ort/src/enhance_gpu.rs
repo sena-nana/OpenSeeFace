@@ -751,7 +751,7 @@ impl CudaEnhance {
 
     fn launch_n<A>(f: &cudarc::driver::CudaFunction, n: u32, args: A) -> Result<()>
     where
-        A: cudarc::driver::LaunchArgs,
+        cudarc::driver::CudaFunction: cudarc::driver::LaunchAsync<A>,
     {
         use cudarc::driver::{LaunchAsync, LaunchConfig};
         let cfg = LaunchConfig::for_num_elems(n);

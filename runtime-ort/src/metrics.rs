@@ -55,6 +55,7 @@ pub struct Rss {
 }
 
 pub fn rss() -> Rss {
+    #[cfg(unix)]
     let peak = unsafe {
         let mut u = std::mem::zeroed::<libc::rusage>();
         libc::getrusage(libc::RUSAGE_SELF, &mut u);
@@ -67,6 +68,9 @@ pub fn rss() -> Rss {
             (u.ru_maxrss as u64) * 1024
         }
     };
+    // getrusage is Unix-only; peak RSS is not reported on Windows.
+    #[cfg(not(unix))]
+    let peak = 0u64;
     let cur = std::process::Command::new("ps")
         .args(["-o", "rss=", "-p", &std::process::id().to_string()])
         .output()
