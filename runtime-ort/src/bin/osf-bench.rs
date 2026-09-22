@@ -31,7 +31,7 @@ struct Args {
     warmup: u32,
     #[arg(long, default_value_t = 30)]
     iters: u32,
-    /// cpu | gpu (CoreML on Apple, CUDA on NVIDIA)
+    /// cpu | gpu (CoreML on Apple, DirectML on Windows, CUDA on Linux)
     #[arg(long, default_value = "cpu")]
     device: String,
     /// CPU preprocess: auto | on | off. auto = SIMD on x86, scalar on Apple Silicon.

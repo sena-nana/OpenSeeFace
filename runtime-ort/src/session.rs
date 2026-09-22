@@ -1,8 +1,8 @@
 //! CPU vs GPU I/O for ONNX Runtime sessions.
 //!
-//! Host path (CPU EP and CoreML) binds host tensors. CUDA path uses pinned host
-//! buffers so ORT can DMA without an extra pageable copy. Intermediate device
-//! tensors for the detect→landmark pipeline live in `gpu_pre`.
+//! Host path (CPU, CoreML, DirectML) binds host tensors. Linux CUDA uses pinned
+//! host buffers so ORT can DMA without an extra pageable copy. Intermediate
+//! device tensors for the detect→landmark pipeline live in `gpu_pre`.
 
 use std::fmt;
 use std::path::Path;
@@ -22,10 +22,10 @@ use crate::decode::TensorF16;
 
 #[cfg(feature = "gpu")]
 use ort::ep::ExecutionProvider;
-#[cfg(all(feature = "gpu", not(target_os = "macos")))]
+#[cfg(all(feature = "gpu", target_os = "linux"))]
 use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
 
-/// `cpu` or `gpu` (CoreML on Apple, CUDA on NVIDIA).
+/// `cpu` or `gpu` (CoreML on Apple, DirectML on Windows, CUDA on Linux).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Device {
     #[default]
@@ -60,14 +60,16 @@ impl FromStr for Device {
     }
 }
 
-fn is_directml(ep: GpuEp) -> bool {
+fn disables_memory_pattern(device: Device, ep: GpuEp) -> bool {
+    // DirectML rejects memory patterns. On Windows every GPU session uses it.
     #[cfg(windows)]
     {
-        ep == GpuEp::DirectMl
+        let _ = ep;
+        device == Device::Gpu
     }
     #[cfg(not(windows))]
     {
-        let _ = ep;
+        let _ = (device, ep);
         false
     }
 }
@@ -79,7 +81,7 @@ pub(crate) fn oe(e: impl std::fmt::Display) -> anyhow::Error {
 /// GPU execution provider for a session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GpuEp {
-    /// CoreML on Apple, CUDA elsewhere.
+    /// CoreML on Apple, CUDA on Linux. Windows GPU sessions use [`GpuEp::DirectMl`].
     Native { cuda_graph: bool },
     /// Any DirectX 12 GPU; host-memory I/O only.
     #[cfg(windows)]
@@ -93,19 +95,21 @@ pub(crate) fn gpu_eps(ep: GpuEp) -> Result<Vec<ort::ep::ExecutionProviderDispatc
         bail!("GPU requested; rebuild with `--features gpu` or use `--device cpu`");
     }
 
-    #[cfg(feature = "gpu")]
+    #[cfg(all(feature = "gpu", windows))]
+    {
+        let _ = ep;
+        if !ort::ep::DirectML::default().is_available().unwrap_or(false) {
+            bail!("GPU requested but no GPU execution provider is available; use --device cpu");
+        }
+        return Ok(vec![ort::ep::DirectML::default()
+            .build()
+            .error_on_failure()]);
+    }
+
+    #[cfg(all(feature = "gpu", not(windows)))]
     {
         let cuda_graph = match ep {
             GpuEp::Native { cuda_graph } => cuda_graph,
-            #[cfg(windows)]
-            GpuEp::DirectMl => {
-                if !ort::ep::DirectML::default().is_available().unwrap_or(false) {
-                    bail!(
-                        "GPU requested but no GPU execution provider is available; use --device cpu"
-                    );
-                }
-                return Ok(vec![ort::ep::DirectML::default().build().error_on_failure()]);
-            }
         };
         #[allow(unused_mut)]
         let mut eps = Vec::new();
@@ -120,7 +124,7 @@ pub(crate) fn gpu_eps(ep: GpuEp) -> Result<Vec<ort::ep::ExecutionProviderDispatc
                     .error_on_failure(),
             );
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
         if ort::ep::CUDA::default().is_available().unwrap_or(false) {
             let mut cuda = ort::ep::CUDA::default()
                 .with_conv_algorithm_search(ort::ep::cuda::ConvAlgorithmSearch::Heuristic);
@@ -143,7 +147,14 @@ pub(crate) fn make_session(
     batch: i64,
     dims: &[(&str, i64)],
 ) -> Result<(Session, f64)> {
-    make_session_ep(path, threads, device, batch, dims, GpuEp::Native { cuda_graph: false })
+    make_session_ep(
+        path,
+        threads,
+        device,
+        batch,
+        dims,
+        GpuEp::Native { cuda_graph: false },
+    )
 }
 
 pub(crate) fn make_session_ep(
@@ -188,7 +199,7 @@ fn build_session(
         .with_parallel_execution(false)
         .map_err(oe)?
         // DirectML does not support memory patterns.
-        .with_memory_pattern(!is_directml(ep))
+        .with_memory_pattern(!disables_memory_pattern(device, ep))
         .map_err(oe)?
         .with_log_level(LogLevel::Error)
         .map_err(oe)?;
@@ -258,7 +269,7 @@ impl OrtModel {
     }
 
     fn allocs(&self) -> Result<(Allocator, Allocator)> {
-        #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+        #[cfg(all(feature = "gpu", target_os = "linux"))]
         if self.device == Device::Gpu {
             let pin_in = Allocator::new(
                 &self.session,

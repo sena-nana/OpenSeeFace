@@ -83,7 +83,7 @@ struct Args {
     filter_mincutoff: f32,
     #[arg(long, default_value_t = 0.007)]
     filter_beta: f32,
-    /// cpu | gpu (CoreML on Apple, CUDA on NVIDIA). GPU needs `--features gpu`.
+    /// cpu | gpu (CoreML on Apple, DirectML on Windows, CUDA on Linux). GPU needs `--features gpu`.
     #[arg(long, default_value_t = Device::Cpu)]
     device: Device,
     /// CPU preprocess: auto | on | off. auto = SIMD on x86, scalar on Apple Silicon.

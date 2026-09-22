@@ -1,9 +1,10 @@
-//! GPU enhance: Metal (macOS) / CUDA (elsewhere) on device memory.
+//! GPU enhance: Metal on macOS, CUDA on Linux. Windows keeps the frame on the
+//! host buffer `HostPipe` already copies into the DirectML session.
 //!
 //! The working BGR buffer stays in shared or pinned GPU-addressable memory.
 //! Only tiny reductions (channel sums) are read by the CPU.
 
-#[cfg(all(feature = "gpu", not(target_os = "macos")))]
+#[cfg(all(feature = "gpu", target_os = "linux"))]
 use anyhow::bail;
 use anyhow::Result;
 
@@ -331,7 +332,7 @@ struct GpuInfo {
     pad2: f32,
 }
 
-#[cfg(all(feature = "gpu", not(target_os = "macos")))]
+#[cfg(all(feature = "gpu", target_os = "linux"))]
 unsafe impl cudarc::driver::DeviceRepr for GpuInfo {}
 
 #[allow(dead_code)]
@@ -368,8 +369,11 @@ enum Inner {
     Off,
     #[cfg(all(feature = "gpu", target_os = "macos"))]
     Metal(MetalEnhance),
-    #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+    #[cfg(all(feature = "gpu", target_os = "linux"))]
     Cuda(CudaEnhance),
+    /// CPU enhance. HostPipe copies these bytes into the DirectML input tensor.
+    #[cfg(all(feature = "gpu", windows))]
+    Host(Vec<u8>),
 }
 
 impl GpuEnhance {
@@ -387,11 +391,19 @@ impl GpuEnhance {
                 inner: Inner::Metal(MetalEnhance::new(width, height)?),
             });
         }
-        #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+        #[cfg(all(feature = "gpu", target_os = "linux"))]
         {
             return Ok(Self {
                 cfg,
                 inner: Inner::Cuda(CudaEnhance::new(width, height)?),
+            });
+        }
+        #[cfg(all(feature = "gpu", windows))]
+        {
+            let _ = (width, height);
+            return Ok(Self {
+                cfg,
+                inner: Inner::Host(Vec::new()),
             });
         }
         #[cfg(not(feature = "gpu"))]
@@ -424,8 +436,14 @@ impl GpuEnhance {
                 }
                 m.run(src, &cfg)
             }
-            #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+            #[cfg(all(feature = "gpu", target_os = "linux"))]
             Inner::Cuda(c) => c.run(src, &cfg),
+            #[cfg(all(feature = "gpu", windows))]
+            Inner::Host(buf) => {
+                let image = crate::enhance::enhance_bgr(src, &cfg);
+                *buf = image.data;
+                Ok(buf.as_slice())
+            }
         }
     }
 
@@ -448,8 +466,19 @@ impl GpuEnhance {
             Inner::Off => Ok(()),
             #[cfg(all(feature = "gpu", target_os = "macos"))]
             Inner::Metal(m) => m.run_in_place(data, width, height, &cfg),
-            #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+            #[cfg(all(feature = "gpu", target_os = "linux"))]
             Inner::Cuda(c) => c.run_in_place(data, width, height, &cfg),
+            #[cfg(all(feature = "gpu", windows))]
+            Inner::Host(_) => {
+                let mut image = BgrImage {
+                    width,
+                    height,
+                    data: data.to_vec(),
+                };
+                crate::enhance::enhance_bgr_in_place(&mut image, &cfg);
+                data.copy_from_slice(&image.data);
+                Ok(())
+            }
         }
     }
 }
@@ -680,7 +709,7 @@ impl MetalEnhance {
     }
 }
 
-#[cfg(all(feature = "gpu", not(target_os = "macos")))]
+#[cfg(all(feature = "gpu", target_os = "linux"))]
 struct CudaEnhance {
     dev: std::sync::Arc<cudarc::driver::CudaDevice>,
     wb_sum: cudarc::driver::CudaFunction,
@@ -699,7 +728,7 @@ struct CudaEnhance {
     host_out: Vec<u8>,
 }
 
-#[cfg(all(feature = "gpu", not(target_os = "macos")))]
+#[cfg(all(feature = "gpu", target_os = "linux"))]
 impl CudaEnhance {
     fn new(width: u32, height: u32) -> Result<Self> {
         use cudarc::driver::CudaDevice;

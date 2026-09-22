@@ -35,7 +35,7 @@ Webcam or video with the built-in overlay (no Unity required):
     cargo run --release --manifest-path runtime-ort/Cargo.toml --bin facetracker -- -c 0 --visualize 3 --pnp-points 1 --max-threads 4
     cargo run --release --manifest-path runtime-ort/Cargo.toml --bin facetracker -- -c video.mp4 --visualize 3 --pnp-points 1 --max-threads 4
 
-CPU is the default. GPU (CoreML on Apple, CUDA on NVIDIA) uses the same loop; detect/landmarks run on the EP (`--features gpu`, `--device gpu`). Gaze, RetinaFace, PnP, and UDP stay on CPU:
+CPU is the default. GPU (CoreML on Apple, DirectML on Windows, CUDA on Linux) uses the same loop; detect/landmarks run on the EP (`--features gpu`, `--device gpu`). Gaze, RetinaFace, PnP, and UDP stay on CPU:
 
     cargo run --release --features gpu --manifest-path runtime-ort/Cargo.toml --bin facetracker -- -c 0 --device gpu --visualize 3 --pnp-points 1 --max-threads 4
 
@@ -123,8 +123,8 @@ Tracking no longer uses Python. `train/` keeps the PyTorch architectures (`model
 
     cargo run --release --manifest-path runtime-ort/Cargo.toml --bin osf-bench -- --model 3 --threads 4
 
-GPU (CoreML on Apple, CUDA on NVIDIA). Per-model `bench()` times bound inference only.
-The GPU *pipeline* runs Resize+Normalize on the EP (fused MLProgram on CoreML; fused detect + CUDA Graph on NVIDIA)
+GPU is CoreML on Apple, DirectML on Windows, and CUDA on Linux. Per-model `bench()` times bound inference only.
+The GPU *pipeline* runs Resize+Normalize on the EP (fused MLProgram on CoreML, host-memory fused graphs on DirectML, fused detect + CUDA Graph on Linux)
 so the CPU does not build f16 NCHW or read back full heatmaps between detect and landmarks:
 
     cargo run --release --features gpu --manifest-path runtime-ort/Cargo.toml --bin osf-bench -- --model 3 --threads 4 --device gpu

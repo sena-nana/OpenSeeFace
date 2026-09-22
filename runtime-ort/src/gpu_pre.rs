@@ -1,8 +1,8 @@
 //! GPU preprocess: ONNX Resize+Normalize on the EP.
 //!
-//! CoreML fuses uint8 NHWC → Resize+Normalize+model (ORT has no CoreML device allocator).
+//! CoreML and DirectML fuse uint8 NHWC → Resize+Normalize+model in host memory.
 //! Landmark crop is CPU bilinear into a persistent host tensor (static spatial dims).
-//! CUDA uses a fused detect graph (CUDA Graph) plus device-resident landmark NCHW;
+//! Linux CUDA uses a fused detect graph (CUDA Graph) plus device-resident landmark NCHW;
 //! only boxes/heatmaps are read back.
 
 use std::path::Path;
@@ -11,7 +11,7 @@ use std::path::PathBuf;
 #[cfg(feature = "gpu")]
 use std::process::Command;
 
-#[cfg(all(feature = "gpu", not(target_os = "macos")))]
+#[cfg(all(feature = "gpu", target_os = "linux"))]
 use crate::decode::decode_landmarks_data;
 use crate::decode::LmSpec;
 use crate::enhance::EnhanceCfg;
@@ -23,11 +23,11 @@ use crate::preprocess::crop_box_pad;
 use crate::preprocess::resize_roi_into;
 use crate::preprocess::BgrImage;
 #[cfg(feature = "gpu")]
-use crate::session::{make_session_ep, GpuEp};
-#[cfg(feature = "gpu")]
 use crate::session::Device;
 #[cfg(feature = "gpu")]
 use crate::session::{f16_output_specs, oe};
+#[cfg(feature = "gpu")]
+use crate::session::{make_session_ep, GpuEp};
 #[cfg(feature = "gpu")]
 use anyhow::Context;
 use anyhow::{bail, Result};
@@ -111,10 +111,10 @@ fn need_gpu<T>() -> Result<T> {
 
 /// GPU pipeline: preprocess on the EP; only small tensors come back to the CPU.
 pub struct GpuTracker {
-    #[cfg(all(feature = "gpu", target_os = "macos"))]
+    #[cfg(all(feature = "gpu", any(target_os = "macos", windows)))]
     pipe: HostPipe,
-    #[cfg(all(feature = "gpu", not(target_os = "macos")))]
-    pipe: NvPipe,
+    #[cfg(all(feature = "gpu", target_os = "linux"))]
+    pipe: CudaPipe,
     #[cfg(feature = "gpu")]
     cfg: GpuCfg,
     #[cfg(not(feature = "gpu"))]
@@ -175,36 +175,39 @@ impl GpuTracker {
                 cfg,
             })
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(windows)]
         {
-            let cuda = cuda_runs(&pre).and_then(|()| {
-                CudaPipe::open(
+            Ok(Self {
+                pipe: HostPipe::open(
+                    &pre,
+                    cfg.spec,
+                    cfg.threads,
+                    frame,
+                    cfg.enhance,
+                    GpuEp::DirectMl,
+                )?,
+                cfg,
+            })
+        }
+        #[cfg(target_os = "linux")]
+        {
+            cuda_runs(&pre)?;
+            Ok(Self {
+                pipe: CudaPipe::open(
                     &cfg.models_dir,
                     &pre,
                     cfg.spec,
                     cfg.threads,
                     frame,
                     cfg.enhance,
-                )
-            });
-            let pipe = match cuda {
-                Ok(pipe) => NvPipe::Cuda(pipe),
-                #[cfg(windows)]
-                Err(error) => {
-                    eprintln!("CUDA cannot run on this GPU ({error:#}); using DirectML");
-                    NvPipe::DirectMl(HostPipe::open(
-                        &pre,
-                        cfg.spec,
-                        cfg.threads,
-                        frame,
-                        cfg.enhance,
-                        GpuEp::DirectMl,
-                    )?)
-                }
-                #[cfg(not(windows))]
-                Err(error) => return Err(error),
-            };
-            Ok(Self { pipe, cfg })
+                )?,
+                cfg,
+            })
+        }
+        #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+        {
+            let _ = (pre, frame, cfg);
+            bail!("GPU requested but no GPU execution provider is available; use --device cpu")
         }
     }
 
@@ -289,7 +292,7 @@ fn bind_f16_outs(sess: &Session, bind: &mut IoBinding, alloc: &Allocator) -> Res
     Ok(())
 }
 
-#[cfg(all(feature = "gpu", not(target_os = "macos")))]
+#[cfg(all(feature = "gpu", target_os = "linux"))]
 fn pin_alloc(sess: &Session, ty: ort::memory::MemoryType) -> Result<Allocator> {
     use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo};
     Allocator::new(
@@ -302,7 +305,7 @@ fn pin_alloc(sess: &Session, ty: ort::memory::MemoryType) -> Result<Allocator> {
 /// A CUDA provider can load yet ship no kernels for the GPU, which only shows
 /// once a graph runs. Probe with a small preprocess graph in a plain session:
 /// the CUDA-graph pipeline does not fail cleanly in that state.
-#[cfg(all(feature = "gpu", not(target_os = "macos")))]
+#[cfg(all(feature = "gpu", target_os = "linux"))]
 fn cuda_runs(pre: &Path) -> Result<()> {
     let dims = [("height", 8i64), ("width", 8i64)];
     let (mut session, _) = make_session_ep(
@@ -314,51 +317,13 @@ fn cuda_runs(pre: &Path) -> Result<()> {
         GpuEp::Native { cuda_graph: false },
     )?;
     let image = [0u8; 8 * 8 * 3];
-    let tensor = ort::value::TensorRef::from_array_view(([1i64, 8, 8, 3], &image[..])).map_err(oe)?;
+    let tensor =
+        ort::value::TensorRef::from_array_view(([1i64, 8, 8, 3], &image[..])).map_err(oe)?;
     session
         .run(ort::inputs!["image" => tensor])
         .map_err(oe)
         .context("CUDA probe")?;
     Ok(())
-}
-
-#[cfg(all(feature = "gpu", not(target_os = "macos")))]
-enum NvPipe {
-    Cuda(CudaPipe),
-    #[cfg(windows)]
-    DirectMl(HostPipe),
-}
-
-#[cfg(all(feature = "gpu", not(target_os = "macos")))]
-impl NvPipe {
-    fn detect(
-        &mut self,
-        frame: &BgrImage,
-        threshold: f32,
-        max_faces: usize,
-    ) -> Result<Vec<[f32; 5]>> {
-        match self {
-            Self::Cuda(pipe) => pipe.detect(frame, threshold, max_faces),
-            #[cfg(windows)]
-            Self::DirectMl(pipe) => pipe.detect(frame, threshold, max_faces),
-        }
-    }
-
-    fn landmarks_roi(
-        &mut self,
-        frame: &BgrImage,
-        x1: i32,
-        y1: i32,
-        x2: i32,
-        y2: i32,
-        spec: LmSpec,
-    ) -> Result<(f32, Vec<[f32; 3]>)> {
-        match self {
-            Self::Cuda(pipe) => pipe.landmarks_roi(frame, x1, y1, x2, y2, spec),
-            #[cfg(windows)]
-            Self::DirectMl(pipe) => pipe.landmarks_roi(frame, x1, y1, x2, y2, spec),
-        }
-    }
 }
 
 /// Fused uint8 NHWC graphs with host-memory I/O (CoreML, DirectML).
@@ -520,7 +485,7 @@ impl HostPipe {
     }
 }
 
-#[cfg(all(feature = "gpu", not(target_os = "macos")))]
+#[cfg(all(feature = "gpu", target_os = "linux"))]
 struct CudaPipe {
     w: u32,
     h: u32,
@@ -540,7 +505,7 @@ struct CudaPipe {
     enhanced: bool,
 }
 
-#[cfg(all(feature = "gpu", not(target_os = "macos")))]
+#[cfg(all(feature = "gpu", target_os = "linux"))]
 impl CudaPipe {
     fn open(
         models_dir: &Path,

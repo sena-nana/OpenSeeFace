@@ -8,8 +8,9 @@ publish = false
 
 [features]
 default = []
-# CoreML on macOS, CUDA elsewhere (lax match picks the closest prebuilt ORT).
-gpu = ["ort/lax-feature-matching", "ort/coreml", "ort/cuda"]
+# Closest prebuilt ORT. Providers are target dependencies: CoreML on macOS,
+# DirectML on Windows, CUDA on Linux.
+gpu = ["ort/lax-feature-matching", "ort/coreml"]
 # Load the same libonnxruntime as Python (ORT_DYLIB_PATH).
 shared-ort = ["ort/load-dynamic"]
 
@@ -40,8 +41,8 @@ serde_json = "1"
 metal = "0.31"
 
 [target.'cfg(windows)'.dependencies]
-# DirectML runs where the prebuilt CUDA kernels do not support the GPU.
 ort = { version = "2.0.0-rc.13", features = ["directml"] }
 
-[target.'cfg(not(target_os = "macos"))'.dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
+ort = { version = "2.0.0-rc.13", features = ["cuda"] }
 cudarc = { version = "0.13", default-features = false, features = ["std", "driver", "nvrtc", "cuda-12080"] }
