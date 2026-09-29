@@ -3,12 +3,15 @@
 //! The landmark CNN is trained on axis-aligned padded boxes, so in-plane
 //! rotation is not applied to the crop. Scale and translation come from
 //! Umeyama on points 36/39/42/45/30; size is a running max of the detector
-//! box, the 66-pt hull, and the scaled FACE_3D template (grows, never shrinks
-//! with jaw/mouth jitter). If a parallel brows+nose fit disagrees (eye corners
-//! pulled onto a rim), that fit is used instead. Weak refs fall back to
-//! interior landmarks, then hold the previous box.
+//! box, the landmark hull, and the scaled FACE_3D template (grows, never
+//! shrinks with jaw/mouth jitter), capped at [`GROW_CAP`] times the hull.
+//! The hull covers the 66 model landmarks only — the gaze pupils appended to
+//! `lms` are not face landmarks, and an outlier pupil must not blow up the
+//! crop. A fit whose template box no longer covers the hull (foreshortened
+//! eyes under strong yaw) falls back to the hull box. A parallel brows+nose
+//! fit is used when the eye corners are pulled onto a glasses rim; weak refs
+//! hold the previous box.
 
-use crate::decode::landmark_bbox;
 use crate::geom::{similarity_umeyama, xywh_iou, Similarity};
 use crate::pnp::FACE_3D;
 
@@ -18,6 +21,11 @@ const ALPHA_S: f32 = 0.25;
 const ALPHA_T: f32 = 0.8;
 const IOU_RESET: f32 = 0.3;
 const JUMP_FRAC: f32 = 0.2;
+/// Caps the grow-only size rule so one outlier frame cannot latch a giant crop.
+const GROW_CAP: f32 = 1.5;
+/// Minimum template-box coverage of the landmark hull for a fit to be
+/// trusted. Healthy frames measure 0.72-0.94; the failing strong-yaw frame 0.42.
+const COVERAGE_FRAC: f32 = 0.55;
 const INTERIOR: std::ops::Range<usize> = 17..48;
 const EYES_NOSE: [usize; 5] = [36, 39, 42, 45, 30];
 /// Brows 17–26 + nose 27–35 (no lids / corners).
@@ -182,8 +190,8 @@ fn place_box(tmpl: [f32; 4], last: Option<[f32; 4]>, hull: Option<[f32; 4]>) -> 
         h = h.max(p[3]);
     }
     if let Some(p) = hull {
-        w = w.max(p[2]);
-        h = h.max(p[3]);
+        w = w.max(p[2]).min((p[2] * GROW_CAP).max(1.0));
+        h = h.max(p[3]).min((p[3] * GROW_CAP).max(1.0));
     }
     [cx - w * 0.5, cy - h * 0.5, w, h]
 }
@@ -305,6 +313,24 @@ fn mix(state: &mut CropSmoothState, raw: Similarity) -> Similarity {
     mixed
 }
 
+fn hull_box(
+    hull: Option<[f32; 4]>,
+    pts: &[[f32; 3]],
+    last: Option<[f32; 4]>,
+    state: Option<&mut CropSmoothState>,
+) -> Option<[f32; 5]> {
+    // The full-landmark hull matches what the CNN is trained on; the interior
+    // subset excludes mouth and chin, so it only serves when contour refs are
+    // weak; with no confident refs at all the previous box is held.
+    let box4 = hull
+        .or_else(|| aabb_pts(pts, INTERIOR))
+        .or(last)?;
+    if let Some(st) = state {
+        st.last = Some(box4);
+    }
+    Some([box4[0], box4[1], box4[2], box4[3], 1.0])
+}
+
 pub fn stable_landmark_bbox(
     pts: &[[f32; 3]],
     mut state: Option<&mut CropSmoothState>,
@@ -322,16 +348,9 @@ pub fn stable_landmark_bbox(
         Some(s) => (None, s.last),
         None => (None, None),
     };
+    let hull = aabb_pts(pts, 0..pts.len().min(66));
     let Some(raw) = fit_sim(pts, prev) else {
-        let box4 = last
-            .or_else(|| aabb_pts(pts, INTERIOR))
-            .or_else(|| aabb_pts(pts, 0..pts.len().min(66)))?;
-        if let Some(st) = state {
-            if st.last.is_none() {
-                st.last = Some(box4);
-            }
-        }
-        return Some([box4[0], box4[1], box4[2], box4[3], 1.0]);
+        return hull_box(hull, pts, last, state);
     };
     let sim = if let Some(st) = state.as_deref_mut() {
         mix(st, raw)
@@ -339,7 +358,11 @@ pub fn stable_landmark_bbox(
         raw
     };
     let tmpl = sim.aabb((0..66).filter_map(template_xy))?;
-    let hull = landmark_bbox(pts).map(|b| [b[0], b[1], b[2], b[3]]);
+    if hull.is_some_and(|hu| tmpl[2] < COVERAGE_FRAC * hu[2] || tmpl[3] < COVERAGE_FRAC * hu[3]) {
+        // Foreshortened fit points (strong yaw) make the least-squares scale
+        // collapse; the mapped template no longer covers the face.
+        return hull_box(hull, pts, last, state);
+    }
     let box4 = place_box(tmpl, last, hull);
     if let Some(st) = state {
         st.last = Some(box4);
@@ -499,5 +522,62 @@ mod tests {
         let box4 = stable_landmark_bbox(&pts, None).unwrap();
         let cx = box4[0] + box4[2] * 0.5;
         assert!((cx - 320.0).abs() < 2.0, "cx={cx}");
+    }
+
+    /// Frame 1 of TrackingTest pose_20260916/20260916_162851 (three-quarter
+    /// view, left eye foreshortened): pre-fix, `stable_landmark_bbox` turned
+    /// these landmarks into an 836x614 crop (986x656 by the next frame) and
+    /// the tracker dropped the face for ~11 of every 12 frames.
+    const POSE_FRAME: [[f32; 3]; 66] = [
+        [415.5, 605.2, 0.946], [453.5, 610.5, 1.026], [488.6, 619.8, 0.8145], [519.0, 631.5, 0.747],
+        [551.2, 648.9, 0.8547], [575.3, 682.2, 0.8099], [591.9, 719.9, 0.865], [604.1, 761.6, 1.032],
+        [613.7, 798.0, 0.8829], [607.0, 815.9, 0.9078], [597.9, 810.0, 0.9189], [588.3, 797.1, 0.8072],
+        [564.7, 783.4, 0.6673], [533.7, 776.4, 0.7415], [505.3, 774.4, 0.6639], [472.1, 775.8, 0.6703],
+        [431.7, 770.3, 0.759], [369.9, 705.3, 0.7804], [353.0, 725.2, 0.8029], [350.3, 745.7, 0.8414],
+        [353.0, 765.9, 0.829], [359.8, 783.0, 0.8332], [368.1, 807.0, 0.9183], [365.6, 813.2, 0.9869],
+        [365.0, 819.2, 0.7853], [366.9, 824.4, 0.9137], [379.7, 829.4, 0.8079], [396.5, 803.7, 0.9218],
+        [415.1, 814.8, 0.8224], [433.0, 828.2, 0.9627], [452.6, 832.4, 0.9109], [474.5, 799.6, 0.8754],
+        [475.2, 809.0, 1.006], [477.5, 819.1, 1.009], [476.5, 824.1, 0.974], [476.4, 824.5, 0.9637],
+        [397.7, 726.0, 0.9464], [392.9, 739.2, 0.7869], [392.8, 761.4, 0.9961], [399.6, 767.6, 0.9049],
+        [401.4, 760.8, 1.001], [401.7, 738.9, 0.8556], [404.3, 810.6, 0.8921], [401.0, 817.0, 0.9634],
+        [402.8, 828.2, 0.7817], [407.4, 830.2, 0.681], [409.4, 828.5, 0.7639], [408.1, 817.9, 0.9759],
+        [511.3, 799.0, 0.8829], [503.8, 819.8, 0.876], [505.0, 826.5, 0.9141], [505.8, 832.2, 1.004],
+        [515.6, 835.8, 1.001], [533.0, 835.1, 1.017], [536.7, 832.0, 0.8131], [539.4, 825.9, 0.8902],
+        [538.4, 809.8, 0.8485], [531.9, 794.3, 0.9864], [525.2, 777.1, 1.009], [517.4, 805.3, 0.858],
+        [517.9, 826.1, 0.9314], [519.3, 830.3, 0.6521], [529.0, 834.0, 0.9511], [521.9, 828.8, 0.7534],
+        [523.7, 823.3, 0.8733], [522.1, 802.8, 0.9016],
+    ];
+
+    #[test]
+    fn yaw_degenerate_fit_stays_bounded() {
+        let mut st = CropSmoothState::default();
+        st.seed_size([605.0, 350.0, 231.0, 264.0]);
+        let b = stable_landmark_bbox(&POSE_FRAME, Some(&mut st)).unwrap();
+        let hull = landmark_bbox(&POSE_FRAME).unwrap();
+        assert!(
+            b[2] <= hull[2] * GROW_CAP + 2.0 && b[3] <= hull[3] * GROW_CAP + 2.0,
+            "box {b:?} must stay within GROW_CAP of hull {hull:?}"
+        );
+        // The crop must still cover the eye region, not collapse to a sliver.
+        assert!(b[2] > hull[2] * 0.6 && b[3] > hull[3] * 0.6, "box {b:?} vs hull {hull:?}");
+        // And a second call (the frame actually fed to the CNN) stays bounded too.
+        let b2 = stable_landmark_bbox(&POSE_FRAME, Some(&mut st)).unwrap();
+        assert!(
+            b2[2] <= hull[2] * GROW_CAP + 2.0 && b2[3] <= hull[3] * GROW_CAP + 2.0,
+            "second box {b2:?} must stay within GROW_CAP of hull {hull:?}"
+        );
+    }
+
+    #[test]
+    fn grow_only_rule_is_capped_by_hull() {
+        let pts = synth_pts(100.0, 320.0, 240.0);
+        let mut st = CropSmoothState::default();
+        st.last = Some([100.0, 50.0, 900.0, 700.0]);
+        let b = stable_landmark_bbox(&pts, Some(&mut st)).unwrap();
+        let hull = landmark_bbox(&pts).unwrap();
+        assert!(
+            b[2] <= hull[2] * GROW_CAP + 2.0 && b[3] <= hull[3] * GROW_CAP + 2.0,
+            "box {b:?} must be capped by hull {hull:?}"
+        );
     }
 }
