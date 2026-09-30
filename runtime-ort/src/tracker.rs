@@ -707,7 +707,6 @@ impl Tracker {
                 &mut fi.face_3d,
                 &mut fi.pts_3d,
                 &fi.lms,
-                fi.euler,
                 depth.rotation,
                 depth.translation,
                 &cam,

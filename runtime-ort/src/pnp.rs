@@ -3,7 +3,7 @@
 use nalgebra::{Matrix3, Vector3};
 use rand::Rng;
 
-use crate::decode::{mean_conf, EYE_IDX};
+use crate::decode::{EYE_IDX, mean_conf};
 use crate::geom::matrix_to_quaternion;
 
 pub const FACE_3D: [[f32; 3]; 70] = [
@@ -153,16 +153,70 @@ pub fn project_points(
         .collect()
 }
 
-fn residuals(params: &[f64; 6], obj: &[[f32; 3]], img: &[[f32; 2]], cam: &Camera) -> Vec<f64> {
-    let rvec = [params[0] as f32, params[1] as f32, params[2] as f32];
-    let tvec = [params[3] as f32, params[4] as f32, params[5] as f32];
-    let proj = project_points(obj, rvec, tvec, cam);
+fn rodrigues_f64(rvec: [f64; 3]) -> [[f64; 3]; 3] {
+    let theta = (rvec[0] * rvec[0] + rvec[1] * rvec[1] + rvec[2] * rvec[2]).sqrt();
+    if theta < 1e-12 {
+        return [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    }
+    let k = [rvec[0] / theta, rvec[1] / theta, rvec[2] / theta];
+    let c = theta.cos();
+    let s = theta.sin();
+    let oc = 1.0 - c;
+    [
+        [
+            c + k[0] * k[0] * oc,
+            k[0] * k[1] * oc - k[2] * s,
+            k[0] * k[2] * oc + k[1] * s,
+        ],
+        [
+            k[1] * k[0] * oc + k[2] * s,
+            c + k[1] * k[1] * oc,
+            k[1] * k[2] * oc - k[0] * s,
+        ],
+        [
+            k[2] * k[0] * oc - k[1] * s,
+            k[2] * k[1] * oc + k[0] * s,
+            c + k[2] * k[2] * oc,
+        ],
+    ]
+}
+
+fn residuals_f64(params: &[f64; 6], obj: &[[f32; 3]], img: &[[f32; 2]], cam: &Camera) -> Vec<f64> {
+    let rotation = rodrigues_f64([params[0], params[1], params[2]]);
+    let t = [params[3], params[4], params[5]];
+    let fx = cam.fx as f64;
+    let fy = cam.fy as f64;
+    let cx = cam.cx as f64;
+    let cy = cam.cy as f64;
     let mut r = Vec::with_capacity(obj.len() * 2);
-    for (p, q) in proj.iter().zip(img) {
-        r.push(q[0] as f64 - p[0] as f64);
-        r.push(q[1] as f64 - p[1] as f64);
+    for (p, q) in obj.iter().zip(img) {
+        let x = rotation[0][0] * p[0] as f64
+            + rotation[0][1] * p[1] as f64
+            + rotation[0][2] * p[2] as f64
+            + t[0];
+        let y = rotation[1][0] * p[0] as f64
+            + rotation[1][1] * p[1] as f64
+            + rotation[1][2] * p[2] as f64
+            + t[1];
+        let z = rotation[2][0] * p[0] as f64
+            + rotation[2][1] * p[1] as f64
+            + rotation[2][2] * p[2] as f64
+            + t[2];
+        let z = if z.abs() < 1e-8 { 1e-8 } else { z };
+        r.push(q[0] as f64 - (fx * x / z + cx));
+        r.push(q[1] as f64 - (fy * y / z + cy));
     }
     r
+}
+
+/// OpenSeeFace stores a landmark as `(row, col, conf)`. Image x is the column.
+fn image_xy(lm: [f32; 3]) -> [f32; 2] {
+    [lm[1], lm[0]]
+}
+
+fn reprojection_rms(residual: &[f64], points: usize) -> f64 {
+    let sum: f64 = residual.iter().map(|v| v * v).sum();
+    (sum / points.max(1) as f64).sqrt()
 }
 
 /// Iterative PnP (Gauss–Newton), OpenCV `SOLVEPNP_ITERATIVE` stand-in.
@@ -175,7 +229,38 @@ pub fn solve_pnp(
     if obj.len() < 4 || obj.len() != img.len() {
         return None;
     }
-    let (r0, t0) = guess.unwrap_or_else(|| init_pose(obj, img, cam));
+    // Zero rotation is the failed fit. 180° about Z is upright (+X on image
+    // left). 180° about X mirrors left and right and must not win a tie.
+    let mut seeds = Vec::with_capacity(4);
+    if let Some(seed) = guess {
+        seeds.push(seed);
+    }
+    let translation_seed = init_pose(obj, img, cam);
+    seeds.push(translation_seed);
+    seeds.push(([std::f32::consts::PI, 0.0, 0.0], translation_seed.1));
+    seeds.push(([0.0, 0.0, std::f32::consts::PI], translation_seed.1));
+    let mut best: Option<([f32; 3], [f32; 3], f32)> = None;
+    for seed in seeds {
+        let solved = refine_pose(obj, img, cam, seed);
+        if solved.2.is_finite() && best.is_none_or(|(_, _, error)| solved.2 < error) {
+            best = Some(solved);
+        }
+    }
+    let (rvec, tvec, error) = best?;
+    let tlen = (tvec[0] * tvec[0] + tvec[1] * tvec[1] + tvec[2] * tvec[2]).sqrt();
+    if tvec[2].abs() < 0.1 || tlen > 1e6 || error > 250.0 {
+        return None;
+    }
+    Some((rvec, tvec))
+}
+
+fn refine_pose(
+    obj: &[[f32; 3]],
+    img: &[[f32; 2]],
+    cam: &Camera,
+    seed: ([f32; 3], [f32; 3]),
+) -> ([f32; 3], [f32; 3], f32) {
+    let (r0, t0) = seed;
     let mut params = [
         r0[0] as f64,
         r0[1] as f64,
@@ -186,13 +271,15 @@ pub fn solve_pnp(
     ];
     let n = obj.len() * 2;
     let eps = 1e-6;
-    for _ in 0..25 {
-        let r = residuals(&params, obj, img, cam);
+    let mut lambda = 1e-3_f64;
+    for _ in 0..40 {
+        let r = residuals_f64(&params, obj, img, cam);
+        let rms = reprojection_rms(&r, obj.len());
         let mut j = vec![vec![0.0f64; 6]; n];
         for k in 0..6 {
             let mut p2 = params;
             p2[k] += eps;
-            let r2 = residuals(&p2, obj, img, cam);
+            let r2 = residuals_f64(&p2, obj, img, cam);
             for i in 0..n {
                 j[i][k] = (r2[i] - r[i]) / eps;
             }
@@ -208,34 +295,45 @@ pub fn solve_pnp(
             }
         }
         for k in 0..6 {
-            jt_j[k][k] += 1e-4;
+            jt_j[k][k] *= 1.0 + lambda;
         }
         let Some(dx) = solve6(&jt_j, &jt_r) else {
-            break;
+            lambda *= 10.0;
+            if lambda > 1e8 {
+                break;
+            }
+            continue;
         };
-        let mut nrm = 0.0;
-        for k in 0..6 {
-            params[k] += dx[k];
-            nrm += dx[k] * dx[k];
+        let step = dx.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if !step.is_finite() || step > 2.0 {
+            lambda *= 10.0;
+            if lambda > 1e8 {
+                break;
+            }
+            continue;
         }
-        if nrm.sqrt() < 1e-8 {
-            break;
+        let mut trial = params;
+        for k in 0..6 {
+            trial[k] -= dx[k];
+        }
+        let trial_rms = reprojection_rms(&residuals_f64(&trial, obj, img, cam), obj.len());
+        if trial_rms < rms {
+            params = trial;
+            lambda = (lambda * 0.3).max(1e-8);
+            if trial_rms < 0.05 || (rms - trial_rms) < 1e-4 {
+                break;
+            }
+        } else {
+            lambda *= 10.0;
+            if lambda > 1e8 {
+                break;
+            }
         }
     }
-    let tlen = (params[3] * params[3] + params[4] * params[4] + params[5] * params[5]).sqrt();
     let rvec = [params[0] as f32, params[1] as f32, params[2] as f32];
     let tvec = [params[3] as f32, params[4] as f32, params[5] as f32];
-    let proj = project_points(obj, rvec, tvec, cam);
-    let mut e = 0.0f32;
-    for (p, q) in proj.iter().zip(img) {
-        e += (p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2);
-    }
-    e = (e / img.len().max(1) as f32).sqrt();
-    if params[5].abs() < 0.1 || tlen > 1e6 || e > 250.0 {
-        let (r1, t1) = init_pose(obj, img, cam);
-        return Some((r1, t1));
-    }
-    Some((rvec, tvec))
+    let error = reprojection_rms(&residuals_f64(&params, obj, img, cam), obj.len()) as f32;
+    (rvec, tvec, error)
 }
 
 fn init_pose(obj: &[[f32; 3]], img: &[[f32; 2]], cam: &Camera) -> ([f32; 3], [f32; 3]) {
@@ -279,6 +377,45 @@ fn solve6(a: &[[f64; 6]; 6], b: &[f64; 6]) -> Option<[f64; 6]> {
     m.lu()
         .solve(&v)
         .map(|x| [x[0], x[1], x[2], x[3], x[4], x[5]])
+}
+
+fn wrap_degrees(degrees: f32) -> f32 {
+    (degrees + 180.0).rem_euclid(360.0) - 180.0
+}
+
+/// Packet degrees. Pitch is chin-up positive, yaw is nose-to-image-left
+/// positive, and roll is a tilt toward the user's right. The upright solve
+/// sits near roll ±180; `adjust_3d` still uses the raw solve.
+fn published_euler(solved: [f32; 3]) -> [f32; 3] {
+    [
+        wrap_degrees(solved[0]),
+        wrap_degrees(solved[1]),
+        wrap_degrees(-wrap_degrees(solved[2] + 180.0)),
+    ]
+}
+
+/// Same `Rz * Ry * Rx` matrix the output filter rebuilds from packet euler.
+fn quaternion_from_packet_euler(euler: [f32; 3]) -> [f32; 4] {
+    let (x, y, z) = (
+        euler[0].to_radians(),
+        euler[1].to_radians(),
+        euler[2].to_radians(),
+    );
+    let (cx, sx) = (x.cos(), x.sin());
+    let (cy, sy) = (y.cos(), y.sin());
+    let (cz, sz) = (z.cos(), z.sin());
+    let r = Matrix3::new(
+        cy * cz,
+        cz * sx * sy - cx * sz,
+        sx * sz + cx * cz * sy,
+        cy * sz,
+        cx * cz + sx * sy * sz,
+        cx * sy * sz - cz * sx,
+        -sy,
+        cy * sx,
+        cx * cy,
+    );
+    matrix_to_quaternion(&r)
 }
 
 pub fn euler_from_rmat(r: &Matrix3<f32>) -> [f32; 3] {
@@ -325,10 +462,8 @@ pub fn estimate_depth(
         .iter()
         .map(|&i| face_3d.get(i).copied().unwrap_or([0.0; 3]))
         .collect();
-    let img: Vec<[f32; 2]> = contour_idx
-        .iter()
-        .map(|&i| [lms[i][0], lms[i][1]])
-        .collect();
+    // Landmarks are (row, col). The pinhole model takes image (x, y) = (col, row).
+    let img: Vec<[f32; 2]> = contour_idx.iter().map(|&i| image_xy(lms[i])).collect();
 
     let fail = DepthResult {
         success: false,
@@ -364,7 +499,8 @@ pub fn estimate_depth(
         if depth == 0.0 {
             depth = 1e-6;
         }
-        let p = Vector3::new(lms[i][0] * depth, lms[i][1] * depth, depth);
+        let xy = image_xy(lms[i]);
+        let p = Vector3::new(xy[0] * depth, xy[1] * depth, depth);
         let world = inv_r * (inv_cam * p - t);
         pts_3d[i] = [world.x, world.y, world.z];
     }
@@ -378,7 +514,8 @@ pub fn estimate_depth(
         };
         let px = t_reference[i].x / z;
         let py = t_reference[i].y / z;
-        pnp_error += (lms[i][0] - px).powi(2) + (lms[i][1] - py).powi(2);
+        let xy = image_xy(lms[i]);
+        pnp_error += (xy[0] - px).powi(2) + (xy[1] - py).powi(2);
     }
     {
         let z = if t_reference[30].z.abs() < 1e-8 {
@@ -386,8 +523,8 @@ pub fn estimate_depth(
         } else {
             t_reference[30].z
         };
-        pnp_error += (lms[30][0] - t_reference[30].x / z).powi(2)
-            + (lms[30][1] - t_reference[30].y / z).powi(2);
+        let xy = image_xy(lms[30]);
+        pnp_error += (xy[0] - t_reference[30].x / z).powi(2) + (xy[1] - t_reference[30].y / z).powi(2);
     }
     if pnp_error.is_nan() {
         pnp_error = 9_999_999.0;
@@ -442,7 +579,8 @@ pub fn estimate_depth(
         let mut reference = rmat * Vector3::new(pt[0], pt[1], pt[2]) + t;
         reference = cam.matrix() * reference;
         let depth = reference.z;
-        let p = Vector3::new(lms[66 + i][0] * depth, lms[66 + i][1] * depth, depth);
+        let xy = image_xy(lms[66 + i]);
+        let p = Vector3::new(xy[0] * depth, xy[1] * depth, depth);
         let world = inv_r * (inv_cam * p - t);
         pts_3d[66 + i] = [world.x, world.y, world.z];
     }
@@ -453,10 +591,11 @@ pub fn estimate_depth(
     }
 
     pnp_error = (pnp_error / (2.0 * img.len() as f32)).sqrt();
+    let euler = published_euler(euler_from_rmat(&rmat));
     DepthResult {
         success: true,
-        quaternion: matrix_to_quaternion(&rmat),
-        euler: euler_from_rmat(&rmat),
+        quaternion: quaternion_from_packet_euler(euler),
+        euler,
         pnp_error,
         pts_3d,
         lms,
@@ -538,11 +677,33 @@ const RIGHT_ELIGIBLE: &[usize] = &[
     48, 49, 50, 55, 56, 57, 58, 59, 60, 64, 65,
 ];
 
+/// Raw solve. Positive yaw is the user's right and locks that side.
+fn model_update(solved: [f32; 3]) -> ModelUpdate {
+    let pitch = solved[0];
+    let yaw = solved[1];
+    let roll = wrap_degrees(solved[2] + 180.0);
+    if !(-15.0..=35.0).contains(&pitch) {
+        return ModelUpdate::Skip;
+    }
+    if (-20.0..10.0).contains(&yaw) {
+        return ModelUpdate::FrontalDepth;
+    }
+    if roll.abs() > 30.0 {
+        return ModelUpdate::Skip;
+    }
+    ModelUpdate::Turned { lock_right: yaw > 10.0 }
+}
+
+enum ModelUpdate {
+    Skip,
+    FrontalDepth,
+    Turned { lock_right: bool },
+}
+
 pub fn adjust_3d(
     face_3d: &mut [[f32; 3]],
     pts_3d: &mut [[f32; 3]; 70],
     lms: &[[f32; 3]],
-    euler: [f32; 3],
     rotation: [f32; 3],
     translation: [f32; 3],
     cam: &Camera,
@@ -579,36 +740,32 @@ pub fn adjust_3d(
             }
         }
         r[30] = [1.0, 1.0, 1.0];
-        let mut skip = false;
-        if euler[0] > -165.0 && euler[0] < 145.0 {
-            skip = true;
-        } else if euler[1] > -10.0 && euler[1] < 20.0 {
+        let solved = euler_from_rmat(&rodrigues(rotation));
+        let decision = model_update(solved);
+        if let ModelUpdate::FrontalDepth = decision {
             for row in r.iter_mut() {
                 row[2] = 1.0;
             }
             update_type = 0;
-        } else {
+        } else if let ModelUpdate::Turned { lock_right } = decision {
             for row in r.iter_mut() {
                 row[0] = 1.0;
                 row[1] = 1.0;
             }
-            if euler[2] > 120.0 || euler[2] < 60.0 {
-                skip = true;
-            } else if euler[1] < -10.0 {
-                update_type = 1;
+            update_type = 1;
+            if lock_right {
                 for &i in &RIGHT_LOCK {
                     r[i][2] = 1.0;
                 }
                 eligible = LEFT_ELIGIBLE.to_vec();
             } else {
-                update_type = 1;
                 for &i in &LEFT_LOCK {
                     r[i][2] = 1.0;
                 }
                 eligible = RIGHT_ELIGIBLE.to_vec();
             }
         }
-        if !skip {
+        if !matches!(decision, ModelUpdate::Skip) {
             let ut = if update_type < 0 {
                 0
             } else {
@@ -627,11 +784,12 @@ pub fn adjust_3d(
                 let c_proj = project_points(&scaled, rotation, translation, cam);
                 let mut changed = false;
                 for &i in &eligible {
-                    let d_o = ((o_proj[i][0] - lms[i][0]).powi(2)
-                        + (o_proj[i][1] - lms[i][1]).powi(2))
+                    let observed = image_xy(lms[i]);
+                    let d_o = ((o_proj[i][0] - observed[0]).powi(2)
+                        + (o_proj[i][1] - observed[1]).powi(2))
                     .sqrt();
-                    let d_c = ((c_proj[i][0] - lms[i][0]).powi(2)
-                        + (c_proj[i][1] - lms[i][1]).powi(2))
+                    let d_c = ((c_proj[i][0] - observed[0]).powi(2)
+                        + (c_proj[i][1] - observed[1]).powi(2))
                     .sqrt();
                     if d_c < d_o {
                         update_counts[i][ut] += 1.0;
@@ -680,5 +838,227 @@ fn apply_features(
         *current_features = features.update_ex(pts_3d, feature_level == 2, eye_conf);
         eye_blink[0] = 1.0 - (-current_features[1]).clamp(0.0, 1.0);
         eye_blink[1] = 1.0 - (-current_features[0]).clamp(0.0, 1.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn face_image(yaw_degrees: f32, pitch_degrees: f32) -> (Camera, Vec<[f32; 3]>, Vec<[f32; 2]>) {
+        let cam = Camera::from_frame(640, 480);
+        let rotation = model_rotation(yaw_degrees, pitch_degrees);
+        let translation = Vector3::new(0.0, 0.0, 8.0);
+        let obj: Vec<[f32; 3]> = CONTOUR_PTS.iter().map(|&i| FACE_3D[i]).collect();
+        let img = obj
+            .iter()
+            .map(|p| {
+                let x = rotation * Vector3::new(p[0], p[1], p[2]) + translation;
+                [cam.fx * x.x / x.z + cam.cx, cam.fy * x.y / x.z + cam.cy]
+            })
+            .collect();
+        (cam, obj, img)
+    }
+
+    fn model_rotation(yaw_degrees: f32, pitch_degrees: f32) -> Matrix3<f32> {
+        rodrigues([std::f32::consts::PI, 0.0, 0.0])
+            * rodrigues([pitch_degrees.to_radians(), yaw_degrees.to_radians(), 0.0])
+    }
+
+    fn assert_recovered(yaw: f32, pitch: f32, guess_zero: bool) {
+        let (cam, obj, img) = face_image(yaw, pitch);
+        let guess = guess_zero.then(|| init_pose(&obj, &img, &cam));
+        let (rvec, tvec) = solve_pnp(&obj, &img, &cam, guess)
+            .unwrap_or_else(|| panic!("facing face yaw {yaw} pitch {pitch} did not solve"));
+        let euler = euler_from_rmat(&rodrigues(rvec));
+        let truth = euler_from_rmat(&model_rotation(yaw, pitch));
+        for (got, expected) in euler.iter().zip(truth) {
+            let delta = (*got - expected + 180.0).rem_euclid(360.0) - 180.0;
+            assert!(
+                delta.abs() < 2.0,
+                "recovered {euler:?} truth {truth:?} for yaw {yaw} pitch {pitch}"
+            );
+        }
+        let proj = project_points(&obj, rvec, tvec, &cam);
+        let mut error = 0.0f32;
+        for (p, q) in proj.iter().zip(&img) {
+            error += (p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2);
+        }
+        error = (error / img.len() as f32).sqrt();
+        assert!(
+            error < 1.0,
+            "reprojection {error} px for yaw {yaw} pitch {pitch}"
+        );
+    }
+
+    #[test]
+    fn facing_yaw_is_recovered_instead_of_the_zero_rotation() {
+        assert_recovered(18.0, 0.0, false);
+    }
+
+    #[test]
+    fn zero_guess_still_recovers_facing_yaw_and_pitch() {
+        assert_recovered(18.0, -14.0, true);
+    }
+
+    #[test]
+    fn larger_turn_still_reaches_the_facing_pose() {
+        assert_recovered(35.0, 20.0, true);
+    }
+
+    fn project_model(rotation: Matrix3<f32>, point: [f32; 3]) -> [f32; 2] {
+        let cam = Camera::from_frame(640, 480);
+        let x = rotation * Vector3::new(point[0], point[1], point[2]) + Vector3::new(0.0, 0.0, 8.0);
+        [cam.fx * x.x / x.z + cam.cx, cam.fy * x.y / x.z + cam.cy]
+    }
+
+    fn solve_upright(extra: Matrix3<f32>) -> (Matrix3<f32>, DepthResult) {
+        // Subject's right (+X) is image-left and model up (+Y) is image-up.
+        let upright = Matrix3::new(-1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0);
+        let rotation = upright * extra;
+        let cam = Camera::from_frame(640, 480);
+        let translation = Vector3::new(0.0, 0.0, 8.0);
+        let mut lms = vec![[0.0f32; 3]; 66];
+        for (i, p) in FACE_3D.iter().take(66).enumerate() {
+            let x = rotation * Vector3::new(p[0], p[1], p[2]) + translation;
+            let px = cam.fx * x.x / x.z + cam.cx;
+            let py = cam.fy * x.y / x.z + cam.cy;
+            lms[i] = [py, px, 1.0];
+        }
+        let eyes = [[1.0, 0.0, 0.0, 1.0], [1.0, 0.0, 0.0, 1.0]];
+        let depth = estimate_depth(&lms, &eyes, &FACE_3D, &CONTOUR_PTS, &cam, None);
+        (rotation, depth)
+    }
+
+    fn assert_usable(got: [f32; 3], expected: [f32; 3], label: &str) {
+        for (axis, (value, want)) in got.iter().zip(expected).enumerate() {
+            let delta = wrap_degrees(value - want);
+            assert!(
+                delta.abs() < 1.5,
+                "{label} axis {axis}: usable {got:?} want {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn upright_pose_publishes_pitch_yaw_roll() {
+        let (rest_rotation, rest) = solve_upright(Matrix3::identity());
+        assert!(
+            rest.success && rest.pnp_error < 1.0,
+            "rest fit {} err {}",
+            rest.success,
+            rest.pnp_error
+        );
+        let rest_right = project_model(rest_rotation, FACE_3D[0]);
+        let rest_left = project_model(rest_rotation, FACE_3D[16]);
+        let rest_chin = project_model(rest_rotation, FACE_3D[8]);
+        let rest_brow = project_model(rest_rotation, FACE_3D[27]);
+        assert!(
+            rest_right[0] < rest_left[0] - 20.0,
+            "subject right jaw is image-left of subject left: {rest_right:?} {rest_left:?}"
+        );
+        assert!(
+            rest_chin[1] > rest_brow[1] + 20.0,
+            "chin is below the brow: {rest_chin:?} {rest_brow:?}"
+        );
+        assert_usable(rest.euler, [0.0, 0.0, 0.0], "rest");
+
+        let yaw_extra = rodrigues([0.0, 18.0_f32.to_radians(), 0.0]);
+        let (yaw_rotation, yaw) = solve_upright(yaw_extra);
+        let nose = [0.0f32, 0.0, 0.2];
+        let rest_nose = project_model(rest_rotation, nose);
+        let yaw_nose = project_model(yaw_rotation, nose);
+        assert!(
+            yaw_nose[0] < rest_nose[0] - 3.0,
+            "positive model yaw moves the nose to image left: {rest_nose:?} -> {yaw_nose:?}"
+        );
+        assert!(yaw.success && yaw.pnp_error < 1.0, "yaw err {}", yaw.pnp_error);
+        // Image left is the user's right, published as positive yaw.
+        assert_usable(yaw.euler, [0.0, 18.0, 0.0], "yaw");
+
+        let pitch_extra = rodrigues([14.0_f32.to_radians(), 0.0, 0.0]);
+        let (pitch_rotation, pitch) = solve_upright(pitch_extra);
+        let rest_chin = project_model(rest_rotation, FACE_3D[8]);
+        let pitch_chin = project_model(pitch_rotation, FACE_3D[8]);
+        assert!(
+            pitch_chin[1] < rest_chin[1] - 3.0,
+            "positive model pitch lifts the chin: {rest_chin:?} -> {pitch_chin:?}"
+        );
+        assert!(
+            pitch.success && pitch.pnp_error < 1.0,
+            "pitch err {}",
+            pitch.pnp_error
+        );
+        assert_usable(pitch.euler, [14.0, 0.0, 0.0], "pitch");
+
+        let roll_extra = rodrigues([0.0, 0.0, 11.0_f32.to_radians()]);
+        let (roll_rotation, roll) = solve_upright(roll_extra);
+        let rest_brow = project_model(rest_rotation, FACE_3D[27]);
+        let roll_brow = project_model(roll_rotation, FACE_3D[27]);
+        assert!(
+            roll_brow[0] > rest_brow[0] + 3.0,
+            "positive model roll moves the brow to image right: {rest_brow:?} -> {roll_brow:?}"
+        );
+        assert!(roll.success && roll.pnp_error < 1.0, "roll err {}", roll.pnp_error);
+        // Brow moving to image right is a tilt toward the user's left.
+        assert_usable(roll.euler, [0.0, 0.0, -11.0], "roll");
+    }
+
+    #[test]
+    fn model_update_follows_the_raw_solve() {
+        assert!(matches!(
+            model_update([0.0, 0.0, -180.0]),
+            ModelUpdate::FrontalDepth
+        ));
+        assert!(matches!(
+            model_update([0.0, 18.0, -180.0]),
+            ModelUpdate::Turned { lock_right: true }
+        ));
+        assert!(matches!(
+            model_update([0.0, -25.0, 180.0]),
+            ModelUpdate::Turned { lock_right: false }
+        ));
+        assert!(matches!(model_update([-40.0, 0.0, -180.0]), ModelUpdate::Skip));
+        assert!(matches!(
+            model_update([0.0, 18.0, 90.0]),
+            ModelUpdate::Skip
+        ));
+    }
+
+    #[test]
+    fn estimate_depth_unprojects_a_turned_face_back_to_the_model() {
+        let yaw = 18.0;
+        let pitch = -14.0;
+        let cam = Camera::from_frame(640, 480);
+        let rotation = model_rotation(yaw, pitch);
+        let translation = Vector3::new(0.0, 0.0, 8.0);
+        let mut lms = vec![[0.0f32; 3]; 66];
+        for (i, p) in FACE_3D.iter().take(66).enumerate() {
+            let x = rotation * Vector3::new(p[0], p[1], p[2]) + translation;
+            let px = cam.fx * x.x / x.z + cam.cx;
+            let py = cam.fy * x.y / x.z + cam.cy;
+            lms[i] = [py, px, 1.0];
+        }
+        let eyes = [[1.0, 0.0, 0.0, 1.0], [1.0, 0.0, 0.0, 1.0]];
+        let depth = estimate_depth(&lms, &eyes, &FACE_3D, &CONTOUR_PTS, &cam, None);
+        assert!(depth.success, "fit failed, error {}", depth.pnp_error);
+        let truth = euler_from_rmat(&rotation);
+        let solved = euler_from_rmat(&rodrigues(depth.rotation));
+        for (got, expected) in solved.iter().zip(truth) {
+            let delta = (*got - expected + 180.0).rem_euclid(360.0) - 180.0;
+            assert!(
+                delta.abs() < 2.0,
+                "geometric euler {solved:?} truth {truth:?}"
+            );
+        }
+        for i in [0usize, 8, 30, 48, 54] {
+            let delta = dist3(depth.pts_3d[i], FACE_3D[i]);
+            assert!(
+                delta < 0.02,
+                "point {i} stayed in camera space: {:?} vs {:?} ({delta})",
+                depth.pts_3d[i],
+                FACE_3D[i]
+            );
+        }
     }
 }
