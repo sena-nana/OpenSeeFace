@@ -1,12 +1,6 @@
-//! CPU vs GPU I/O for ONNX Runtime sessions.
-//!
-//! Host path (CPU, CoreML, DirectML) binds host tensors. Linux CUDA uses pinned
-//! host buffers so ORT can DMA without an extra pageable copy. Intermediate
-//! device tensors for the detect→landmark pipeline live in `gpu_pre`.
+//! ONNX Runtime sessions on the CPU with host-bound I/O.
 
-use std::fmt;
 use std::path::Path;
-use std::str::FromStr;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
@@ -20,201 +14,8 @@ use ort::{api, AsPointer};
 
 use crate::decode::TensorF16;
 
-#[cfg(feature = "gpu")]
-use ort::ep::ExecutionProvider;
-#[cfg(all(feature = "gpu", target_os = "linux"))]
-use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
-
-/// `cpu` or `gpu` (CoreML on Apple, DirectML on Windows, CUDA on Linux).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Device {
-    #[default]
-    Cpu,
-    Gpu,
-}
-
-impl Device {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Cpu => "cpu",
-            Self::Gpu => "gpu",
-        }
-    }
-}
-
-impl fmt::Display for Device {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for Device {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "cpu" => Ok(Self::Cpu),
-            "gpu" => Ok(Self::Gpu),
-            _ => bail!("unknown device {s:?}, expected cpu|gpu"),
-        }
-    }
-}
-
-fn disables_memory_pattern(device: Device, ep: GpuEp) -> bool {
-    // DirectML rejects memory patterns. On Windows every GPU session uses it.
-    #[cfg(windows)]
-    {
-        let _ = ep;
-        device == Device::Gpu
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = (device, ep);
-        false
-    }
-}
-
-pub(crate) fn oe(e: impl std::fmt::Display) -> anyhow::Error {
+fn oe(e: impl std::fmt::Display) -> anyhow::Error {
     anyhow::anyhow!("{e}")
-}
-
-/// GPU execution provider for a session.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum GpuEp {
-    /// CoreML on Apple, CUDA on Linux. Windows GPU sessions use [`GpuEp::DirectMl`].
-    Native { cuda_graph: bool },
-    /// Any DirectX 12 GPU; host-memory I/O only.
-    #[cfg(windows)]
-    DirectMl,
-}
-
-pub(crate) fn gpu_eps(ep: GpuEp) -> Result<Vec<ort::ep::ExecutionProviderDispatch>> {
-    #[cfg(not(feature = "gpu"))]
-    {
-        let _ = ep;
-        bail!("GPU requested; rebuild with `--features gpu` or use `--device cpu`");
-    }
-
-    #[cfg(all(feature = "gpu", windows))]
-    {
-        let _ = ep;
-        if !ort::ep::DirectML::default().is_available().unwrap_or(false) {
-            bail!("GPU requested but no GPU execution provider is available; use --device cpu");
-        }
-        return Ok(vec![ort::ep::DirectML::default()
-            .build()
-            .error_on_failure()]);
-    }
-
-    #[cfg(all(feature = "gpu", not(windows)))]
-    {
-        let cuda_graph = match ep {
-            GpuEp::Native { cuda_graph } => cuda_graph,
-        };
-        #[allow(unused_mut)]
-        let mut eps = Vec::new();
-        #[cfg(target_os = "macos")]
-        if ort::ep::CoreML::default().is_available().unwrap_or(false) {
-            let _ = cuda_graph;
-            eps.push(
-                ort::ep::CoreML::default()
-                    .with_compute_units(ort::ep::coreml::ComputeUnits::CPUAndGPU)
-                    .with_model_format(ort::ep::coreml::ModelFormat::MLProgram)
-                    .build()
-                    .error_on_failure(),
-            );
-        }
-        #[cfg(target_os = "linux")]
-        if ort::ep::CUDA::default().is_available().unwrap_or(false) {
-            let mut cuda = ort::ep::CUDA::default()
-                .with_conv_algorithm_search(ort::ep::cuda::ConvAlgorithmSearch::Heuristic);
-            if cuda_graph {
-                cuda = cuda.with_cuda_graph(true);
-            }
-            eps.push(cuda.build().error_on_failure());
-        }
-        if eps.is_empty() {
-            bail!("GPU requested but no GPU execution provider is available; use --device cpu");
-        }
-        Ok(eps)
-    }
-}
-
-pub(crate) fn make_session(
-    path: &Path,
-    threads: usize,
-    device: Device,
-    batch: i64,
-    dims: &[(&str, i64)],
-) -> Result<(Session, f64)> {
-    make_session_ep(
-        path,
-        threads,
-        device,
-        batch,
-        dims,
-        GpuEp::Native { cuda_graph: false },
-    )
-}
-
-pub(crate) fn make_session_ep(
-    path: &Path,
-    threads: usize,
-    device: Device,
-    batch: i64,
-    dims: &[(&str, i64)],
-    ep: GpuEp,
-) -> Result<(Session, f64)> {
-    match build_session(path, threads, device, batch, dims, ep) {
-        // Graph capture needs every node on the CUDA provider; models with
-        // CPU-placed nodes still run on CUDA without it.
-        Err(error)
-            if ep == (GpuEp::Native { cuda_graph: true })
-                && error.to_string().contains("graph capture") =>
-        {
-            let ep = GpuEp::Native { cuda_graph: false };
-            build_session(path, threads, device, batch, dims, ep)
-        }
-        result => result,
-    }
-}
-
-fn build_session(
-    path: &Path,
-    threads: usize,
-    device: Device,
-    batch: i64,
-    dims: &[(&str, i64)],
-    ep: GpuEp,
-) -> Result<(Session, f64)> {
-    let start = Instant::now();
-    let mut builder = Session::builder()
-        .map_err(oe)?
-        .with_optimization_level(GraphOptimizationLevel::Level3)
-        .map_err(oe)?
-        .with_intra_threads(threads.max(1))
-        .map_err(oe)?
-        .with_inter_threads(1)
-        .map_err(oe)?
-        .with_parallel_execution(false)
-        .map_err(oe)?
-        // DirectML does not support memory patterns.
-        .with_memory_pattern(!disables_memory_pattern(device, ep))
-        .map_err(oe)?
-        .with_log_level(LogLevel::Error)
-        .map_err(oe)?;
-    if device == Device::Gpu {
-        builder = builder
-            .with_dimension_override("batch_size", batch.max(1))
-            .map_err(oe)?
-            .with_execution_providers(gpu_eps(ep)?)
-            .map_err(oe)?;
-        for (name, size) in dims {
-            builder = builder.with_dimension_override(*name, *size).map_err(oe)?;
-        }
-    }
-    let session = builder.commit_from_file(path).map_err(oe)?;
-    Ok((session, start.elapsed().as_secs_f64() * 1000.0))
 }
 
 struct BoundIo {
@@ -228,32 +29,26 @@ pub struct OrtModel {
     bound: Option<BoundIo>,
     pub input_name: String,
     pub load_ms: f64,
-    device: Device,
 }
 
 impl OrtModel {
     pub fn load(path: impl AsRef<Path>, threads: usize) -> Result<Self> {
-        Self::open(path, threads, Device::Cpu, 1)
-    }
-
-    pub fn open(
-        path: impl AsRef<Path>,
-        threads: usize,
-        device: Device,
-        batch: i64,
-    ) -> Result<Self> {
-        Self::open_dims(path, threads, device, batch, &[])
-    }
-
-    pub fn open_dims(
-        path: impl AsRef<Path>,
-        threads: usize,
-        device: Device,
-        batch: i64,
-        dims: &[(&str, i64)],
-    ) -> Result<Self> {
-        let path = path.as_ref();
-        let (session, load_ms) = make_session(path, threads, device, batch, dims)?;
+        let start = Instant::now();
+        let session = Session::builder()
+            .map_err(oe)?
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(oe)?
+            .with_intra_threads(threads.max(1))
+            .map_err(oe)?
+            .with_inter_threads(1)
+            .map_err(oe)?
+            .with_parallel_execution(false)
+            .map_err(oe)?
+            .with_log_level(LogLevel::Error)
+            .map_err(oe)?
+            .commit_from_file(path.as_ref())
+            .map_err(oe)?;
+        let load_ms = start.elapsed().as_secs_f64() * 1000.0;
         let input_name = session
             .inputs()
             .first()
@@ -264,39 +59,7 @@ impl OrtModel {
             bound: None,
             input_name,
             load_ms,
-            device,
         })
-    }
-
-    fn allocs(&self) -> Result<(Allocator, Allocator)> {
-        #[cfg(all(feature = "gpu", target_os = "linux"))]
-        if self.device == Device::Gpu {
-            let pin_in = Allocator::new(
-                &self.session,
-                MemoryInfo::new(
-                    AllocationDevice::CUDA_PINNED,
-                    0,
-                    AllocatorType::Device,
-                    MemoryType::CPUInput,
-                )
-                .map_err(oe)?,
-            );
-            let pin_out = Allocator::new(
-                &self.session,
-                MemoryInfo::new(
-                    AllocationDevice::CUDA_PINNED,
-                    0,
-                    AllocatorType::Device,
-                    MemoryType::CPUOutput,
-                )
-                .map_err(oe)?,
-            );
-            if let (Ok(i), Ok(o)) = (pin_in, pin_out) {
-                return Ok((i, o));
-            }
-        }
-        let _ = self.device;
-        Ok((Allocator::default(), Allocator::default()))
     }
 
     fn output_specs(&self, batch: i64) -> Result<Vec<(String, Vec<i64>)>> {
@@ -320,15 +83,15 @@ impl OrtModel {
                 .map(|(o, t)| (o.name().to_string(), t.shape.clone()))
                 .collect();
         }
-        let (in_alloc, out_alloc) = self.allocs()?;
-        let input_t = Tensor::<f16>::new(&in_alloc, shape).map_err(oe)?;
+        let alloc = Allocator::default();
+        let input_t = Tensor::<f16>::new(&alloc, shape).map_err(oe)?;
         let mut binding = self.session.create_binding().map_err(oe)?;
         binding
             .bind_input(self.input_name.clone(), &input_t)
             .map_err(oe)?;
         for (name, out_shape) in specs {
             binding
-                .bind_output(name, Tensor::<f16>::new(&out_alloc, out_shape).map_err(oe)?)
+                .bind_output(name, Tensor::<f16>::new(&alloc, out_shape).map_err(oe)?)
                 .map_err(oe)?;
         }
         self.bound = Some(BoundIo {
@@ -398,7 +161,7 @@ impl OrtModel {
     }
 }
 
-pub(crate) fn collect_f16(outputs: &ort::session::SessionOutputs<'_>) -> Result<Vec<TensorF16>> {
+fn collect_f16(outputs: &ort::session::SessionOutputs<'_>) -> Result<Vec<TensorF16>> {
     let mut out = Vec::with_capacity(outputs.len());
     for i in 0..outputs.len() {
         let (shape, data) = outputs[i].try_extract_tensor::<f16>().map_err(oe)?;
@@ -413,15 +176,12 @@ pub(crate) fn collect_f16(outputs: &ort::session::SessionOutputs<'_>) -> Result<
     Ok(out)
 }
 
-pub(crate) fn output_f16<'s>(
-    outputs: &'s ort::session::SessionOutputs<'_>,
-    i: usize,
-) -> Result<&'s [f16]> {
+fn output_f16<'s>(outputs: &'s ort::session::SessionOutputs<'_>, i: usize) -> Result<&'s [f16]> {
     let (_, data) = outputs[i].try_extract_tensor::<f16>().map_err(oe)?;
     Ok(data)
 }
 
-pub(crate) fn f16_output_specs(session: &Session, batch: i64) -> Result<Vec<(String, Vec<i64>)>> {
+fn f16_output_specs(session: &Session, batch: i64) -> Result<Vec<(String, Vec<i64>)>> {
     let mut specs = Vec::new();
     for o in session.outputs() {
         let ValueType::Tensor { shape, .. } = o.dtype() else {

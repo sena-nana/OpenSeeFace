@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -11,9 +10,9 @@ use osf_ort::{
     enhance_bgr, face_crop, imagenet_nchw, imagenet_nchw_roi_into, iou, max_abs, mean_abs,
     mean_conf, model_path, nme, paint_synthetic_glasses, paste_bgr, pick_lm, read_f32_le,
     resize_bgr, retina_nchw, rss, set_simd_mode, simd_backend, synth_canvas, unwrap_deg, xywh_iou,
-    AdaptiveCfg, AdaptiveState, BgrImage, CropTrack, DetWindow, Device, EnhanceCfg, FilterCfg,
-    FilterKind, FilterQuality, GpuTracker, Latency, LmSpec, OrtModel, OutputFilter, SimdMode,
-    TensorF16, Tracker, TrackerConfig, EYE_IDX, FAST_LM, VERSION,
+    AdaptiveCfg, AdaptiveState, BgrImage, CropTrack, DetWindow, EnhanceCfg, FilterCfg, FilterKind,
+    FilterQuality, Latency, LmSpec, OrtModel, OutputFilter, SimdMode, TensorF16, Tracker,
+    TrackerConfig, EYE_IDX, FAST_LM, VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -31,9 +30,6 @@ struct Args {
     warmup: u32,
     #[arg(long, default_value_t = 30)]
     iters: u32,
-    /// cpu | gpu (CoreML on Apple, DirectML on Windows, CUDA on Linux)
-    #[arg(long, default_value = "cpu")]
-    device: String,
     /// CPU preprocess: auto | on | off. auto = SIMD on x86, scalar on Apple Silicon.
     #[arg(long, default_value_t = SimdMode::Auto)]
     simd: SimdMode,
@@ -46,7 +42,7 @@ struct Args {
     ref_dir: Option<PathBuf>,
     #[arg(long)]
     scenario_dir: Option<PathBuf>,
-    /// CPU: zoomed detector ROI + 112/224 landmark ladder. GPU: ROI detect only.
+    /// Zoomed detector ROI + 112/224 landmark ladder.
     #[arg(long, default_value_t = false)]
     adaptive: bool,
     /// Gray-world WB + CLAHE/AHE before detect/landmarks. Off keeps Python tensor parity.
@@ -72,7 +68,6 @@ impl Args {
 struct Report {
     backend: &'static str,
     crate_version: &'static str,
-    device: String,
     ort_dylib: Option<String>,
     threads: usize,
     models: HashMap<String, ModelReport>,
@@ -181,31 +176,30 @@ struct ScenarioReport {
 fn main() -> Result<()> {
     let args = Args::parse();
     set_simd_mode(args.simd);
-    let device = Device::from_str(&args.device)?;
     let spec = LmSpec::from_type(args.model)?;
     if args.suite == "scale" {
         let path = args.out.clone().unwrap_or_else(default_scale_out);
-        run_scale_suite(&args, spec, device, &path)?;
+        run_scale_suite(&args, spec, &path)?;
         return Ok(());
     }
     if args.suite == "enhance" {
         let path = args.out.clone().unwrap_or_else(default_enhance_out);
-        run_enhance_suite(&args, spec, device, &path)?;
+        run_enhance_suite(&args, spec, &path)?;
         return Ok(());
     }
     if args.suite == "crop" {
         let path = args.out.clone().unwrap_or_else(default_crop_out);
-        run_crop_suite(&args, spec, device, &path)?;
+        run_crop_suite(&args, spec, &path)?;
         return Ok(());
     }
     if args.suite == "filter" {
         let path = args.out.clone().unwrap_or_else(default_filter_out);
-        run_filter_suite(&args, spec, device, &path)?;
+        run_filter_suite(&args, spec, &path)?;
         return Ok(());
     }
     if args.suite == "glasses" {
         let path = args.out.clone().unwrap_or_else(default_glasses_out);
-        run_glasses_suite(&args, spec, device, &path)?;
+        run_glasses_suite(&args, spec, &path)?;
         return Ok(());
     }
     if args.suite == "pre" {
@@ -219,7 +213,6 @@ fn main() -> Result<()> {
         let report = Report {
             backend: "ort-rust",
             crate_version: VERSION,
-            device: device.as_str().into(),
             ort_dylib: std::env::var("ORT_DYLIB_PATH").ok(),
             threads: args.threads,
             models: HashMap::new(),
@@ -262,7 +255,6 @@ fn main() -> Result<()> {
                     file,
                     input,
                     args.threads,
-                    device,
                     args.warmup,
                     args.iters,
                     dump(out),
@@ -315,12 +307,12 @@ fn main() -> Result<()> {
                 "retinaface_output_0.bin",
             )?;
         }
-        pipe = Some(pipeline(&args, &frame, spec, device)?);
+        pipe = Some(pipeline(&args, &frame, spec)?);
     }
 
     let scenarios = if run_real {
         if let Some(dir) = &args.scenario_dir {
-            run_scenario_dir(&args, spec, device, dir)?
+            run_scenario_dir(&args, spec, dir)?
         } else {
             HashMap::new()
         }
@@ -333,18 +325,13 @@ fn main() -> Result<()> {
     }
     if let Some(p) = &pipe {
         eprintln!(
-            "pipeline {}  detect={:.3}ms  landmarks={:.3}ms  e2e={:.3}ms  faces={}",
-            device.as_str(),
-            p.detect_ms,
-            p.landmarks_ms,
-            p.e2e_ms,
-            p.faces
+            "pipeline  detect={:.3}ms  landmarks={:.3}ms  e2e={:.3}ms  faces={}",
+            p.detect_ms, p.landmarks_ms, p.e2e_ms, p.faces
         );
     }
     let report = Report {
         backend: "ort-rust",
         crate_version: VERSION,
-        device: device.as_str().into(),
         ort_dylib: std::env::var("ORT_DYLIB_PATH").ok(),
         threads: args.threads,
         models,
@@ -436,14 +423,11 @@ fn bench(
     filename: &str,
     input: &TensorF16,
     threads: usize,
-    device: Device,
     warmup: u32,
     iters: u32,
     ref_out: Option<PathBuf>,
 ) -> Result<ModelReport> {
-    let batch = input.shape.first().copied().unwrap_or(1).max(1);
-    let mut m =
-        OrtModel::open(path, threads, device, batch).with_context(|| path.display().to_string())?;
+    let mut m = OrtModel::load(path, threads).with_context(|| path.display().to_string())?;
     let t0 = Instant::now();
     let first = m.run(input)?;
     let first_infer_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -480,14 +464,7 @@ fn bench(
     })
 }
 
-fn pipeline(args: &Args, frame: &BgrImage, spec: LmSpec, device: Device) -> Result<Pipeline> {
-    if device == Device::Gpu {
-        return gpu_pipeline(args, frame, spec);
-    }
-    cpu_pipeline(args, frame, spec, device)
-}
-
-fn cpu_pipeline(args: &Args, frame: &BgrImage, spec: LmSpec, device: Device) -> Result<Pipeline> {
+fn pipeline(args: &Args, frame: &BgrImage, spec: LmSpec) -> Result<Pipeline> {
     let enhanced;
     let frame = if args.enhance {
         enhanced = enhance_bgr(frame, &args.enhance_cfg());
@@ -495,18 +472,11 @@ fn cpu_pipeline(args: &Args, frame: &BgrImage, spec: LmSpec, device: Device) -> 
     } else {
         frame
     };
-    let mut det = OrtModel::open(
+    let mut det = OrtModel::load(
         model_path(&args.models_dir, "mnv3_detection_opt.onnx"),
         args.threads,
-        device,
-        1,
     )?;
-    let mut lm = OrtModel::open(
-        model_path(&args.models_dir, spec.file),
-        args.threads,
-        device,
-        1,
-    )?;
+    let mut lm = OrtModel::load(model_path(&args.models_dir, spec.file), args.threads)?;
     let din = imagenet_nchw(frame, 224);
     let mut crop_lin = None;
     let dout = det.run(&din)?;
@@ -557,47 +527,6 @@ fn cpu_pipeline(args: &Args, frame: &BgrImage, spec: LmSpec, device: Device) -> 
                 );
             }
         }
-    }
-    Ok(finish_pipeline(
-        args,
-        dets.first(),
-        pts.as_deref(),
-        faces,
-        detect_ms,
-        landmarks_ms,
-    ))
-}
-
-fn gpu_pipeline(args: &Args, frame: &BgrImage, spec: LmSpec) -> Result<Pipeline> {
-    let mut tracker = GpuTracker::with_enhance(
-        &args.models_dir,
-        spec,
-        args.threads,
-        frame,
-        args.enhance_cfg(),
-    )?;
-    let mut dets = tracker.detect(frame)?;
-    if let Some(d) = dets.first() {
-        let _ = tracker.landmarks(frame, d, spec, 0.1, 0.125)?;
-    }
-    for _ in 0..args.warmup.max(1) {
-        dets = tracker.detect(frame)?;
-        if let Some(d) = dets.first() {
-            let _ = tracker.landmarks(frame, d, spec, 0.1, 0.125)?;
-        }
-    }
-    let t0 = Instant::now();
-    let dets = tracker.detect(frame)?;
-    let detect_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let mut landmarks_ms = 0.0;
-    let mut faces = 0;
-    let mut pts = None;
-    if let Some(d) = dets.first() {
-        faces = 1;
-        let t1 = Instant::now();
-        let decoded = tracker.landmarks(frame, d, spec, 0.1, 0.125)?;
-        landmarks_ms = t1.elapsed().as_secs_f64() * 1000.0;
-        pts = Some(decoded.1);
     }
     Ok(finish_pipeline(
         args,
@@ -734,14 +663,13 @@ impl LmBank {
     }
 }
 
-struct CpuPipe {
+struct Pipe {
     det: OrtModel,
     lm: LmBank,
 }
 
 fn one_frame(
-    mut cpu: Option<&mut CpuPipe>,
-    mut gpu: Option<&mut GpuTracker>,
+    pipe: &mut Pipe,
     gaze: &mut Option<OrtModel>,
     frame: &BgrImage,
     spec: LmSpec,
@@ -755,7 +683,7 @@ fn one_frame(
     crop: &mut CropTrack,
 ) -> Result<Row> {
     let enhanced;
-    let frame = if gpu.is_none() && !enhance.is_off() {
+    let frame = if !enhance.is_off() {
         enhanced = enhance_bgr(frame, &enhance);
         &enhanced
     } else {
@@ -772,10 +700,10 @@ fn one_frame(
         } else {
             DetWindow::Full
         };
-        let mut dets = detect_window(cpu.as_deref_mut(), gpu.as_deref_mut(), frame, window)?;
+        let mut dets = detect_window(pipe, frame, window)?;
         if dets.is_empty() && adaptive.is_some() && last.is_none() {
             window = center_2x(frame.width, frame.height);
-            dets = detect_window(cpu.as_deref_mut(), gpu.as_deref_mut(), frame, window)?;
+            dets = detect_window(pipe, frame, window)?;
         }
         detect_ms = t.elapsed().as_secs_f64() * 1000.0;
         det_score = dets.first().map(|d| d[4]);
@@ -808,11 +736,7 @@ fn one_frame(
     };
     let face_h = d[3];
     let lm_type = if let Some((cfg, st)) = adaptive {
-        if gpu.is_some() {
-            spec.model_type
-        } else {
-            pick_lm(st, face_h, cfg)
-        }
+        pick_lm(st, face_h, cfg)
     } else {
         spec.model_type
     };
@@ -824,29 +748,15 @@ fn one_frame(
         return Ok(miss());
     }
     let crop_ms = t.elapsed().as_secs_f64() * 1000.0;
-    let t = Instant::now();
-    let (conf, pts, pre_ms, lm_ms, decode_ms) = if let Some(pipe) = cpu.as_mut() {
-        let (lm, run_spec) = pipe.lm.pair(lm_type);
+    let (lm, run_spec) = pipe.lm.pair(lm_type);
+    let (conf, pts, pre_ms, lm_ms, decode_ms) =
         match run_landmarks(lm, frame, &d, run_spec, pad_x, pad_y) {
             Ok(v) => v,
             Err(_) => {
                 crop.reset();
                 return Ok(miss());
             }
-        }
-    } else if let Some(tr) = gpu.as_mut() {
-        let decoded = tr.landmarks(frame, &d, spec, pad_x, pad_y)?;
-        (
-            decoded.0,
-            decoded.1,
-            0.0,
-            t.elapsed().as_secs_f64() * 1000.0,
-            0.0,
-        )
-    } else {
-        crop.reset();
-        return Ok(miss());
-    };
+        };
     let t_box = Instant::now();
     crop.seed_size([d[0], d[1], d[2], d[3]]);
     let mut next = crop.next_box(&pts, conf).unwrap_or(d);
@@ -890,12 +800,7 @@ fn one_frame(
     })
 }
 
-fn detect_window(
-    cpu: Option<&mut CpuPipe>,
-    gpu: Option<&mut GpuTracker>,
-    frame: &BgrImage,
-    window: DetWindow,
-) -> Result<Vec<[f32; 5]>> {
+fn detect_window(pipe: &mut Pipe, frame: &BgrImage, window: DetWindow) -> Result<Vec<[f32; 5]>> {
     let (view, fallback_full) = match window {
         DetWindow::Full => (None, false),
         DetWindow::Roi { x1, y1, x2, y2 } => {
@@ -908,49 +813,15 @@ fn detect_window(
         }
     };
     if fallback_full {
-        return detect_window(cpu, gpu, frame, DetWindow::Full);
+        return detect_window(pipe, frame, DetWindow::Full);
     }
-    if let Some(pipe) = cpu {
-        let src = view.as_ref().unwrap_or(frame);
-        let dout = pipe.det.run(&imagenet_nchw(src, 224))?;
-        let mut dets = detect_faces(&dout[0], &dout[1], src.width, src.height, 0.6);
-        if view.is_some() {
-            window.apply_offset(&mut dets);
-        }
-        return Ok(dets);
+    let src = view.as_ref().unwrap_or(frame);
+    let dout = pipe.det.run(&imagenet_nchw(src, 224))?;
+    let mut dets = detect_faces(&dout[0], &dout[1], src.width, src.height, 0.6);
+    if view.is_some() {
+        window.apply_offset(&mut dets);
     }
-    let Some(tr) = gpu else {
-        return Ok(Vec::new());
-    };
-    // CoreML/CUDA sessions are bound to the full-frame size. Stretch the ROI
-    // to that size so the fused graph still runs, then map boxes back.
-    if let Some(crop) = view.as_ref() {
-        let stretched = resize_bgr(crop, frame.width, frame.height);
-        match tr.detect(&stretched) {
-            Ok(mut dets) => {
-                remap_stretched_roi(&mut dets, window, frame);
-                return Ok(dets);
-            }
-            Err(_) => return tr.detect(frame),
-        }
-    }
-    tr.detect(frame)
-}
-
-fn remap_stretched_roi(dets: &mut [[f32; 5]], window: DetWindow, frame: &BgrImage) {
-    let DetWindow::Roi { x1, y1, x2, y2 } = window else {
-        return;
-    };
-    let rw = (x2 - x1).max(1) as f32;
-    let rh = (y2 - y1).max(1) as f32;
-    let fw = frame.width as f32;
-    let fh = frame.height as f32;
-    for d in dets {
-        d[0] = x1 as f32 + d[0] * rw / fw;
-        d[1] = y1 as f32 + d[1] * rh / fh;
-        d[2] *= rw / fw;
-        d[3] *= rh / fh;
-    }
+    Ok(dets)
 }
 
 fn run_landmarks(
@@ -992,7 +863,6 @@ fn lat(warmup: u32, rows: &[Row], f: impl Fn(&Row) -> f64) -> Latency {
 fn run_scenario_dir(
     args: &Args,
     spec: LmSpec,
-    device: Device,
     root: &Path,
 ) -> Result<HashMap<String, ScenarioReport>> {
     let mut out = HashMap::new();
@@ -1005,50 +875,13 @@ fn run_scenario_dir(
     let mut gaze = model_path(&args.models_dir, "mnv3_gaze32_split_opt.onnx")
         .is_file()
         .then(|| {
-            OrtModel::open(
+            OrtModel::load(
                 model_path(&args.models_dir, "mnv3_gaze32_split_opt.onnx"),
                 args.threads,
-                device,
-                2,
             )
         })
         .transpose()?;
-    let mut cpu = if device == Device::Cpu {
-        let det = OrtModel::open(
-            model_path(&args.models_dir, "mnv3_detection_opt.onnx"),
-            args.threads,
-            device,
-            1,
-        )?;
-        let hi = OrtModel::open(
-            model_path(&args.models_dir, spec.file),
-            args.threads,
-            device,
-            1,
-        )?;
-        let lo_spec = LmSpec::from_type(FAST_LM)?;
-        let lo = (args.adaptive && spec.model_type >= 0)
-            .then(|| {
-                OrtModel::open(
-                    model_path(&args.models_dir, lo_spec.file),
-                    args.threads,
-                    device,
-                    1,
-                )
-            })
-            .transpose()?;
-        Some(CpuPipe {
-            det,
-            lm: LmBank {
-                hi,
-                hi_spec: spec,
-                lo,
-                lo_spec,
-            },
-        })
-    } else {
-        None
-    };
+    let mut pipe = open_pipe(args, spec, args.adaptive && spec.model_type >= 0)?;
     let cfg = args
         .adaptive
         .then(|| AdaptiveCfg::default().with_ceiling(spec.model_type));
@@ -1064,17 +897,6 @@ fn run_scenario_dir(
         }
         let scan_every = meta.scan_every.max(1);
         let do_gaze = meta.gaze && gaze.is_some();
-        let mut gpu = (device == Device::Gpu)
-            .then(|| {
-                GpuTracker::with_enhance(
-                    &args.models_dir,
-                    spec,
-                    args.threads,
-                    &frames[0],
-                    args.enhance_cfg(),
-                )
-            })
-            .transpose()?;
         let enh = args.enhance_cfg();
         let mut state = cfg.map(AdaptiveState::new);
         let mut crop = CropTrack::new();
@@ -1083,8 +905,7 @@ fn run_scenario_dir(
                         scanned: bool,
                         st: Option<&mut AdaptiveState>| {
             one_frame(
-                cpu.as_mut(),
-                gpu.as_mut(),
+                &mut pipe,
                 &mut gaze,
                 frame,
                 spec,
@@ -1219,31 +1040,17 @@ struct ScaleSeq {
     frames: Vec<BgrImage>,
 }
 
-fn open_cpu_pipe(args: &Args, spec: LmSpec, with_fast: bool) -> Result<CpuPipe> {
-    let det = OrtModel::open(
+fn open_pipe(args: &Args, spec: LmSpec, with_fast: bool) -> Result<Pipe> {
+    let det = OrtModel::load(
         model_path(&args.models_dir, "mnv3_detection_opt.onnx"),
         args.threads,
-        Device::Cpu,
-        1,
     )?;
-    let hi = OrtModel::open(
-        model_path(&args.models_dir, spec.file),
-        args.threads,
-        Device::Cpu,
-        1,
-    )?;
+    let hi = OrtModel::load(model_path(&args.models_dir, spec.file), args.threads)?;
     let lo_spec = LmSpec::from_type(FAST_LM)?;
     let lo = with_fast
-        .then(|| {
-            OrtModel::open(
-                model_path(&args.models_dir, lo_spec.file),
-                args.threads,
-                Device::Cpu,
-                1,
-            )
-        })
+        .then(|| OrtModel::load(model_path(&args.models_dir, lo_spec.file), args.threads))
         .transpose()?;
-    Ok(CpuPipe {
+    Ok(Pipe {
         det,
         lm: LmBank {
             hi,
@@ -1254,7 +1061,7 @@ fn open_cpu_pipe(args: &Args, spec: LmSpec, with_fast: bool) -> Result<CpuPipe> 
     })
 }
 
-fn extract_face_tile(pipe: &mut CpuPipe, frame: &BgrImage) -> Result<(BgrImage, f32)> {
+fn extract_face_tile(pipe: &mut Pipe, frame: &BgrImage) -> Result<(BgrImage, f32)> {
     let dout = pipe.det.run(&imagenet_nchw(frame, 224))?;
     let dets = detect_faces(&dout[0], &dout[1], frame.width, frame.height, 0.6);
     let d = dets
@@ -1304,20 +1111,18 @@ struct TeachFrame {
 }
 
 fn run_seq(
-    cpu: Option<&mut CpuPipe>,
-    gpu: Option<&mut GpuTracker>,
+    pipe: &mut Pipe,
     spec: LmSpec,
     seq: &ScaleSeq,
     cfg: Option<&AdaptiveCfg>,
     enhance: EnhanceCfg,
     scan_every: u32,
 ) -> Result<Vec<Row>> {
-    run_seq_ex(cpu, gpu, spec, seq, cfg, enhance, scan_every, false)
+    run_seq_ex(pipe, spec, seq, cfg, enhance, scan_every, false)
 }
 
 fn run_seq_ex(
-    mut cpu: Option<&mut CpuPipe>,
-    mut gpu: Option<&mut GpuTracker>,
+    pipe: &mut Pipe,
     spec: LmSpec,
     seq: &ScaleSeq,
     cfg: Option<&AdaptiveCfg>,
@@ -1334,7 +1139,7 @@ fn run_seq_ex(
         let p2 = PathBuf::from("models/mnv3_gaze32_split_opt.onnx");
         let path = if p.is_file() { p } else { p2 };
         if path.is_file() {
-            gaze = OrtModel::open(path, 1, Device::Cpu, 2).ok();
+            gaze = OrtModel::load(path, 1).ok();
         }
     }
     let mut crop = CropTrack::new();
@@ -1348,18 +1153,7 @@ fn run_seq_ex(
             n => box5.is_none() || (i as u32 % n == 0),
         };
         let row = one_frame(
-            cpu.as_deref_mut(),
-            gpu.as_deref_mut(),
-            &mut gaze,
-            frame,
-            spec,
-            box5,
-            0.1,
-            0.125,
-            do_detect,
-            do_gaze,
-            ad,
-            enhance,
+            pipe, &mut gaze, frame, spec, box5, 0.1, 0.125, do_detect, do_gaze, ad, enhance,
             &mut crop,
         )?;
         box5 = row.box5;
@@ -1441,10 +1235,10 @@ fn print_score(tag: &str, s: &ScaleScore) {
     );
 }
 
-fn run_scale_suite(args: &Args, _spec: LmSpec, device: Device, out: &Path) -> Result<()> {
+fn run_scale_suite(args: &Args, _spec: LmSpec, out: &Path) -> Result<()> {
     let spec = LmSpec::from_type(3)?;
     let cfg = AdaptiveCfg::default().with_ceiling(spec.model_type);
-    let mut pipe = open_cpu_pipe(args, spec, device == Device::Cpu)?;
+    let mut pipe = open_pipe(args, spec, true)?;
     let seed = BgrImage::load(&args.image)?;
     let (tile, face_h) = extract_face_tile(&mut pipe, &seed)?;
     let seqs: Vec<ScaleSeq> = SCALE_FRACS
@@ -1452,55 +1246,17 @@ fn run_scale_suite(args: &Args, _spec: LmSpec, device: Device, out: &Path) -> Re
         .map(|&f| make_scale_seq(&tile, face_h, f))
         .collect();
     eprintln!(
-        "scale: seed face_h={face_h:.1}px, {} fracs × {SCALE_FRAMES} frames ({})",
-        seqs.len(),
-        device.as_str()
+        "scale: seed face_h={face_h:.1}px, {} fracs × {SCALE_FRAMES} frames",
+        seqs.len()
     );
 
     let enh = args.enhance_cfg();
-    let (base_rows, ad_rows) = if device == Device::Gpu {
-        let mut gpu = GpuTracker::with_enhance(
-            &args.models_dir,
-            spec,
-            args.threads,
-            &seqs[0].frames[0],
-            enh,
-        )?;
-        for _ in 0..args.warmup.max(2) {
-            let _ = run_seq(None, Some(&mut gpu), spec, &seqs[0], None, enh, 1)?;
-        }
-        let mut base = Vec::new();
-        let mut ad = Vec::new();
-        for seq in &seqs {
-            base.push(run_seq(None, Some(&mut gpu), spec, seq, None, enh, 1)?);
-            ad.push(run_seq(
-                None,
-                Some(&mut gpu),
-                spec,
-                seq,
-                Some(&cfg),
-                enh,
-                1,
-            )?);
-        }
-        (base, ad)
-    } else {
-        let mut base = Vec::new();
-        let mut ad = Vec::new();
-        for seq in &seqs {
-            base.push(run_seq(Some(&mut pipe), None, spec, seq, None, enh, 1)?);
-            ad.push(run_seq(
-                Some(&mut pipe),
-                None,
-                spec,
-                seq,
-                Some(&cfg),
-                enh,
-                1,
-            )?);
-        }
-        (base, ad)
-    };
+    let mut base_rows = Vec::new();
+    let mut ad_rows = Vec::new();
+    for seq in &seqs {
+        base_rows.push(run_seq(&mut pipe, spec, seq, None, enh, 1)?);
+        ad_rows.push(run_seq(&mut pipe, spec, seq, Some(&cfg), enh, 1)?);
+    }
 
     let teacher: Vec<Vec<TeachFrame>> = base_rows.iter().cloned().map(rows_to_teacher).collect();
     let (baseline, baseline_per_frac) = score_against_teacher(&seqs, &base_rows, &teacher);
@@ -1674,14 +1430,13 @@ fn trial_score(t: &EnhanceTrial, base: &EnhanceTrial) -> f32 {
 }
 
 fn score_seq(
-    cpu: Option<&mut CpuPipe>,
-    gpu: Option<&mut GpuTracker>,
+    pipe: &mut Pipe,
     spec: LmSpec,
     seq: &ScaleSeq,
     teacher: &[Vec<TeachFrame>],
     enhance: EnhanceCfg,
 ) -> Result<(f32, f32, f64)> {
-    let rows = run_seq(cpu, gpu, spec, seq, None, enhance, 1)?;
+    let rows = run_seq(pipe, spec, seq, None, enhance, 1)?;
     let (s, _) = score_against_teacher(
         &[ScaleSeq {
             face_frac: seq.face_frac,
@@ -1694,10 +1449,8 @@ fn score_seq(
 }
 
 fn eval_cfg(
-    args: &Args,
     spec: LmSpec,
-    device: Device,
-    pipe: &mut CpuPipe,
+    pipe: &mut Pipe,
     seqs: &[(&'static str, ScaleSeq)],
     teacher: &[Vec<TeachFrame>],
     name: &str,
@@ -1705,29 +1458,12 @@ fn eval_cfg(
 ) -> Result<EnhanceTrial> {
     let mut scenes = HashMap::new();
     let mut e2e_p50_ms = 0.0;
-    if device == Device::Gpu {
-        let mut gpu = GpuTracker::with_enhance(
-            &args.models_dir,
-            spec,
-            args.threads,
-            &seqs[0].1.frames[0],
-            cfg,
-        )?;
-        for (i, (n, seq)) in seqs.iter().enumerate() {
-            let (nme, recall, e2e) = score_seq(None, Some(&mut gpu), spec, seq, teacher, cfg)?;
-            if i == 0 {
-                e2e_p50_ms = e2e;
-            }
-            scenes.insert((*n).to_string(), SceneRow { nme, recall });
+    for (i, (n, seq)) in seqs.iter().enumerate() {
+        let (nme, recall, e2e) = score_seq(pipe, spec, seq, teacher, cfg)?;
+        if i == 0 {
+            e2e_p50_ms = e2e;
         }
-    } else {
-        for (i, (n, seq)) in seqs.iter().enumerate() {
-            let (nme, recall, e2e) = score_seq(Some(pipe), None, spec, seq, teacher, cfg)?;
-            if i == 0 {
-                e2e_p50_ms = e2e;
-            }
-            scenes.insert((*n).to_string(), SceneRow { nme, recall });
-        }
+        scenes.insert((*n).to_string(), SceneRow { nme, recall });
     }
     Ok(EnhanceTrial {
         name: name.to_string(),
@@ -1738,13 +1474,8 @@ fn eval_cfg(
     })
 }
 
-fn seq_recall(
-    pipe: &mut CpuPipe,
-    spec: LmSpec,
-    seq: &ScaleSeq,
-    enhance: EnhanceCfg,
-) -> Result<f32> {
-    let rows = run_seq(Some(pipe), None, spec, seq, None, enhance, 1)?;
+fn seq_recall(pipe: &mut Pipe, spec: LmSpec, seq: &ScaleSeq, enhance: EnhanceCfg) -> Result<f32> {
+    let rows = run_seq(pipe, spec, seq, None, enhance, 1)?;
     let hits = rows.iter().filter(|r| r.faces > 0).count();
     Ok(hits as f32 / rows.len().max(1) as f32)
 }
@@ -1758,7 +1489,7 @@ struct DarkLight {
 }
 
 fn pick_dark_lighting(
-    pipe: &mut CpuPipe,
+    pipe: &mut Pipe,
     spec: LmSpec,
     face: &BgrImage,
     face_h: f32,
@@ -1794,7 +1525,7 @@ fn pick_dark_lighting(
 }
 
 fn probe_param<T: Copy>(
-    pipe: &mut CpuPipe,
+    pipe: &mut Pipe,
     spec: LmSpec,
     clean: &ScaleSeq,
     name: &'static str,
@@ -1834,17 +1565,14 @@ fn fmt_row(t: &EnhanceTrial, name: &str) -> String {
         .unwrap_or_else(|| "-".into())
 }
 
-fn run_enhance_suite(args: &Args, _spec: LmSpec, device: Device, out: &Path) -> Result<()> {
+fn run_enhance_suite(args: &Args, _spec: LmSpec, out: &Path) -> Result<()> {
     let spec = LmSpec::from_type(3)?;
-    let mut pipe = open_cpu_pipe(args, spec, false)?;
+    let mut pipe = open_pipe(args, spec, false)?;
     let seed = BgrImage::load(&args.image)?;
     let (tile, face_h) = extract_face_tile(&mut pipe, &seed)?;
     let n = args.frames.max(1);
     let probe_n = n.min(ENHANCE_PROBE_FRAMES);
-    eprintln!(
-        "enhance: seed face_h={face_h:.1}px, {n} frames/scene (probe {probe_n}) ({})",
-        device.as_str()
-    );
+    eprintln!("enhance: seed face_h={face_h:.1}px, {n} frames/scene (probe {probe_n})");
     let lit = pick_dark_lighting(&mut pipe, spec, &tile, face_h, probe_n)?;
     let clean = make_scale_seq_n(&tile, face_h, lit.frac, n, true);
     let probe_clean = ScaleSeq {
@@ -1890,15 +1618,7 @@ fn run_enhance_suite(args: &Args, _spec: LmSpec, device: Device, out: &Path) -> 
         |s| format!("σ={s:.0}"),
     )?;
 
-    let teacher_rows = run_seq(
-        Some(&mut pipe),
-        None,
-        spec,
-        &clean,
-        None,
-        EnhanceCfg::off(),
-        1,
-    )?;
+    let teacher_rows = run_seq(&mut pipe, spec, &clean, None, EnhanceCfg::off(), 1)?;
     let teacher = vec![rows_to_teacher(teacher_rows)];
     let seqs: Vec<(&'static str, ScaleSeq)> = vec![
         ("clean", clean.clone()),
@@ -1948,7 +1668,7 @@ fn run_enhance_suite(args: &Args, _spec: LmSpec, device: Device, out: &Path) -> 
             cfg.he.as_str(),
             cfg.auto
         );
-        match eval_cfg(args, spec, device, &mut pipe, &seqs, &teacher, name, *cfg) {
+        match eval_cfg(spec, &mut pipe, &seqs, &teacher, name, *cfg) {
             Ok(t) => {
                 eprintln!(
                     "      clean {}  dark {}  over {}  back {}  noise {}  lowcon {}",
@@ -2150,16 +1870,13 @@ fn print_crop_scene(tag: &str, s: &CropSceneScore) {
     );
 }
 
-fn run_crop_suite(args: &Args, _spec: LmSpec, device: Device, out: &Path) -> Result<()> {
+fn run_crop_suite(args: &Args, _spec: LmSpec, out: &Path) -> Result<()> {
     let spec = LmSpec::from_type(3)?;
-    let mut pipe = open_cpu_pipe(args, spec, false)?;
+    let mut pipe = open_pipe(args, spec, false)?;
     let seed = BgrImage::load(&args.image)?;
     let (tile, face_h) = extract_face_tile(&mut pipe, &seed)?;
     let n = args.frames.max(30);
-    eprintln!(
-        "crop: seed face_h={face_h:.1}px, {n} frames/scene ({})",
-        device.as_str()
-    );
+    eprintln!("crop: seed face_h={face_h:.1}px, {n} frames/scene");
     let mut static_seq = make_scale_seq_n(&tile, face_h, 0.20, n, false);
     if let Some(first) = static_seq.frames.first().cloned() {
         static_seq.frames = vec![first; n];
@@ -2185,25 +1902,9 @@ fn run_crop_suite(args: &Args, _spec: LmSpec, device: Device, out: &Path) -> Res
         ("noisy", noisy),
     ];
 
-    let mut gpu = (device == Device::Gpu)
-        .then(|| {
-            GpuTracker::with_enhance(
-                &args.models_dir,
-                spec,
-                args.threads,
-                &scenes[0].1.frames[0],
-                EnhanceCfg::off(),
-            )
-        })
-        .transpose()?;
-
     let mut scores = Vec::new();
     for (scene_name, seq) in &scenes {
-        let rows = if let Some(g) = gpu.as_mut() {
-            run_seq(None, Some(g), spec, seq, None, EnhanceCfg::off(), 0)?
-        } else {
-            run_seq(Some(&mut pipe), None, spec, seq, None, EnhanceCfg::off(), 0)?
-        };
+        let rows = run_seq(&mut pipe, spec, seq, None, EnhanceCfg::off(), 0)?;
         let mut sc = crop_score(&rows);
         sc.scene = (*scene_name).into();
         print_crop_scene(*scene_name, &sc);
@@ -2498,16 +2199,13 @@ fn print_filter_row(s: &FilterSceneScore) {
     );
 }
 
-fn run_filter_suite(args: &Args, _spec: LmSpec, device: Device, out: &Path) -> Result<()> {
-    let mut pipe = open_cpu_pipe(args, LmSpec::from_type(3)?, false)?;
+fn run_filter_suite(args: &Args, _spec: LmSpec, out: &Path) -> Result<()> {
+    let mut pipe = open_pipe(args, LmSpec::from_type(3)?, false)?;
     let seed = BgrImage::load(&args.image)?;
     let (tile, face_h) = extract_face_tile(&mut pipe, &seed)?;
     let n = args.frames.max(30);
     let dt = 1.0 / 30.0;
-    eprintln!(
-        "filter: seed face_h={face_h:.1}px, {n} frames/scene ({})",
-        device.as_str()
-    );
+    eprintln!("filter: seed face_h={face_h:.1}px, {n} frames/scene");
 
     let mut static_clean = make_scale_seq_n(&tile, face_h, 0.20, n, false);
     if let Some(first) = static_clean.frames.first().cloned() {
@@ -2764,41 +2462,16 @@ fn wikimedia_stills() -> Vec<(String, BgrImage)> {
     out
 }
 
-fn run_glasses_suite(args: &Args, _spec: LmSpec, device: Device, out: &Path) -> Result<()> {
+fn run_glasses_suite(args: &Args, _spec: LmSpec, out: &Path) -> Result<()> {
     let spec = LmSpec::from_type(3)?;
-    let mut pipe = open_cpu_pipe(args, spec, false)?;
+    let mut pipe = open_pipe(args, spec, false)?;
     let seed = BgrImage::load(&args.image)?;
     let (tile, face_h) = extract_face_tile(&mut pipe, &seed)?;
     let n = args.frames.max(24);
     let bare = make_scale_seq_n(&tile, face_h, 0.20, n, true);
     eprintln!("glasses: seed face_h={face_h:.1}px, {n} frames");
 
-    let mut gpu = (device == Device::Gpu)
-        .then(|| {
-            GpuTracker::with_enhance(
-                &args.models_dir,
-                spec,
-                args.threads,
-                &bare.frames[0],
-                EnhanceCfg::off(),
-            )
-        })
-        .transpose()?;
-
-    let bare_rows = if let Some(g) = gpu.as_mut() {
-        run_seq_ex(None, Some(g), spec, &bare, None, EnhanceCfg::off(), 0, true)?
-    } else {
-        run_seq_ex(
-            Some(&mut pipe),
-            None,
-            spec,
-            &bare,
-            None,
-            EnhanceCfg::off(),
-            0,
-            true,
-        )?
-    };
+    let bare_rows = run_seq_ex(&mut pipe, spec, &bare, None, EnhanceCfg::off(), 0, true)?;
 
     let mut painted = Vec::with_capacity(bare.frames.len());
     for (frame, row) in bare.frames.iter().zip(bare_rows.iter()) {
@@ -2812,29 +2485,15 @@ fn run_glasses_suite(args: &Args, _spec: LmSpec, device: Device, out: &Path) -> 
         face_frac: bare.face_frac,
         frames: painted,
     };
-    let glasses_rows = if let Some(g) = gpu.as_mut() {
-        run_seq_ex(
-            None,
-            Some(g),
-            spec,
-            &glasses_seq,
-            None,
-            EnhanceCfg::off(),
-            0,
-            true,
-        )?
-    } else {
-        run_seq_ex(
-            Some(&mut pipe),
-            None,
-            spec,
-            &glasses_seq,
-            None,
-            EnhanceCfg::off(),
-            0,
-            true,
-        )?
-    };
+    let glasses_rows = run_seq_ex(
+        &mut pipe,
+        spec,
+        &glasses_seq,
+        None,
+        EnhanceCfg::off(),
+        0,
+        true,
+    )?;
 
     let mut scenes = vec![
         glasses_scene("bare", &bare_rows, None),
@@ -2845,20 +2504,7 @@ fn run_glasses_suite(args: &Args, _spec: LmSpec, device: Device, out: &Path) -> 
             face_frac: 0.0,
             frames: vec![im; 8.min(n).max(1)],
         };
-        let rows = if let Some(g) = gpu.as_mut() {
-            run_seq_ex(None, Some(g), spec, &seq, None, EnhanceCfg::off(), 1, true)?
-        } else {
-            run_seq_ex(
-                Some(&mut pipe),
-                None,
-                spec,
-                &seq,
-                None,
-                EnhanceCfg::off(),
-                1,
-                true,
-            )?
-        };
+        let rows = run_seq_ex(&mut pipe, spec, &seq, None, EnhanceCfg::off(), 1, true)?;
         scenes.push(glasses_scene(&id, &rows, None));
     }
     for s in &scenes {

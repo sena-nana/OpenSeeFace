@@ -18,7 +18,7 @@ pub struct AdaptiveCfg {
 
 impl Default for AdaptiveCfg {
     /// From `osf-bench --suite scale`: zoom recovers far-face recall; 112px
-    /// on faces taller than 200px. GPU ignores the landmark ladder.
+    /// on faces taller than 200px.
     fn default() -> Self {
         Self {
             ceiling: 3,

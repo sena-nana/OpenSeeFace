@@ -6,9 +6,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use osf_ort::{
     draw_tracking, dump_symmetric_points, encode_faces_into, encode_vmc, list_cameras,
-    model_base_path, Device, ExtListener, FacePacket, FilterKind, InputSource, OutputDriver,
-    PipedInput, SimdMode, Tracker, TrackerConfig, VideoOut, VizWindow, VrmCfg, VrmDriver,
-    PACKET_FRAME_SIZE,
+    model_base_path, ExtListener, FacePacket, FilterKind, InputSource, OutputDriver, PipedInput,
+    SimdMode, Tracker, TrackerConfig, VideoOut, VizWindow, VrmCfg, VrmDriver, PACKET_FRAME_SIZE,
 };
 
 #[derive(Parser, Debug)]
@@ -83,9 +82,6 @@ struct Args {
     filter_mincutoff: f32,
     #[arg(long, default_value_t = 0.007)]
     filter_beta: f32,
-    /// cpu | gpu (CoreML on Apple, DirectML on Windows, CUDA on Linux). GPU needs `--features gpu`.
-    #[arg(long, default_value_t = Device::Cpu)]
-    device: Device,
     /// CPU preprocess: auto | on | off. auto = SIMD on x86, scalar on Apple Silicon.
     #[arg(long, default_value_t = SimdMode::Auto)]
     simd: SimdMode,
@@ -235,7 +231,6 @@ fn main() -> Result<()> {
                 filter,
                 filter_mincutoff: args.filter_mincutoff,
                 filter_beta: args.filter_beta,
-                device: args.device,
                 ..TrackerConfig::default()
             })?);
             if args.visualize != 0 {
@@ -251,9 +246,6 @@ fn main() -> Result<()> {
 
         let t0 = Instant::now();
         let faces = tracker.predict(&frame);
-        if let Some(error) = tracker.take_gpu_error() {
-            return Err(error.context("GPU inference failed"));
-        }
         if !faces.is_empty() {
             let dt = t0.elapsed().as_secs_f64();
             total_tracking_time += dt;
@@ -372,7 +364,6 @@ fn run_benchmark(args: &Args) -> Result<()> {
             max_feature_updates: 900.0,
             static_model: args.no_3d_adapt == 1,
             filter: FilterKind::None,
-            device: args.device,
             ..TrackerConfig::default()
         })?;
         let mut total = 0.0;

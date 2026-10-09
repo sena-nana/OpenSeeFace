@@ -5,14 +5,12 @@ mod capture;
 mod crop;
 mod decode;
 mod enhance;
-mod enhance_gpu;
 mod ext;
 mod features;
 mod filter;
 mod gaze;
 mod geom;
 mod glasses;
-mod gpu_pre;
 mod metrics;
 mod output;
 mod pnp;
@@ -45,7 +43,6 @@ pub use features::{
 pub use filter::{unwrap_deg, FilterCfg, FilterKind, FilterQuality, OutputFilter};
 pub use geom::xywh_iou;
 pub use glasses::{ear_2d, paint_synthetic_glasses};
-pub use gpu_pre::GpuTracker;
 pub use metrics::{cosine, max_abs, mean_abs, model_path, read_f32_le, rss, Latency, Rss};
 pub use output::OutputDriver;
 pub use pnp::Camera;
@@ -53,7 +50,7 @@ pub use preprocess::{
     crop_box, crop_box_pad, crop_img, face_crop, imagenet_nchw, imagenet_nchw_roi_into, iou, nchw,
     paste_bgr, resize_bgr, retina_nchw, synth_canvas, BgrImage, ColorNorm,
 };
-pub use session::{Device, OrtModel};
+pub use session::OrtModel;
 pub use simd::{backend_name as simd_backend, set_simd_mode, SimdMode};
 pub use tracker::{model_base_path, FaceInfo, Tracker, TrackerConfig};
 pub use udp::{

@@ -6,17 +6,15 @@ use anyhow::Result;
 
 use crate::crop::{stable_landmark_bbox, CropSmoothState};
 use crate::decode::{decode_landmarks_data, detect_faces_data, LmSpec};
-use crate::enhance::EnhanceCfg;
 use crate::features::{FeatureExtractor, FeatureVec};
 use crate::filter::{FilterCfg, FilterKind, FilterQuality, OutputFilter};
 use crate::gaze::get_eye_state;
 use crate::geom::{clamp_to_im, group_rects};
 use crate::glasses::hold_gaze;
-use crate::gpu_pre::GpuTracker;
 use crate::pnp::{adjust_3d, estimate_depth, Camera, CONTOUR_PTS, CONTOUR_PTS_T, FACE_3D};
 use crate::preprocess::{imagenet_nchw_into, imagenet_nchw_roi_into, BgrImage};
 use crate::retinaface::RetinaFace;
-use crate::session::{Device, OrtModel};
+use crate::session::OrtModel;
 
 const MAP30: [usize; 66] = [
     0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5, 6, 7, 7, 8, 8, 9, 10, 10, 11, 11, 12, 21, 21,
@@ -193,7 +191,8 @@ pub struct Tracker {
     feature_level: i32,
     max_feature_updates: f32,
     cam: Camera,
-    infer: DetLm,
+    det: OrtModel,
+    lm: OrtModel,
     gaze: Option<OrtModel>,
     retina: Option<RetinaFace>,
     retina_scan: Option<RetinaFace>,
@@ -205,7 +204,6 @@ pub struct Tracker {
     frame_count: i32,
     model_dir: PathBuf,
     last_tick: Option<std::time::Instant>,
-    gpu_error: Option<anyhow::Error>,
 }
 
 pub struct TrackerConfig {
@@ -228,7 +226,6 @@ pub struct TrackerConfig {
     pub filter: FilterKind,
     pub filter_mincutoff: f32,
     pub filter_beta: f32,
-    pub device: Device,
 }
 
 impl Default for TrackerConfig {
@@ -253,14 +250,8 @@ impl Default for TrackerConfig {
             filter: FilterKind::OneEuro,
             filter_mincutoff: 1.0,
             filter_beta: 0.007,
-            device: Device::Cpu,
         }
     }
-}
-
-enum DetLm {
-    Cpu { det: OrtModel, lm: OrtModel },
-    Gpu(GpuTracker),
 }
 
 impl Tracker {
@@ -272,21 +263,8 @@ impl Tracker {
         }
         let dir = model_base_path(cfg.model_dir.as_deref());
         let threads = cfg.max_threads.max(1);
-        let infer = match cfg.device {
-            Device::Cpu => DetLm::Cpu {
-                det: OrtModel::load(dir.join("mnv3_detection_opt.onnx"), threads.min(4))?,
-                lm: OrtModel::load(dir.join(spec.file), threads.min(4))?,
-            },
-            Device::Gpu => DetLm::Gpu(GpuTracker::open(
-                &dir,
-                spec,
-                threads.min(4),
-                &BgrImage::zeros(cfg.width.max(1), cfg.height.max(1)),
-                EnhanceCfg::off(),
-                cfg.detection_threshold,
-                cfg.max_faces.max(1),
-            )?),
-        };
+        let det = OrtModel::load(dir.join("mnv3_detection_opt.onnx"), threads.min(4))?;
+        let lm = OrtModel::load(dir.join(spec.file), threads.min(4))?;
         let gaze = if cfg.no_gaze {
             None
         } else {
@@ -347,7 +325,8 @@ impl Tracker {
             feature_level,
             max_feature_updates: cfg.max_feature_updates,
             cam: Camera::from_frame(cfg.width, cfg.height),
-            infer,
+            det,
+            lm,
             gaze,
             retina,
             retina_scan,
@@ -359,13 +338,7 @@ impl Tracker {
             frame_count: 0,
             model_dir: dir,
             last_tick: None,
-            gpu_error: None,
         })
-    }
-
-    /// A GPU inference failure from the last `predict`; tracking cannot continue.
-    pub fn take_gpu_error(&mut self) -> Option<anyhow::Error> {
-        self.gpu_error.take()
     }
 
     pub fn set_size(&mut self, width: u32, height: u32) {
@@ -375,13 +348,6 @@ impl Tracker {
         self.width = width;
         self.height = height;
         self.cam = Camera::from_frame(width, height);
-        if let DetLm::Gpu(gpu) = &mut self.infer {
-            if let Err(e) = gpu.set_size(width.max(1), height.max(1)) {
-                if !self.silent {
-                    eprintln!("GPU session rebuild failed: {e}");
-                }
-            }
-        }
     }
 
     pub fn models_dir(&self) -> &Path {
@@ -409,34 +375,24 @@ impl Tracker {
     }
 
     fn detect_heatmap(&mut self, frame: &BgrImage) -> Vec<[f32; 4]> {
-        let dets = match &mut self.infer {
-            DetLm::Cpu { det, .. } => {
-                let shape = [1i64, 3, 224, 224];
-                let w = frame.width;
-                let h = frame.height;
-                let thresh = self.detection_threshold;
-                let max_faces = self.max_faces;
-                det.run_prep(
-                    &shape,
-                    |buf| imagenet_nchw_into(frame, 224, buf),
-                    |outs| {
-                        if outs.len() < 2 {
-                            return Ok(Vec::new());
-                        }
-                        Ok(detect_faces_data(outs[0], outs[1], w, h, thresh, max_faces))
-                    },
-                )
-                .unwrap_or_default()
-            }
-            DetLm::Gpu(gpu) => match gpu.detect(frame) {
-                Ok(dets) => dets,
-                Err(error) => {
-                    // Every later frame would fail the same way; let the caller stop.
-                    self.gpu_error = Some(error);
-                    Vec::new()
-                }
-            },
-        };
+        let shape = [1i64, 3, 224, 224];
+        let w = frame.width;
+        let h = frame.height;
+        let thresh = self.detection_threshold;
+        let max_faces = self.max_faces;
+        let dets = self
+            .det
+            .run_prep(
+                &shape,
+                |buf| imagenet_nchw_into(frame, 224, buf),
+                |outs| {
+                    if outs.len() < 2 {
+                        return Ok(Vec::new());
+                    }
+                    Ok(detect_faces_data(outs[0], outs[1], w, h, thresh, max_faces))
+                },
+            )
+            .unwrap_or_default();
         dets.into_iter().map(|d| [d[0], d[1], d[2], d[3]]).collect()
     }
 
@@ -595,14 +551,11 @@ impl Tracker {
         let size = spec.size;
         let shape = [1i64, 3, size as i64, size as i64];
         for (crop, bonus, x1, y1, x2, y2) in &crops {
-            let Ok((conf, lms)) = (match &mut self.infer {
-                DetLm::Cpu { lm, .. } => lm.run_prep(
-                    &shape,
-                    |buf| imagenet_nchw_roi_into(frame, *x1, *y1, *x2, *y2, size, buf),
-                    |outs| Ok(decode_landmarks_data(outs[0], *crop, spec)),
-                ),
-                DetLm::Gpu(gpu) => gpu.landmarks_roi(frame, *x1, *y1, *x2, *y2, spec),
-            }) else {
+            let Ok((conf, lms)) = self.lm.run_prep(
+                &shape,
+                |buf| imagenet_nchw_roi_into(frame, *x1, *y1, *x2, *y2, size, buf),
+                |outs| Ok(decode_landmarks_data(outs[0], *crop, spec)),
+            ) else {
                 continue;
             };
             let (conf, lms) = self.remap_lms(conf, lms);
