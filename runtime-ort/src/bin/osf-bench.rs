@@ -6,15 +6,16 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use clap::Parser;
 use osf_ort::{
-    center_2x, cosine, crop_box, crop_box_pad, crop_img, det_window, detect_faces, ear_2d,
-    enhance_bgr, face_crop, imagenet_nchw, imagenet_nchw_roi_into, iou, max_abs, mean_abs,
-    mean_conf, model_path, nme, paint_synthetic_glasses, paste_bgr, pick_lm, read_f32_le,
-    resize_bgr, retina_nchw, rss, set_simd_mode, simd_backend, synth_canvas, unwrap_deg, xywh_iou,
-    AdaptiveCfg, AdaptiveState, BgrImage, CropTrack, DetWindow, EnhanceCfg, FilterCfg, FilterKind,
-    FilterQuality, Latency, LmSpec, OrtModel, OutputFilter, SimdMode, TensorF16, Tracker,
-    TrackerConfig, EYE_IDX, FAST_LM, VERSION,
+    cosine, crop_box, crop_box_pad, crop_img, decode_landmarks, decode_landmarks_data,
+    detect_faces, face_crop, imagenet_nchw, imagenet_nchw_roi_into, iou, max_abs, mean_abs,
+    model_path, paste_bgr, read_f32_le, resize_bgr, retina_nchw, rss, set_simd_mode, simd_backend,
+    synth_canvas, unwrap_deg, BgrImage, FilterCfg, FilterKind, Latency, LmSpec, OrtModel,
+    OutputFilter, SimdMode, TensorF16, Tracker, TrackerConfig, VERSION,
 };
 use serde::{Deserialize, Serialize};
+
+const SCALE_W: u32 = 1280;
+const SCALE_H: u32 = 720;
 
 #[derive(Parser)]
 struct Args {
@@ -33,7 +34,7 @@ struct Args {
     /// CPU preprocess: auto | on | off. auto = SIMD on x86, scalar on Apple Silicon.
     #[arg(long, default_value_t = SimdMode::Auto)]
     simd: SimdMode,
-    /// micro | realistic | all | scale | enhance | crop | filter | glasses | pre
+    /// micro | realistic | all | filter | pre
     #[arg(long, default_value = "micro")]
     suite: String,
     #[arg(long)]
@@ -42,26 +43,9 @@ struct Args {
     ref_dir: Option<PathBuf>,
     #[arg(long)]
     scenario_dir: Option<PathBuf>,
-    /// Zoomed detector ROI + 112/224 landmark ladder.
-    #[arg(long, default_value_t = false)]
-    adaptive: bool,
-    /// Gray-world WB + CLAHE/AHE before detect/landmarks. Off keeps Python tensor parity.
-    /// When set, uses per-frame auto policy (dark/backlight/overexp/noise/cast).
-    #[arg(long, default_value_t = false)]
-    enhance: bool,
-    /// Frames per lighting scene in `--suite enhance` (probes still use 8).
+    /// Frames per scene in `--suite filter`.
     #[arg(long, default_value_t = 50)]
     frames: usize,
-}
-
-impl Args {
-    fn enhance_cfg(&self) -> EnhanceCfg {
-        if self.enhance {
-            EnhanceCfg::auto()
-        } else {
-            EnhanceCfg::off()
-        }
-    }
 }
 
 #[derive(Serialize)]
@@ -131,8 +115,6 @@ struct ScenarioMeta {
     pad_x: f32,
     #[serde(default = "pad_y_default")]
     pad_y: f32,
-    #[serde(default)]
-    glasses: bool,
     frames: Vec<String>,
 }
 
@@ -153,7 +135,6 @@ struct ScenarioReport {
     frames: usize,
     scan_every: u32,
     gaze: bool,
-    glasses: bool,
     detect_ms: Latency,
     crop_ms: Latency,
     pre_ms: Latency,
@@ -168,7 +149,6 @@ struct ScenarioReport {
     faces: usize,
     det_score: Option<f32>,
     lm_conf: Option<f32>,
-    eye_conf: Option<f32>,
     gaze_conf: Option<f32>,
     landmarks: Vec<[f32; 3]>,
 }
@@ -177,36 +157,16 @@ fn main() -> Result<()> {
     let args = Args::parse();
     set_simd_mode(args.simd);
     let spec = LmSpec::from_type(args.model)?;
-    if args.suite == "scale" {
-        let path = args.out.clone().unwrap_or_else(default_scale_out);
-        run_scale_suite(&args, spec, &path)?;
-        return Ok(());
-    }
-    if args.suite == "enhance" {
-        let path = args.out.clone().unwrap_or_else(default_enhance_out);
-        run_enhance_suite(&args, spec, &path)?;
-        return Ok(());
-    }
-    if args.suite == "crop" {
-        let path = args.out.clone().unwrap_or_else(default_crop_out);
-        run_crop_suite(&args, spec, &path)?;
-        return Ok(());
-    }
     if args.suite == "filter" {
         let path = args.out.clone().unwrap_or_else(default_filter_out);
-        run_filter_suite(&args, spec, &path)?;
-        return Ok(());
-    }
-    if args.suite == "glasses" {
-        let path = args.out.clone().unwrap_or_else(default_glasses_out);
-        run_glasses_suite(&args, spec, &path)?;
+        run_filter_suite(&args, &path)?;
         return Ok(());
     }
     if args.suite == "pre" {
         let frame = if args.image.is_file() {
             BgrImage::load(&args.image)?
         } else {
-            synth_canvas(1280, 720)
+            synth_canvas(SCALE_W, SCALE_H)
         };
         let preprocess = bench_preprocess(&frame, args.warmup, args.iters, args.simd);
         eprint_preprocess(&preprocess);
@@ -372,10 +332,10 @@ fn bench_preprocess(
     iters: u32,
     restore: SimdMode,
 ) -> PreprocessReport {
-    let src = if frame.width == 1280 && frame.height == 720 {
+    let src = if frame.width == SCALE_W && frame.height == SCALE_H {
         frame.clone()
     } else {
-        resize_bgr(frame, 1280, 720)
+        resize_bgr(frame, SCALE_W, SCALE_H)
     };
     let mut buf224 = vec![half::f16::ZERO; 3 * 224 * 224];
     let mut buf112 = vec![half::f16::ZERO; 3 * 112 * 112];
@@ -419,7 +379,7 @@ fn bench_preprocess(
 }
 
 fn bench(
-    path: &std::path::Path,
+    path: &Path,
     filename: &str,
     input: &TensorF16,
     threads: usize,
@@ -442,7 +402,7 @@ fn bench(
     }
     let accuracy = ref_out
         .filter(|p| p.is_file())
-        .map(|p| read_f32_le(p))
+        .map(read_f32_le)
         .transpose()?
         .map(|r| {
             let got = first[0].to_f32();
@@ -465,13 +425,6 @@ fn bench(
 }
 
 fn pipeline(args: &Args, frame: &BgrImage, spec: LmSpec) -> Result<Pipeline> {
-    let enhanced;
-    let frame = if args.enhance {
-        enhanced = enhance_bgr(frame, &args.enhance_cfg());
-        &enhanced
-    } else {
-        frame
-    };
     let mut det = OrtModel::load(
         model_path(&args.models_dir, "mnv3_detection_opt.onnx"),
         args.threads,
@@ -518,12 +471,7 @@ fn pipeline(args: &Args, frame: &BgrImage, spec: LmSpec) -> Result<Pipeline> {
                 let scale_x = (x2 - x1) as f32 / spec.size as f32;
                 let scale_y = (y2 - y1) as f32 / spec.size as f32;
                 pts = Some(
-                    osf_ort::decode_landmarks(
-                        &out[0],
-                        [x1 as f32, y1 as f32, scale_x, scale_y],
-                        spec,
-                    )
-                    .1,
+                    decode_landmarks(&out[0], [x1 as f32, y1 as f32, scale_x, scale_y], spec).1,
                 );
             }
         }
@@ -593,7 +541,6 @@ fn finish_pipeline(
 struct Row {
     detect_ms: f64,
     crop_ms: f64,
-    box_ms: f64,
     pre_ms: f64,
     lm_ms: f64,
     decode_ms: f64,
@@ -603,13 +550,49 @@ struct Row {
     faces: usize,
     det_score: Option<f32>,
     lm_conf: Option<f32>,
-    eye_conf: Option<f32>,
     gaze_conf: Option<f32>,
     crop_w: u32,
     crop_h: u32,
     box5: Option<[f32; 5]>,
     pts: Vec<[f32; 3]>,
-    ear: Option<f32>,
+}
+
+struct Pipe {
+    det: OrtModel,
+    lm: OrtModel,
+}
+
+fn open_pipe(args: &Args, spec: LmSpec) -> Result<Pipe> {
+    Ok(Pipe {
+        det: OrtModel::load(
+            model_path(&args.models_dir, "mnv3_detection_opt.onnx"),
+            args.threads,
+        )?,
+        lm: OrtModel::load(model_path(&args.models_dir, spec.file), args.threads)?,
+    })
+}
+
+fn landmark_bbox(pts: &[[f32; 3]], conf: f32) -> Option<[f32; 5]> {
+    if pts.is_empty() {
+        return None;
+    }
+    let mut min_r = f32::MAX;
+    let mut max_r = f32::MIN;
+    let mut min_c = f32::MAX;
+    let mut max_c = f32::MIN;
+    for p in pts.iter().take(66) {
+        min_r = min_r.min(p[0]);
+        max_r = max_r.max(p[0]);
+        min_c = min_c.min(p[1]);
+        max_c = max_c.max(p[1]);
+    }
+    Some([
+        min_c,
+        min_r,
+        (max_c - min_c).max(1.0),
+        (max_r - min_r).max(1.0),
+        conf,
+    ])
 }
 
 fn gaze_input(frame: &BgrImage, pts: &[[f32; 3]]) -> Option<TensorF16> {
@@ -645,29 +628,28 @@ fn mean_opt(vals: impl Iterator<Item = Option<f32>>) -> Option<f32> {
     (n > 0).then(|| s / n as f32)
 }
 
-struct LmBank {
-    hi: OrtModel,
-    hi_spec: LmSpec,
-    lo: Option<OrtModel>,
-    lo_spec: LmSpec,
+fn mean_f32(v: &[f32]) -> Option<f32> {
+    (!v.is_empty()).then(|| v.iter().sum::<f32>() / v.len() as f32)
 }
 
-impl LmBank {
-    fn pair(&mut self, model_type: i32) -> (&mut OrtModel, LmSpec) {
-        if model_type == self.lo_spec.model_type {
-            if let Some(lo) = self.lo.as_mut() {
-                return (lo, self.lo_spec);
-            }
-        }
-        (&mut self.hi, self.hi_spec)
+fn nme(pred: &[[f32; 3]], gt: &[[f32; 3]]) -> Option<f32> {
+    if pred.len() < 46 || gt.len() < 46 {
+        return None;
     }
+    let iod = (gt[36][0] - gt[45][0])
+        .hypot(gt[36][1] - gt[45][1])
+        .max(1.0);
+    let n = pred.len().min(gt.len()).min(66);
+    let sum: f32 = pred
+        .iter()
+        .zip(gt)
+        .take(n)
+        .map(|(p, g)| (p[0] - g[0]).hypot(p[1] - g[1]))
+        .sum();
+    Some(sum / (n as f32 * iod))
 }
 
-struct Pipe {
-    det: OrtModel,
-    lm: LmBank,
-}
-
+#[allow(clippy::too_many_arguments)]
 fn one_frame(
     pipe: &mut Pipe,
     gaze: &mut Option<OrtModel>,
@@ -678,33 +660,14 @@ fn one_frame(
     pad_y: f32,
     do_detect: bool,
     do_gaze: bool,
-    adaptive: Option<(&AdaptiveCfg, &mut AdaptiveState)>,
-    enhance: EnhanceCfg,
-    crop: &mut CropTrack,
 ) -> Result<Row> {
-    let enhanced;
-    let frame = if !enhance.is_off() {
-        enhanced = enhance_bgr(frame, &enhance);
-        &enhanced
-    } else {
-        frame
-    };
     let t_all = Instant::now();
     let mut detect_ms = 0.0;
     let mut det_score = None;
     if do_detect {
         let t = Instant::now();
-        let last = box5.as_ref();
-        let mut window = if let Some((cfg, _)) = adaptive.as_ref() {
-            det_window(frame.width, frame.height, last, cfg)
-        } else {
-            DetWindow::Full
-        };
-        let mut dets = detect_window(pipe, frame, window)?;
-        if dets.is_empty() && adaptive.is_some() && last.is_none() {
-            window = center_2x(frame.width, frame.height);
-            dets = detect_window(pipe, frame, window)?;
-        }
+        let dout = pipe.det.run(&imagenet_nchw(frame, 224))?;
+        let dets = detect_faces(&dout[0], &dout[1], frame.width, frame.height, 0.6);
         detect_ms = t.elapsed().as_secs_f64() * 1000.0;
         det_score = dets.first().map(|d| d[4]);
         box5 = dets.first().copied();
@@ -712,7 +675,6 @@ fn one_frame(
     let miss = || Row {
         detect_ms,
         crop_ms: 0.0,
-        box_ms: 0.0,
         pre_ms: 0.0,
         lm_ms: 0.0,
         decode_ms: 0.0,
@@ -722,46 +684,28 @@ fn one_frame(
         faces: 0,
         det_score,
         lm_conf: None,
-        eye_conf: None,
         gaze_conf: None,
         crop_w: 0,
         crop_h: 0,
         box5: None,
         pts: Vec::new(),
-        ear: None,
     };
     let Some(d) = box5 else {
-        crop.reset();
         return Ok(miss());
-    };
-    let face_h = d[3];
-    let lm_type = if let Some((cfg, st)) = adaptive {
-        pick_lm(st, face_h, cfg)
-    } else {
-        spec.model_type
     };
     let t = Instant::now();
     let (x1, y1, x2, y2) = crop_box_pad(frame, &d, pad_x, pad_y);
     let (crop_w, crop_h) = ((x2 - x1).max(0) as u32, (y2 - y1).max(0) as u32);
     if crop_w < 4 || crop_h < 4 {
-        crop.reset();
         return Ok(miss());
     }
     let crop_ms = t.elapsed().as_secs_f64() * 1000.0;
-    let (lm, run_spec) = pipe.lm.pair(lm_type);
     let (conf, pts, pre_ms, lm_ms, decode_ms) =
-        match run_landmarks(lm, frame, &d, run_spec, pad_x, pad_y) {
+        match run_landmarks(&mut pipe.lm, frame, &d, spec, pad_x, pad_y) {
             Ok(v) => v,
-            Err(_) => {
-                crop.reset();
-                return Ok(miss());
-            }
+            Err(_) => return Ok(miss()),
         };
-    let t_box = Instant::now();
-    crop.seed_size([d[0], d[1], d[2], d[3]]);
-    let mut next = crop.next_box(&pts, conf).unwrap_or(d);
-    let box_ms = t_box.elapsed().as_secs_f64() * 1000.0;
-    next[4] = conf;
+    let next = landmark_bbox(&pts, conf).unwrap_or(d);
     let mut gconf = None;
     let mut gaze_ms = 0.0;
     if do_gaze {
@@ -780,7 +724,6 @@ fn one_frame(
     Ok(Row {
         detect_ms,
         crop_ms,
-        box_ms,
         pre_ms,
         lm_ms,
         decode_ms,
@@ -790,40 +733,15 @@ fn one_frame(
         faces: 1,
         det_score: det_score.or(Some(conf)),
         lm_conf: Some(conf),
-        eye_conf: mean_conf(&pts, &EYE_IDX),
         gaze_conf: gconf,
         crop_w,
         crop_h,
         box5: Some(next),
-        ear: ear_2d(&pts),
         pts,
     })
 }
 
-fn detect_window(pipe: &mut Pipe, frame: &BgrImage, window: DetWindow) -> Result<Vec<[f32; 5]>> {
-    let (view, fallback_full) = match window {
-        DetWindow::Full => (None, false),
-        DetWindow::Roi { x1, y1, x2, y2 } => {
-            let crop = crop_img(frame, x1, y1, x2, y2);
-            if crop.width < 8 || crop.height < 8 {
-                (None, true)
-            } else {
-                (Some(crop), false)
-            }
-        }
-    };
-    if fallback_full {
-        return detect_window(pipe, frame, DetWindow::Full);
-    }
-    let src = view.as_ref().unwrap_or(frame);
-    let dout = pipe.det.run(&imagenet_nchw(src, 224))?;
-    let mut dets = detect_faces(&dout[0], &dout[1], src.width, src.height, 0.6);
-    if view.is_some() {
-        window.apply_offset(&mut dets);
-    }
-    Ok(dets)
-}
-
+#[allow(clippy::type_complexity)]
 fn run_landmarks(
     lm: &mut OrtModel,
     frame: &BgrImage,
@@ -849,8 +767,8 @@ fn run_landmarks(
     let shape = [1i64, 3, size as i64, size as i64];
     let decoded = lm.run_prep(
         &shape,
-        |buf| osf_ort::imagenet_nchw_roi_into(frame, x1, y1, x2, y2, size, buf),
-        |outs| Ok(osf_ort::decode_landmarks_data(outs[0], crop, spec)),
+        |buf| imagenet_nchw_roi_into(frame, x1, y1, x2, y2, size, buf),
+        |outs| Ok(decode_landmarks_data(outs[0], crop, spec)),
     )?;
     let lm_ms = t.elapsed().as_secs_f64() * 1000.0;
     Ok((decoded.0, decoded.1, pre_ms, lm_ms, 0.0))
@@ -881,10 +799,7 @@ fn run_scenario_dir(
             )
         })
         .transpose()?;
-    let mut pipe = open_pipe(args, spec, args.adaptive && spec.model_type >= 0)?;
-    let cfg = args
-        .adaptive
-        .then(|| AdaptiveCfg::default().with_ceiling(spec.model_type));
+    let mut pipe = open_pipe(args, spec)?;
     for dir in dirs {
         let meta: ScenarioMeta = serde_json::from_str(&fs::read_to_string(dir.join("meta.json"))?)?;
         let frames: Vec<BgrImage> = meta
@@ -897,40 +812,18 @@ fn run_scenario_dir(
         }
         let scan_every = meta.scan_every.max(1);
         let do_gaze = meta.gaze && gaze.is_some();
-        let enh = args.enhance_cfg();
-        let mut state = cfg.map(AdaptiveState::new);
-        let mut crop = CropTrack::new();
-        let mut step = |box5: Option<[f32; 5]>,
-                        frame: &BgrImage,
-                        scanned: bool,
-                        st: Option<&mut AdaptiveState>| {
-            one_frame(
-                &mut pipe,
-                &mut gaze,
-                frame,
-                spec,
-                box5,
-                meta.pad_x,
-                meta.pad_y,
-                scanned,
-                do_gaze,
-                match (cfg.as_ref(), st) {
-                    (Some(c), Some(s)) => Some((c, s)),
-                    _ => None,
-                },
-                enh,
-                &mut crop,
-            )
-        };
         for _ in 0..args.warmup.max(1) {
-            let mut warm = state;
-            let _ = step(None, &frames[0], true, warm.as_mut())?;
+            let _ = one_frame(
+                &mut pipe, &mut gaze, &frames[0], spec, None, meta.pad_x, meta.pad_y, true, do_gaze,
+            )?;
         }
         let mut box5 = None;
         let mut rows = Vec::with_capacity(frames.len());
         for (i, frame) in frames.iter().enumerate() {
-            let scanned = box5.is_none() || (i as u32 % scan_every == 0);
-            let row = step(box5, frame, scanned, state.as_mut())?;
+            let scanned = box5.is_none() || (i as u32).is_multiple_of(scan_every);
+            let row = one_frame(
+                &mut pipe, &mut gaze, frame, spec, box5, meta.pad_x, meta.pad_y, scanned, do_gaze,
+            )?;
             box5 = row.box5;
             rows.push(row);
         }
@@ -958,7 +851,6 @@ fn run_scenario_dir(
                 frames: rows.len(),
                 scan_every,
                 gaze: do_gaze,
-                glasses: meta.glasses,
                 detect_ms: Latency::from_samples(args.warmup, &detect_s),
                 crop_ms: lat(args.warmup, &rows, |r| r.crop_ms),
                 pre_ms: lat(args.warmup, &rows, |r| r.pre_ms),
@@ -973,7 +865,6 @@ fn run_scenario_dir(
                 faces: last.map(|r| r.faces).unwrap_or(0),
                 det_score: mean_opt(rows.iter().map(|r| r.det_score)),
                 lm_conf: mean_opt(rows.iter().map(|r| r.lm_conf)),
-                eye_conf: mean_opt(rows.iter().map(|r| r.eye_conf)),
                 gaze_conf: mean_opt(rows.iter().map(|r| r.gaze_conf)),
                 landmarks: last.map(|r| r.pts.clone()).unwrap_or_default(),
             },
@@ -982,83 +873,8 @@ fn run_scenario_dir(
     Ok(out)
 }
 
-fn default_scale_out() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../benchmarks/out/scale_sweep.json")
-}
-
-fn default_enhance_out() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../benchmarks/out/enhance_sweep.json")
-}
-
-fn default_crop_out() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../benchmarks/out/crop_sweep.json")
-}
-
 fn default_filter_out() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../benchmarks/out/filter.json")
-}
-
-fn default_glasses_out() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../benchmarks/out/glasses.json")
-}
-
-const SCALE_FRACS: [f32; 7] = [0.10, 0.14, 0.20, 0.28, 0.36, 0.48, 0.60];
-const SCALE_W: u32 = 1280;
-const SCALE_H: u32 = 720;
-const SCALE_FRAMES: usize = 8;
-const ENHANCE_PROBE_FRAMES: usize = 8;
-
-#[derive(Clone, Serialize)]
-struct ScaleScore {
-    nme: f32,
-    recall: f32,
-    e2e_p50_ms: f64,
-    far_nme: f32,
-    hits: usize,
-    frames: usize,
-}
-
-#[derive(Clone, Serialize)]
-struct FracRow {
-    face_frac: f32,
-    nme: Option<f32>,
-    recall: f32,
-    e2e_p50_ms: f64,
-}
-
-#[derive(Serialize)]
-struct ScaleReport {
-    baseline: ScaleScore,
-    adaptive: ScaleScore,
-    baseline_per_frac: Vec<FracRow>,
-    adaptive_per_frac: Vec<FracRow>,
-}
-
-#[derive(Clone)]
-struct ScaleSeq {
-    face_frac: f32,
-    frames: Vec<BgrImage>,
-}
-
-fn open_pipe(args: &Args, spec: LmSpec, with_fast: bool) -> Result<Pipe> {
-    let det = OrtModel::load(
-        model_path(&args.models_dir, "mnv3_detection_opt.onnx"),
-        args.threads,
-    )?;
-    let hi = OrtModel::load(model_path(&args.models_dir, spec.file), args.threads)?;
-    let lo_spec = LmSpec::from_type(FAST_LM)?;
-    let lo = with_fast
-        .then(|| OrtModel::load(model_path(&args.models_dir, lo_spec.file), args.threads))
-        .transpose()?;
-    Ok(Pipe {
-        det,
-        lm: LmBank {
-            hi,
-            hi_spec: spec,
-            lo,
-            lo_spec,
-        },
-    })
 }
 
 fn extract_face_tile(pipe: &mut Pipe, frame: &BgrImage) -> Result<(BgrImage, f32)> {
@@ -1072,11 +888,13 @@ fn extract_face_tile(pipe: &mut Pipe, frame: &BgrImage) -> Result<(BgrImage, f32
     Ok((tile, face_h))
 }
 
-fn make_scale_seq(face: &BgrImage, face_h: f32, frac: f32) -> ScaleSeq {
-    make_scale_seq_n(face, face_h, frac, SCALE_FRAMES, false)
-}
-
-fn make_scale_seq_n(face: &BgrImage, face_h: f32, frac: f32, n: usize, wander: bool) -> ScaleSeq {
+fn make_scale_seq_n(
+    face: &BgrImage,
+    face_h: f32,
+    frac: f32,
+    n: usize,
+    wander: bool,
+) -> Vec<BgrImage> {
     let n = n.max(1);
     let target = ((SCALE_H as f32 * frac) as u32).max(8);
     let scale = target as f32 / face_h.max(1.0);
@@ -1098,245 +916,27 @@ fn make_scale_seq_n(face: &BgrImage, face_h: f32, frac: f32, n: usize, wander: b
         paste_bgr(&mut canvas, &resized, x, y);
         frames.push(canvas);
     }
-    ScaleSeq {
-        face_frac: frac,
-        frames,
+    frames
+}
+
+fn make_step_seq(face: &BgrImage, face_h: f32, frac: f32, n: usize, dx: f32) -> Vec<BgrImage> {
+    let n = n.max(8);
+    let target = ((SCALE_H as f32 * frac) as u32).max(8);
+    let scale = target as f32 / face_h.max(1.0);
+    let fw = ((face.width as f32 * scale) as u32).max(8);
+    let fh = ((face.height as f32 * scale) as u32).max(8);
+    let resized = resize_bgr(face, fw, fh);
+    let mut frames = Vec::with_capacity(n);
+    let mid = n / 2;
+    for i in 0..n {
+        let extra = if i >= mid { dx } else { 0.0 };
+        let x = (SCALE_W as i32 - fw as i32) / 2 + extra as i32;
+        let y = (SCALE_H as i32 - fh as i32) / 2;
+        let mut canvas = synth_canvas(SCALE_W, SCALE_H);
+        paste_bgr(&mut canvas, &resized, x, y);
+        frames.push(canvas);
     }
-}
-
-#[derive(Clone)]
-struct TeachFrame {
-    pts: Vec<[f32; 3]>,
-    hit: bool,
-}
-
-fn run_seq(
-    pipe: &mut Pipe,
-    spec: LmSpec,
-    seq: &ScaleSeq,
-    cfg: Option<&AdaptiveCfg>,
-    enhance: EnhanceCfg,
-    scan_every: u32,
-) -> Result<Vec<Row>> {
-    run_seq_ex(pipe, spec, seq, cfg, enhance, scan_every, false)
-}
-
-fn run_seq_ex(
-    pipe: &mut Pipe,
-    spec: LmSpec,
-    seq: &ScaleSeq,
-    cfg: Option<&AdaptiveCfg>,
-    enhance: EnhanceCfg,
-    scan_every: u32,
-    do_gaze: bool,
-) -> Result<Vec<Row>> {
-    let mut state = cfg.copied().map(AdaptiveState::new);
-    let mut box5 = None;
-    let mut rows = Vec::with_capacity(seq.frames.len());
-    let mut gaze = None;
-    if do_gaze {
-        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../models/mnv3_gaze32_split_opt.onnx");
-        let p2 = PathBuf::from("models/mnv3_gaze32_split_opt.onnx");
-        let path = if p.is_file() { p } else { p2 };
-        if path.is_file() {
-            gaze = OrtModel::load(path, 1).ok();
-        }
-    }
-    let mut crop = CropTrack::new();
-    for (i, frame) in seq.frames.iter().enumerate() {
-        let ad = match (cfg, state.as_mut()) {
-            (Some(c), Some(s)) => Some((c, s)),
-            _ => None,
-        };
-        let do_detect = match scan_every {
-            0 => box5.is_none(),
-            n => box5.is_none() || (i as u32 % n == 0),
-        };
-        let row = one_frame(
-            pipe, &mut gaze, frame, spec, box5, 0.1, 0.125, do_detect, do_gaze, ad, enhance,
-            &mut crop,
-        )?;
-        box5 = row.box5;
-        rows.push(row);
-    }
-    Ok(rows)
-}
-
-fn mean_f32(v: &[f32]) -> Option<f32> {
-    (!v.is_empty()).then(|| v.iter().sum::<f32>() / v.len() as f32)
-}
-
-fn score_against_teacher(
-    seqs: &[ScaleSeq],
-    rows: &[Vec<Row>],
-    teacher: &[Vec<TeachFrame>],
-) -> (ScaleScore, Vec<FracRow>) {
-    let mut nmes = Vec::new();
-    let mut far_nmes = Vec::new();
-    let mut e2e = Vec::new();
-    let mut hits = 0usize;
-    let mut frames = 0usize;
-    let mut per = Vec::new();
-    for (seq, (rs, ts)) in seqs.iter().zip(rows.iter().zip(teacher.iter())) {
-        let mut local_nme = Vec::new();
-        let mut local_e2e = Vec::new();
-        let mut local_hits = 0usize;
-        for (r, t) in rs.iter().zip(ts.iter()) {
-            frames += 1;
-            e2e.push(r.e2e_ms);
-            local_e2e.push(r.e2e_ms);
-            if r.faces > 0 {
-                hits += 1;
-                local_hits += 1;
-            }
-            if r.faces > 0 && t.hit {
-                if let Some(v) = nme(&r.pts, &t.pts) {
-                    local_nme.push(v);
-                    nmes.push(v);
-                    if seq.face_frac <= 0.14 {
-                        far_nmes.push(v);
-                    }
-                }
-            }
-        }
-        per.push(FracRow {
-            face_frac: seq.face_frac,
-            nme: mean_f32(&local_nme),
-            recall: local_hits as f32 / seq.frames.len().max(1) as f32,
-            e2e_p50_ms: Latency::from_samples(0, &local_e2e).p50_ms,
-        });
-    }
-    (
-        ScaleScore {
-            nme: mean_f32(&nmes).unwrap_or(0.0),
-            recall: hits as f32 / frames.max(1) as f32,
-            e2e_p50_ms: Latency::from_samples(0, &e2e).p50_ms,
-            far_nme: mean_f32(&far_nmes).unwrap_or(0.0),
-            hits,
-            frames,
-        },
-        per,
-    )
-}
-
-fn rows_to_teacher(rows: Vec<Row>) -> Vec<TeachFrame> {
-    rows.into_iter()
-        .map(|r| TeachFrame {
-            hit: r.faces > 0,
-            pts: r.pts,
-        })
-        .collect()
-}
-
-fn print_score(tag: &str, s: &ScaleScore) {
-    eprintln!(
-        "{tag}: rec={:.3} nme={:.4} p50={:.2}ms far_nme={:.4}",
-        s.recall, s.nme, s.e2e_p50_ms, s.far_nme
-    );
-}
-
-fn run_scale_suite(args: &Args, _spec: LmSpec, out: &Path) -> Result<()> {
-    let spec = LmSpec::from_type(3)?;
-    let cfg = AdaptiveCfg::default().with_ceiling(spec.model_type);
-    let mut pipe = open_pipe(args, spec, true)?;
-    let seed = BgrImage::load(&args.image)?;
-    let (tile, face_h) = extract_face_tile(&mut pipe, &seed)?;
-    let seqs: Vec<ScaleSeq> = SCALE_FRACS
-        .iter()
-        .map(|&f| make_scale_seq(&tile, face_h, f))
-        .collect();
-    eprintln!(
-        "scale: seed face_h={face_h:.1}px, {} fracs × {SCALE_FRAMES} frames",
-        seqs.len()
-    );
-
-    let enh = args.enhance_cfg();
-    let mut base_rows = Vec::new();
-    let mut ad_rows = Vec::new();
-    for seq in &seqs {
-        base_rows.push(run_seq(&mut pipe, spec, seq, None, enh, 1)?);
-        ad_rows.push(run_seq(&mut pipe, spec, seq, Some(&cfg), enh, 1)?);
-    }
-
-    let teacher: Vec<Vec<TeachFrame>> = base_rows.iter().cloned().map(rows_to_teacher).collect();
-    let (baseline, baseline_per_frac) = score_against_teacher(&seqs, &base_rows, &teacher);
-    let (adaptive, adaptive_per_frac) = score_against_teacher(&seqs, &ad_rows, &teacher);
-    print_score("baseline", &baseline);
-    print_score("adaptive", &adaptive);
-    eprintln!(
-        "Δ rec={:+.3}  nme={:.4}  p50={:+.2}ms",
-        adaptive.recall - baseline.recall,
-        adaptive.nme,
-        adaptive.e2e_p50_ms - baseline.e2e_p50_ms
-    );
-    for (b, a) in baseline_per_frac.iter().zip(adaptive_per_frac.iter()) {
-        eprintln!(
-            "  frac={:.2} rec {:.3}->{:.3} p50 {:.2}->{:.2}",
-            b.face_frac, b.recall, a.recall, b.e2e_p50_ms, a.e2e_p50_ms
-        );
-    }
-    let report = ScaleReport {
-        baseline,
-        adaptive,
-        baseline_per_frac,
-        adaptive_per_frac,
-    };
-    if let Some(dir) = out.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    fs::write(out, serde_json::to_string_pretty(&report)?)?;
-    eprintln!("wrote {}", out.display());
-    Ok(())
-}
-
-fn degrade_gamma(src: &BgrImage, exposure: f32, gamma: f32) -> BgrImage {
-    let mut d = src.clone();
-    for p in &mut d.data {
-        let x = (*p as f32 / 255.0 * exposure).clamp(0.0, 1.0);
-        *p = (x.powf(gamma) * 255.0).round().clamp(0.0, 255.0) as u8;
-    }
-    d
-}
-
-fn degrade_contrast(src: &BgrImage, k: f32) -> BgrImage {
-    let mut d = src.clone();
-    for p in &mut d.data {
-        *p = ((*p as f32 - 128.0) * k + 128.0).round().clamp(0.0, 255.0) as u8;
-    }
-    d
-}
-
-fn degrade_cast(src: &BgrImage, gb: f32, gg: f32, gr: f32) -> BgrImage {
-    let mut d = src.clone();
-    for p in d.data.chunks_exact_mut(3) {
-        p[0] = ((p[0] as f32) * gb).round().clamp(0.0, 255.0) as u8;
-        p[1] = ((p[1] as f32) * gg).round().clamp(0.0, 255.0) as u8;
-        p[2] = ((p[2] as f32) * gr).round().clamp(0.0, 255.0) as u8;
-    }
-    d
-}
-
-fn degrade_backlight(src: &BgrImage, face_exp: f32, bg_gain: f32) -> BgrImage {
-    let mut d = src.clone();
-    let w = d.width as f32;
-    let h = d.height as f32;
-    let cx = w * 0.5;
-    let cy = h * 0.5;
-    let sig = 0.16 * w.min(h);
-    let inv = 1.0 / (2.0 * sig * sig);
-    for y in 0..d.height {
-        for x in 0..d.width {
-            let dx = x as f32 - cx;
-            let dy = y as f32 - cy;
-            let face = (-(dx * dx + dy * dy) * inv).exp();
-            let g = face * face_exp + (1.0 - face) * bg_gain;
-            let i = ((y * d.width + x) * 3) as usize;
-            for c in 0..3 {
-                d.data[i + c] = ((d.data[i + c] as f32) * g).round().clamp(0.0, 255.0) as u8;
-            }
-        }
-    }
-    d
+    frames
 }
 
 fn degrade_noise(src: &BgrImage, sigma: f32, seed: u32) -> BgrImage {
@@ -1357,571 +957,6 @@ fn degrade_noise(src: &BgrImage, sigma: f32, seed: u32) -> BgrImage {
     d
 }
 
-fn map_seq(seq: &ScaleSeq, f: impl Fn(&BgrImage) -> BgrImage) -> ScaleSeq {
-    ScaleSeq {
-        face_frac: seq.face_frac,
-        frames: seq.frames.iter().map(f).collect(),
-    }
-}
-
-fn map_seq_i(seq: &ScaleSeq, f: impl Fn(usize, &BgrImage) -> BgrImage) -> ScaleSeq {
-    ScaleSeq {
-        face_frac: seq.face_frac,
-        frames: seq
-            .frames
-            .iter()
-            .enumerate()
-            .map(|(i, fr)| f(i, fr))
-            .collect(),
-    }
-}
-
-#[derive(Clone, Serialize)]
-struct SceneRow {
-    nme: f32,
-    recall: f32,
-}
-
-#[derive(Clone, Serialize)]
-struct EnhanceTrial {
-    name: String,
-    cfg: EnhanceCfg,
-    scenes: HashMap<String, SceneRow>,
-    e2e_p50_ms: f64,
-    score: f32,
-}
-
-#[derive(Serialize)]
-struct SceneProbe {
-    name: String,
-    detail: String,
-    off_recall: f32,
-}
-
-#[derive(Serialize)]
-struct EnhanceReport {
-    face_frac: f32,
-    frames: usize,
-    dark_exposure: f32,
-    dark_gamma: f32,
-    probes: Vec<SceneProbe>,
-    winner: EnhanceCfg,
-    winner_name: String,
-    baseline: EnhanceTrial,
-    trials: Vec<EnhanceTrial>,
-}
-
-fn trial_score(t: &EnhanceTrial, base: &EnhanceTrial) -> f32 {
-    let rec = |n: &str| t.scenes.get(n).map(|s| s.recall).unwrap_or(0.0);
-    let nme = |n: &str| t.scenes.get(n).map(|s| s.nme).unwrap_or(1.0);
-    let brec = |n: &str| base.scenes.get(n).map(|s| s.recall).unwrap_or(0.0);
-    if rec("clean") + 0.01 < brec("clean") {
-        return -1.0e9;
-    }
-    let hard = ["dark", "over", "back", "noise", "lowcon"];
-    let rec_gain: f32 = hard.iter().map(|n| rec(n) - brec(n)).sum();
-    rec_gain * 12.0 + hard.iter().map(|n| rec(n)).sum::<f32>() * 4.0 + rec("clean")
-        - [
-            "clean", "dark", "over", "back", "noise", "lowcon", "warm", "cool",
-        ]
-        .iter()
-        .map(|n| nme(n))
-        .sum::<f32>()
-}
-
-fn score_seq(
-    pipe: &mut Pipe,
-    spec: LmSpec,
-    seq: &ScaleSeq,
-    teacher: &[Vec<TeachFrame>],
-    enhance: EnhanceCfg,
-) -> Result<(f32, f32, f64)> {
-    let rows = run_seq(pipe, spec, seq, None, enhance, 1)?;
-    let (s, _) = score_against_teacher(
-        &[ScaleSeq {
-            face_frac: seq.face_frac,
-            frames: seq.frames.clone(),
-        }],
-        &[rows],
-        teacher,
-    );
-    Ok((s.nme, s.recall, s.e2e_p50_ms))
-}
-
-fn eval_cfg(
-    spec: LmSpec,
-    pipe: &mut Pipe,
-    seqs: &[(&'static str, ScaleSeq)],
-    teacher: &[Vec<TeachFrame>],
-    name: &str,
-    cfg: EnhanceCfg,
-) -> Result<EnhanceTrial> {
-    let mut scenes = HashMap::new();
-    let mut e2e_p50_ms = 0.0;
-    for (i, (n, seq)) in seqs.iter().enumerate() {
-        let (nme, recall, e2e) = score_seq(pipe, spec, seq, teacher, cfg)?;
-        if i == 0 {
-            e2e_p50_ms = e2e;
-        }
-        scenes.insert((*n).to_string(), SceneRow { nme, recall });
-    }
-    Ok(EnhanceTrial {
-        name: name.to_string(),
-        cfg,
-        scenes,
-        e2e_p50_ms,
-        score: 0.0,
-    })
-}
-
-fn seq_recall(pipe: &mut Pipe, spec: LmSpec, seq: &ScaleSeq, enhance: EnhanceCfg) -> Result<f32> {
-    let rows = run_seq(pipe, spec, seq, None, enhance, 1)?;
-    let hits = rows.iter().filter(|r| r.faces > 0).count();
-    Ok(hits as f32 / rows.len().max(1) as f32)
-}
-
-#[derive(Clone, Copy)]
-struct DarkLight {
-    frac: f32,
-    exposure: f32,
-    gamma: f32,
-    off_recall: f32,
-}
-
-fn pick_dark_lighting(
-    pipe: &mut Pipe,
-    spec: LmSpec,
-    face: &BgrImage,
-    face_h: f32,
-    probe_n: usize,
-) -> Result<DarkLight> {
-    const GAMMA: f32 = 1.7;
-    let mut fallback: Option<DarkLight> = None;
-    for frac in [0.20f32, 0.14, 0.10] {
-        let clean = make_scale_seq_n(face, face_h, frac, probe_n, false);
-        for exp in [0.40f32, 0.32, 0.26, 0.22, 0.16, 0.12, 0.09, 0.06] {
-            let dark = map_seq(&clean, |f| degrade_gamma(f, exp, GAMMA));
-            let rec = seq_recall(pipe, spec, &dark, EnhanceCfg::off())?;
-            eprintln!("  probe frac={frac:.2} exp={exp:.2} γ={GAMMA} off_rec={rec:.3}");
-            let lit = DarkLight {
-                frac,
-                exposure: exp,
-                gamma: GAMMA,
-                off_recall: rec,
-            };
-            let worse = match &fallback {
-                None => true,
-                Some(b) => rec < b.off_recall - 1e-6,
-            };
-            if worse {
-                fallback = Some(lit);
-            }
-            if rec < 0.5 {
-                return Ok(lit);
-            }
-        }
-    }
-    fallback.ok_or_else(|| anyhow::anyhow!("no dark probe frames"))
-}
-
-fn probe_param<T: Copy>(
-    pipe: &mut Pipe,
-    spec: LmSpec,
-    clean: &ScaleSeq,
-    name: &'static str,
-    levels: &[T],
-    apply: impl Fn(&BgrImage, T) -> BgrImage,
-    label: impl Fn(T) -> String,
-) -> Result<(T, SceneProbe)> {
-    let mut fallback: Option<(T, SceneProbe)> = None;
-    for &lv in levels {
-        let seq = map_seq(clean, |f| apply(f, lv));
-        let rec = seq_recall(pipe, spec, &seq, EnhanceCfg::off())?;
-        let detail = label(lv);
-        eprintln!("  probe {name} {detail} off_rec={rec:.3}");
-        let probe = SceneProbe {
-            name: name.to_string(),
-            detail,
-            off_recall: rec,
-        };
-        let worse = match &fallback {
-            None => true,
-            Some((_, b)) => rec < b.off_recall - 1e-6,
-        };
-        if worse {
-            fallback = Some((lv, probe));
-        }
-        if rec < 0.5 {
-            return Ok(fallback.unwrap());
-        }
-    }
-    fallback.ok_or_else(|| anyhow::anyhow!("no {name} probe frames"))
-}
-
-fn fmt_row(t: &EnhanceTrial, name: &str) -> String {
-    t.scenes
-        .get(name)
-        .map(|s| format!("rec={:.3} nme={:.4}", s.recall, s.nme))
-        .unwrap_or_else(|| "-".into())
-}
-
-fn run_enhance_suite(args: &Args, _spec: LmSpec, out: &Path) -> Result<()> {
-    let spec = LmSpec::from_type(3)?;
-    let mut pipe = open_pipe(args, spec, false)?;
-    let seed = BgrImage::load(&args.image)?;
-    let (tile, face_h) = extract_face_tile(&mut pipe, &seed)?;
-    let n = args.frames.max(1);
-    let probe_n = n.min(ENHANCE_PROBE_FRAMES);
-    eprintln!("enhance: seed face_h={face_h:.1}px, {n} frames/scene (probe {probe_n})");
-    let lit = pick_dark_lighting(&mut pipe, spec, &tile, face_h, probe_n)?;
-    let clean = make_scale_seq_n(&tile, face_h, lit.frac, n, true);
-    let probe_clean = ScaleSeq {
-        face_frac: clean.face_frac,
-        frames: clean.frames[..probe_n.min(clean.frames.len())].to_vec(),
-    };
-    eprintln!(
-        "enhance: frac={:.2} dark exp={:.2} γ={:.1} (probe off rec={:.3})",
-        lit.frac, lit.exposure, lit.gamma, lit.off_recall
-    );
-
-    let (over_g, over_p) = probe_param(
-        &mut pipe,
-        spec,
-        &probe_clean,
-        "over",
-        &[1.35f32, 1.55, 1.75, 2.1, 2.6, 3.4],
-        |f, g| degrade_gamma(f, g, 0.85),
-        |g| format!("gain={g:.2} γ=0.85"),
-    )?;
-    let (back_lv, back_p) = probe_param(
-        &mut pipe,
-        spec,
-        &probe_clean,
-        "back",
-        &[
-            (0.55f32, 2.2f32),
-            (0.45, 2.8),
-            (0.36, 3.6),
-            (0.28, 4.6),
-            (0.20, 5.8),
-        ],
-        |f, (fe, bg)| degrade_backlight(f, fe, bg),
-        |(fe, bg)| format!("face={fe:.2} bg={bg:.1}"),
-    )?;
-    let (noise_s, noise_p) = probe_param(
-        &mut pipe,
-        spec,
-        &probe_clean,
-        "noise",
-        &[16.0f32, 24.0, 34.0, 46.0, 60.0, 78.0],
-        |f, s| degrade_noise(f, s, 0xC0FFEE),
-        |s| format!("σ={s:.0}"),
-    )?;
-
-    let teacher_rows = run_seq(&mut pipe, spec, &clean, None, EnhanceCfg::off(), 1)?;
-    let teacher = vec![rows_to_teacher(teacher_rows)];
-    let seqs: Vec<(&'static str, ScaleSeq)> = vec![
-        ("clean", clean.clone()),
-        (
-            "dark",
-            map_seq(&clean, |f| degrade_gamma(f, lit.exposure, lit.gamma)),
-        ),
-        ("over", map_seq(&clean, |f| degrade_gamma(f, over_g, 0.85))),
-        (
-            "back",
-            map_seq(&clean, |f| degrade_backlight(f, back_lv.0, back_lv.1)),
-        ),
-        (
-            "noise",
-            map_seq_i(&clean, |i, f| {
-                degrade_noise(f, noise_s, 0xC0FFEE ^ (i as u32).wrapping_mul(0x9E3779B9))
-            }),
-        ),
-        (
-            "lowcon",
-            map_seq(&clean, |f| {
-                degrade_gamma(&degrade_contrast(f, 0.35), 0.45, 1.4)
-            }),
-        ),
-        (
-            "warm",
-            map_seq(&clean, |f| degrade_cast(f, 0.55, 0.75, 1.15)),
-        ),
-        (
-            "cool",
-            map_seq(&clean, |f| degrade_cast(f, 1.15, 0.75, 0.55)),
-        ),
-    ];
-
-    let policies: Vec<(&str, EnhanceCfg)> = vec![
-        ("off", EnhanceCfg::off()),
-        ("clahe", EnhanceCfg::clahe()),
-        ("auto", EnhanceCfg::auto()),
-    ];
-
-    let mut trials = Vec::new();
-    for (i, (name, cfg)) in policies.iter().enumerate() {
-        eprintln!(
-            "  [{}/{}] {name} he={} auto={}",
-            i + 1,
-            policies.len(),
-            cfg.he.as_str(),
-            cfg.auto
-        );
-        match eval_cfg(spec, &mut pipe, &seqs, &teacher, name, *cfg) {
-            Ok(t) => {
-                eprintln!(
-                    "      clean {}  dark {}  over {}  back {}  noise {}  lowcon {}",
-                    fmt_row(&t, "clean"),
-                    fmt_row(&t, "dark"),
-                    fmt_row(&t, "over"),
-                    fmt_row(&t, "back"),
-                    fmt_row(&t, "noise"),
-                    fmt_row(&t, "lowcon")
-                );
-                trials.push(t);
-            }
-            Err(e) => eprintln!("      skip: {e}"),
-        }
-    }
-    let baseline = trials
-        .iter()
-        .find(|t| t.name == "off")
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("missing off trial"))?;
-    for t in &mut trials {
-        t.score = trial_score(t, &baseline);
-    }
-    let winner = trials
-        .iter()
-        .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap())
-        .cloned()
-        .unwrap();
-    eprintln!(
-        "winner: {} he={} auto={} score={:.3}",
-        winner.name,
-        winner.cfg.he.as_str(),
-        winner.cfg.auto,
-        winner.score
-    );
-    let rec_of = |t: &EnhanceTrial, n: &str| t.scenes.get(n).map(|s| s.recall).unwrap_or(0.0);
-    eprintln!(
-        "  vs off: dark {:.2}->{:.2}  over {:.2}->{:.2}  back {:.2}->{:.2}  noise {:.2}->{:.2}",
-        rec_of(&baseline, "dark"),
-        rec_of(&winner, "dark"),
-        rec_of(&baseline, "over"),
-        rec_of(&winner, "over"),
-        rec_of(&baseline, "back"),
-        rec_of(&winner, "back"),
-        rec_of(&baseline, "noise"),
-        rec_of(&winner, "noise")
-    );
-    let mut probes = vec![SceneProbe {
-        name: "dark".into(),
-        detail: format!("exp={:.2} γ={:.1}", lit.exposure, lit.gamma),
-        off_recall: lit.off_recall,
-    }];
-    probes.push(over_p);
-    probes.push(back_p);
-    probes.push(noise_p);
-    let report = EnhanceReport {
-        face_frac: lit.frac,
-        frames: n,
-        dark_exposure: lit.exposure,
-        dark_gamma: lit.gamma,
-        probes,
-        winner: winner.cfg,
-        winner_name: winner.name.clone(),
-        baseline,
-        trials,
-    };
-    if let Some(dir) = out.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    fs::write(out, serde_json::to_string_pretty(&report)?)?;
-    eprintln!("wrote {}", out.display());
-    Ok(())
-}
-
-#[derive(Clone, Serialize)]
-struct CropSceneScore {
-    scene: String,
-    center_rmse: f32,
-    scale_cv: f32,
-    iou_mean: f32,
-    mean_h: f32,
-    lm_conf: Option<f32>,
-    eye_conf: Option<f32>,
-    recall: f32,
-    max_streak: usize,
-    drops: usize,
-    e2e_p50_ms: f64,
-    lm_p50_ms: f64,
-    box_p50_ms: f64,
-    hits: usize,
-    frames: usize,
-}
-
-#[derive(Serialize)]
-struct CropReport {
-    frames: usize,
-    scenes: Vec<CropSceneScore>,
-}
-
-fn crop_score(rows: &[Row]) -> CropSceneScore {
-    let mut cx = Vec::new();
-    let mut cy = Vec::new();
-    let mut hs = Vec::new();
-    let mut ious = Vec::new();
-    let mut prev: Option<[f32; 4]> = None;
-    let mut hits = 0usize;
-    let mut streak = 0usize;
-    let mut max_streak = 0usize;
-    let mut drops = 0usize;
-    let mut was_hit = false;
-    let mut e2e = Vec::new();
-    let mut lm_ms = Vec::new();
-    let mut box_ms = Vec::new();
-    let mut lm = Vec::new();
-    let mut eye = Vec::new();
-    for r in rows {
-        e2e.push(r.e2e_ms);
-        lm_ms.push(r.lm_ms);
-        box_ms.push(r.box_ms);
-        let hit = r.faces > 0;
-        if hit {
-            hits += 1;
-            streak += 1;
-            max_streak = max_streak.max(streak);
-            if let Some(b) = r.box5 {
-                cx.push(b[0] + b[2] * 0.5);
-                cy.push(b[1] + b[3] * 0.5);
-                hs.push(b[3]);
-                if let Some(p) = prev {
-                    ious.push(xywh_iou(p, [b[0], b[1], b[2], b[3]]));
-                }
-                prev = Some([b[0], b[1], b[2], b[3]]);
-            }
-            if let Some(c) = r.lm_conf {
-                lm.push(c);
-            }
-            if let Some(c) = r.eye_conf {
-                eye.push(c);
-            }
-        } else {
-            if was_hit {
-                drops += 1;
-            }
-            streak = 0;
-            prev = None;
-        }
-        was_hit = hit;
-    }
-    let n = cx.len() as f32;
-    let mx = mean_f32(&cx).unwrap_or(0.0);
-    let my = mean_f32(&cy).unwrap_or(0.0);
-    let rmse = if n > 0.0 {
-        (cx.iter()
-            .zip(&cy)
-            .map(|(x, y)| (x - mx) * (x - mx) + (y - my) * (y - my))
-            .sum::<f32>()
-            / n)
-            .sqrt()
-    } else {
-        0.0
-    };
-    let mh = mean_f32(&hs).unwrap_or(0.0);
-    let var_h = if n > 0.0 && mh > 1e-3 {
-        hs.iter().map(|h| (h - mh) * (h - mh)).sum::<f32>() / n
-    } else {
-        0.0
-    };
-    CropSceneScore {
-        scene: String::new(),
-        center_rmse: rmse,
-        scale_cv: if mh > 1e-3 { var_h.sqrt() / mh } else { 0.0 },
-        iou_mean: mean_f32(&ious).unwrap_or(0.0),
-        mean_h: mh,
-        lm_conf: mean_f32(&lm),
-        eye_conf: mean_f32(&eye),
-        recall: hits as f32 / rows.len().max(1) as f32,
-        max_streak,
-        drops,
-        e2e_p50_ms: Latency::from_samples(0, &e2e).p50_ms,
-        lm_p50_ms: Latency::from_samples(0, &lm_ms).p50_ms,
-        box_p50_ms: Latency::from_samples(0, &box_ms).p50_ms,
-        hits,
-        frames: rows.len(),
-    }
-}
-
-fn print_crop_scene(tag: &str, s: &CropSceneScore) {
-    eprintln!(
-        "  {tag:16} rmse={:.3} cv={:.4} iou={:.3} h={:.1} rec={:.3} lm={:.3} e2e={:.2}ms infer={:.2}ms box={:.3}ms",
-        s.center_rmse,
-        s.scale_cv,
-        s.iou_mean,
-        s.mean_h,
-        s.recall,
-        s.lm_conf.unwrap_or(0.0),
-        s.e2e_p50_ms,
-        s.lm_p50_ms,
-        s.box_p50_ms
-    );
-}
-
-fn run_crop_suite(args: &Args, _spec: LmSpec, out: &Path) -> Result<()> {
-    let spec = LmSpec::from_type(3)?;
-    let mut pipe = open_pipe(args, spec, false)?;
-    let seed = BgrImage::load(&args.image)?;
-    let (tile, face_h) = extract_face_tile(&mut pipe, &seed)?;
-    let n = args.frames.max(30);
-    eprintln!("crop: seed face_h={face_h:.1}px, {n} frames/scene");
-    let mut static_seq = make_scale_seq_n(&tile, face_h, 0.20, n, false);
-    if let Some(first) = static_seq.frames.first().cloned() {
-        static_seq.frames = vec![first; n];
-    }
-    let wander = make_scale_seq_n(&tile, face_h, 0.20, n, true);
-    let far = make_scale_seq_n(&tile, face_h, 0.08, n, true);
-    let noisy = {
-        let s = make_scale_seq_n(&tile, face_h, 0.20, n, true);
-        ScaleSeq {
-            face_frac: s.face_frac,
-            frames: s
-                .frames
-                .iter()
-                .enumerate()
-                .map(|(i, f)| degrade_noise(f, 34.0, 0xC0FFEE ^ (i as u32 * 997)))
-                .collect(),
-        }
-    };
-    let scenes: [(&str, ScaleSeq); 4] = [
-        ("static", static_seq),
-        ("wander", wander),
-        ("far", far),
-        ("noisy", noisy),
-    ];
-
-    let mut scores = Vec::new();
-    for (scene_name, seq) in &scenes {
-        let rows = run_seq(&mut pipe, spec, seq, None, EnhanceCfg::off(), 0)?;
-        let mut sc = crop_score(&rows);
-        sc.scene = (*scene_name).into();
-        print_crop_scene(*scene_name, &sc);
-        scores.push(sc);
-    }
-    let report = CropReport {
-        frames: n,
-        scenes: scores,
-    };
-    if let Some(dir) = out.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    fs::write(out, serde_json::to_string_pretty(&report)?)?;
-    eprintln!("wrote {}", out.display());
-    Ok(())
-}
-
 #[derive(Clone)]
 struct RawTrack {
     euler: [f32; 3],
@@ -1931,7 +966,6 @@ struct RawTrack {
     pts_3d: [[f32; 3]; 70],
     conf: f32,
     pnp_error: f32,
-    success: bool,
     hit: bool,
     e2e_ms: f64,
 }
@@ -1961,7 +995,6 @@ struct FilterReport {
     noisy_nme_ratio: f32,
     step_lag_extra: f32,
     filter_us: f64,
-    vs_speed_jitter: f32,
     scenes: Vec<FilterSceneScore>,
 }
 
@@ -1985,10 +1018,10 @@ fn open_filter_tracker(args: &Args, w: u32, h: u32) -> Result<Tracker> {
     })
 }
 
-fn capture_raw(tracker: &mut Tracker, seq: &ScaleSeq) -> Result<Vec<RawTrack>> {
+fn capture_raw(tracker: &mut Tracker, frames: &[BgrImage]) -> Result<Vec<RawTrack>> {
     tracker.set_size(SCALE_W, SCALE_H);
-    let mut out = Vec::with_capacity(seq.frames.len());
-    for frame in &seq.frames {
+    let mut out = Vec::with_capacity(frames.len());
+    for frame in frames {
         let t0 = Instant::now();
         let faces = tracker.predict(frame);
         let e2e_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -2001,7 +1034,6 @@ fn capture_raw(tracker: &mut Tracker, seq: &ScaleSeq) -> Result<Vec<RawTrack>> {
                 pts_3d: f.pts_3d,
                 conf: f.conf,
                 pnp_error: f.pnp_error,
-                success: f.success,
                 hit: true,
                 e2e_ms,
             });
@@ -2014,7 +1046,6 @@ fn capture_raw(tracker: &mut Tracker, seq: &ScaleSeq) -> Result<Vec<RawTrack>> {
                 pts_3d: [[0.0; 3]; 70],
                 conf: 0.0,
                 pnp_error: 0.0,
-                success: false,
                 hit: false,
                 e2e_ms,
             });
@@ -2023,27 +1054,13 @@ fn capture_raw(tracker: &mut Tracker, seq: &ScaleSeq) -> Result<Vec<RawTrack>> {
     Ok(out)
 }
 
-fn replay_filter(
-    raw: &[RawTrack],
-    cfg: FilterCfg,
-    dt: f32,
-    use_track_quality: bool,
-) -> (Vec<RawTrack>, f64) {
+fn replay_filter(raw: &[RawTrack], cfg: FilterCfg, dt: f32) -> (Vec<RawTrack>, f64) {
     let mut flt = OutputFilter::new(cfg);
     let t0 = Instant::now();
     let mut out = Vec::with_capacity(raw.len());
     for r in raw {
         let mut s = r.clone();
         if s.hit {
-            let q = if use_track_quality {
-                FilterQuality {
-                    conf: s.conf,
-                    pnp_error: s.pnp_error,
-                    success: s.success,
-                }
-            } else {
-                FilterQuality::default()
-            };
             flt.apply(
                 &mut s.euler,
                 &mut s.translation,
@@ -2051,7 +1068,6 @@ fn replay_filter(
                 &mut s.lms,
                 &mut s.pts_3d,
                 dt,
-                q,
             );
         } else {
             flt.reset();
@@ -2158,29 +1174,6 @@ fn median_f32(v: &[f32]) -> f32 {
     s[s.len() / 2]
 }
 
-fn make_step_seq(face: &BgrImage, face_h: f32, frac: f32, n: usize, dx: f32) -> ScaleSeq {
-    let n = n.max(8);
-    let target = ((SCALE_H as f32 * frac) as u32).max(8);
-    let scale = target as f32 / face_h.max(1.0);
-    let fw = ((face.width as f32 * scale) as u32).max(8);
-    let fh = ((face.height as f32 * scale) as u32).max(8);
-    let resized = resize_bgr(face, fw, fh);
-    let mut frames = Vec::with_capacity(n);
-    let mid = n / 2;
-    for i in 0..n {
-        let extra = if i >= mid { dx } else { 0.0 };
-        let x = (SCALE_W as i32 - fw as i32) / 2 + extra as i32;
-        let y = (SCALE_H as i32 - fh as i32) / 2;
-        let mut canvas = synth_canvas(SCALE_W, SCALE_H);
-        paste_bgr(&mut canvas, &resized, x, y);
-        frames.push(canvas);
-    }
-    ScaleSeq {
-        face_frac: frac,
-        frames,
-    }
-}
-
 fn print_filter_row(s: &FilterSceneScore) {
     eprintln!(
         "  {:8} {:10} jitter_e={:.3} jitter_c={:.3} lag={:.1} nme={:.4} pose={:.3} filt={:.1}us e2e={:.2}ms rec={:.2} conf={:.3} pnp={:.1}",
@@ -2199,8 +1192,8 @@ fn print_filter_row(s: &FilterSceneScore) {
     );
 }
 
-fn run_filter_suite(args: &Args, _spec: LmSpec, out: &Path) -> Result<()> {
-    let mut pipe = open_pipe(args, LmSpec::from_type(3)?, false)?;
+fn run_filter_suite(args: &Args, out: &Path) -> Result<()> {
+    let mut pipe = open_pipe(args, LmSpec::from_type(3)?)?;
     let seed = BgrImage::load(&args.image)?;
     let (tile, face_h) = extract_face_tile(&mut pipe, &seed)?;
     let n = args.frames.max(30);
@@ -2208,32 +1201,24 @@ fn run_filter_suite(args: &Args, _spec: LmSpec, out: &Path) -> Result<()> {
     eprintln!("filter: seed face_h={face_h:.1}px, {n} frames/scene");
 
     let mut static_clean = make_scale_seq_n(&tile, face_h, 0.20, n, false);
-    if let Some(first) = static_clean.frames.first().cloned() {
-        static_clean.frames = vec![first; n];
+    if let Some(first) = static_clean.first().cloned() {
+        static_clean = vec![first; n];
     }
-    let static_seq = ScaleSeq {
-        face_frac: static_clean.face_frac,
-        frames: static_clean
-            .frames
-            .iter()
-            .enumerate()
-            .map(|(i, f)| degrade_noise(f, 16.0, 0x51A71C ^ (i as u32 * 131)))
-            .collect(),
-    };
+    let static_seq: Vec<BgrImage> = static_clean
+        .iter()
+        .enumerate()
+        .map(|(i, f)| degrade_noise(f, 16.0, 0x51A71C ^ (i as u32 * 131)))
+        .collect();
     let wander = make_scale_seq_n(&tile, face_h, 0.20, n, true);
     let far = make_scale_seq_n(&tile, face_h, 0.08, n, true);
-    let noisy = ScaleSeq {
-        face_frac: wander.face_frac,
-        frames: wander
-            .frames
-            .iter()
-            .enumerate()
-            .map(|(i, f)| degrade_noise(f, 34.0, 0xC0FFEE ^ (i as u32 * 997)))
-            .collect(),
-    };
+    let noisy: Vec<BgrImage> = wander
+        .iter()
+        .enumerate()
+        .map(|(i, f)| degrade_noise(f, 34.0, 0xC0FFEE ^ (i as u32 * 997)))
+        .collect();
     let step = make_step_seq(&tile, face_h, 0.20, n, 160.0);
     let static_teacher_seq = static_clean;
-    let scenes: [(&str, ScaleSeq); 5] = [
+    let scenes: [(&str, Vec<BgrImage>); 5] = [
         ("static", static_seq),
         ("wander", wander),
         ("far", far),
@@ -2241,11 +1226,9 @@ fn run_filter_suite(args: &Args, _spec: LmSpec, out: &Path) -> Result<()> {
         ("step", step),
     ];
 
-    let euro = FilterCfg::new(FilterKind::OneEuro, 1.0, 0.007);
-    let kinds: [(&str, FilterCfg, bool); 3] = [
-        ("none", FilterCfg::default(), false),
-        ("speed", euro, false),
-        ("one-euro", euro, true),
+    let kinds: [(&str, FilterCfg); 2] = [
+        ("none", FilterCfg::default()),
+        ("one-euro", FilterCfg::new(FilterKind::OneEuro, 1.0, 0.007)),
     ];
 
     let mut scores = Vec::new();
@@ -2269,11 +1252,11 @@ fn run_filter_suite(args: &Args, _spec: LmSpec, out: &Path) -> Result<()> {
             raw.clone()
         };
         let e2e = Latency::from_samples(0, &raw.iter().map(|r| r.e2e_ms).collect::<Vec<_>>());
-        for (fname, cfg, use_q) in &kinds {
+        for (fname, cfg) in &kinds {
             let (filt, filter_us) = if *fname == "none" {
                 (raw.clone(), 0.0)
             } else {
-                replay_filter(&raw, *cfg, dt, *use_q)
+                replay_filter(&raw, *cfg, dt)
             };
             let (je, jc) = jitter_of(&filt);
             let (nme_t, pose) = nme_pose(&filt, &teacher);
@@ -2312,14 +1295,8 @@ fn run_filter_suite(args: &Args, _spec: LmSpec, out: &Path) -> Result<()> {
     let jitter = |s: &FilterSceneScore| s.jitter_euler.max(s.jitter_center);
     let none_j = pick("static", "none", jitter);
     let euro_j = pick("static", "one-euro", jitter);
-    let speed_j = pick("static", "speed", jitter);
     let drop = if none_j > 1e-6 {
         (none_j - euro_j) / none_j
-    } else {
-        0.0
-    };
-    let vs_speed_jitter = if speed_j > 1e-6 {
-        (speed_j - euro_j) / speed_j
     } else {
         0.0
     };
@@ -2339,9 +1316,8 @@ fn run_filter_suite(args: &Args, _spec: LmSpec, out: &Path) -> Result<()> {
         .map(|s| s.filter_us)
         .fold(0.0, f64::max);
     eprintln!(
-        "one-euro vs none: drop={:.1}% nme_ratio={nme_ratio:.3} lag_extra={lag_extra:.1} filt={filter_us:.1}us vs_speed_jitter={:.1}%",
-        drop * 100.0,
-        vs_speed_jitter * 100.0
+        "one-euro vs none: drop={:.1}% nme_ratio={nme_ratio:.3} lag_extra={lag_extra:.1} filt={filter_us:.1}us",
+        drop * 100.0
     );
 
     let report = FilterReport {
@@ -2351,166 +1327,8 @@ fn run_filter_suite(args: &Args, _spec: LmSpec, out: &Path) -> Result<()> {
         noisy_nme_ratio: nme_ratio,
         step_lag_extra: lag_extra,
         filter_us,
-        vs_speed_jitter,
         scenes: scores,
     };
-    if let Some(dir) = out.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    fs::write(out, serde_json::to_string_pretty(&report)?)?;
-    eprintln!("wrote {}", out.display());
-    Ok(())
-}
-
-#[derive(Serialize)]
-struct GlassesSceneScore {
-    name: String,
-    frames: usize,
-    hits: usize,
-    lm_conf: Option<f32>,
-    eye_conf: Option<f32>,
-    gaze_conf: Option<f32>,
-    ear_mean: Option<f32>,
-    ear_std: Option<f32>,
-    crop_iou_vs_control: Option<f32>,
-    e2e_p50_ms: f64,
-}
-
-#[derive(Serialize)]
-struct GlassesReport {
-    frames: usize,
-    scenes: Vec<GlassesSceneScore>,
-}
-
-fn std_f32(v: &[f32]) -> Option<f32> {
-    let m = mean_f32(v)?;
-    if v.len() < 2 {
-        return Some(0.0);
-    }
-    let var = v.iter().map(|x| (x - m) * (x - m)).sum::<f32>() / v.len() as f32;
-    Some(var.sqrt())
-}
-
-fn glasses_scene(name: &str, rows: &[Row], control: Option<&[Row]>) -> GlassesSceneScore {
-    let hits = rows.iter().filter(|r| r.faces > 0).count();
-    let mut iou = Vec::new();
-    if let Some(ctl) = control {
-        for (a, b) in rows.iter().zip(ctl.iter()) {
-            if let (Some(x), Some(y)) = (a.box5, b.box5) {
-                iou.push(xywh_iou([x[0], x[1], x[2], x[3]], [y[0], y[1], y[2], y[3]]));
-            }
-        }
-    }
-    let ears: Vec<f32> = rows.iter().filter_map(|r| r.ear).collect();
-    GlassesSceneScore {
-        name: name.into(),
-        frames: rows.len(),
-        hits,
-        lm_conf: mean_opt(rows.iter().map(|r| r.lm_conf)),
-        eye_conf: mean_opt(rows.iter().map(|r| r.eye_conf)),
-        gaze_conf: mean_opt(rows.iter().map(|r| r.gaze_conf)),
-        ear_mean: mean_f32(&ears),
-        ear_std: std_f32(&ears),
-        crop_iou_vs_control: mean_f32(&iou),
-        e2e_p50_ms: Latency::from_samples(0, &rows.iter().map(|r| r.e2e_ms).collect::<Vec<_>>())
-            .p50_ms,
-    }
-}
-
-fn print_glasses_scene(s: &GlassesSceneScore) {
-    eprintln!(
-        "  {:16} lm={:.3} eye={:.3} gaze={:.3} ear={:.3}±{:.3} iou={:.3} rec={:.3} p50={:.2}ms",
-        s.name,
-        s.lm_conf.unwrap_or(0.0),
-        s.eye_conf.unwrap_or(0.0),
-        s.gaze_conf.unwrap_or(0.0),
-        s.ear_mean.unwrap_or(0.0),
-        s.ear_std.unwrap_or(0.0),
-        s.crop_iou_vs_control.unwrap_or(0.0),
-        s.hits as f32 / s.frames.max(1) as f32,
-        s.e2e_p50_ms
-    );
-}
-
-fn wikimedia_stills() -> Vec<(String, BgrImage)> {
-    let cache = Path::new(env!("CARGO_MANIFEST_DIR")).join("../benchmarks/fixtures/cache");
-    let man = Path::new(env!("CARGO_MANIFEST_DIR")).join("../benchmarks/fixtures/manifest.json");
-    let Ok(text) = fs::read_to_string(man) else {
-        return Vec::new();
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    let Some(photos) = v.get("photos").and_then(|p| p.as_array()) else {
-        return out;
-    };
-    for p in photos {
-        let Some(file) = p.get("file").and_then(|s| s.as_str()) else {
-            continue;
-        };
-        let id = p
-            .get("id")
-            .and_then(|s| s.as_str())
-            .unwrap_or(file)
-            .to_string();
-        let path = cache.join(file);
-        if let Ok(im) = BgrImage::load(&path) {
-            out.push((id, im));
-        }
-    }
-    out
-}
-
-fn run_glasses_suite(args: &Args, _spec: LmSpec, out: &Path) -> Result<()> {
-    let spec = LmSpec::from_type(3)?;
-    let mut pipe = open_pipe(args, spec, false)?;
-    let seed = BgrImage::load(&args.image)?;
-    let (tile, face_h) = extract_face_tile(&mut pipe, &seed)?;
-    let n = args.frames.max(24);
-    let bare = make_scale_seq_n(&tile, face_h, 0.20, n, true);
-    eprintln!("glasses: seed face_h={face_h:.1}px, {n} frames");
-
-    let bare_rows = run_seq_ex(&mut pipe, spec, &bare, None, EnhanceCfg::off(), 0, true)?;
-
-    let mut painted = Vec::with_capacity(bare.frames.len());
-    for (frame, row) in bare.frames.iter().zip(bare_rows.iter()) {
-        let mut f = frame.clone();
-        if row.pts.len() >= 48 {
-            paint_synthetic_glasses(&mut f, &row.pts);
-        }
-        painted.push(f);
-    }
-    let glasses_seq = ScaleSeq {
-        face_frac: bare.face_frac,
-        frames: painted,
-    };
-    let glasses_rows = run_seq_ex(
-        &mut pipe,
-        spec,
-        &glasses_seq,
-        None,
-        EnhanceCfg::off(),
-        0,
-        true,
-    )?;
-
-    let mut scenes = vec![
-        glasses_scene("bare", &bare_rows, None),
-        glasses_scene("synth_glasses", &glasses_rows, Some(&bare_rows)),
-    ];
-    for (id, im) in wikimedia_stills() {
-        let seq = ScaleSeq {
-            face_frac: 0.0,
-            frames: vec![im; 8.min(n).max(1)],
-        };
-        let rows = run_seq_ex(&mut pipe, spec, &seq, None, EnhanceCfg::off(), 1, true)?;
-        scenes.push(glasses_scene(&id, &rows, None));
-    }
-    for s in &scenes {
-        print_glasses_scene(s);
-    }
-    let report = GlassesReport { frames: n, scenes };
     if let Some(dir) = out.parent() {
         fs::create_dir_all(dir)?;
     }

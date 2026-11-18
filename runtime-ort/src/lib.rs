@@ -1,16 +1,12 @@
 //! ORT inference and the OpenSeeFace tracker (`facetracker` binary).
 
-mod adaptive;
 mod capture;
-mod crop;
 mod decode;
-mod enhance;
 mod ext;
 mod features;
 mod filter;
 mod gaze;
 mod geom;
-mod glasses;
 mod metrics;
 mod output;
 mod pnp;
@@ -24,25 +20,14 @@ mod viz;
 mod vmc;
 mod vrm;
 
-pub use adaptive::{
-    center_2x, det_window, face_on_224, nme, pick_lm, AdaptiveCfg, AdaptiveState, DetWindow,
-    FAST_LM,
-};
 pub use capture::{list_cameras, mirror_bgr, InputSource, PipedInput, VideoOut};
-pub use crop::{stable_landmark_bbox, CropSmoothState, CropTrack};
 pub use decode::{
-    decode_landmarks, decode_landmarks_data, detect_faces, detect_faces_n, landmark_bbox,
-    mean_conf, LmSpec, TensorF16, EYE_IDX,
+    decode_landmarks, decode_landmarks_data, detect_faces, detect_faces_n, LmSpec, TensorF16,
 };
-pub use enhance::{enhance_bgr, enhance_bgr_in_place, EnhanceCfg, HeMode};
 pub use ext::{ExtListener, ExtState, VISEME_COUNT, VISEME_NAMES};
-pub use features::{
-    FeatureVec, FEATURE_COUNT, FEATURE_NAMES, FEAT_CHEEK_PUFF, FEAT_JAW_OPEN, FEAT_MOUTH_FUNNEL,
-    FEAT_MOUTH_OFFSET_X, FEAT_MOUTH_PRESS_LIP_OPEN, FEAT_MOUTH_PUCKER,
-};
-pub use filter::{unwrap_deg, FilterCfg, FilterKind, FilterQuality, OutputFilter};
+pub use features::{FeatureVec, FEATURE_COUNT, FEATURE_NAMES};
+pub use filter::{unwrap_deg, FilterCfg, FilterKind, OutputFilter};
 pub use geom::xywh_iou;
-pub use glasses::{ear_2d, paint_synthetic_glasses};
 pub use metrics::{cosine, max_abs, mean_abs, model_path, read_f32_le, rss, Latency, Rss};
 pub use output::OutputDriver;
 pub use pnp::Camera;

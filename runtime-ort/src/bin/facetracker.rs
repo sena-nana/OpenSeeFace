@@ -76,7 +76,7 @@ struct Args {
     #[arg(long, default_value = "")]
     dump_points: String,
     /// Output post-process: none | one-euro
-    #[arg(long, default_value = "one-euro")]
+    #[arg(long, default_value = "none")]
     filter: String,
     #[arg(long, default_value_t = 1.0)]
     filter_mincutoff: f32,
@@ -106,21 +106,6 @@ struct Args {
     /// Listen for `/OSF/Ext/Visemes` and `/OSF/Ext/Expression` (OVRLipSync / SVM sidecar). 0 disables.
     #[arg(long, default_value_t = 39540)]
     osf_ext_listen: u16,
-}
-
-/// Analog eye openness for the tracker console (`eye_blink` in 0..=1).
-/// Glyphs: O open, o half, - slit, x shut.
-fn format_eye_open(open: f32) -> String {
-    let g = if open > 0.75 {
-        'O'
-    } else if open > 0.40 {
-        'o'
-    } else if open > 0.15 {
-        '-'
-    } else {
-        'x'
-    };
-    format!("{g} {open:.2}")
 }
 
 fn main() -> Result<()> {
@@ -161,7 +146,7 @@ fn main() -> Result<()> {
         ..VrmCfg::default()
     });
     let mut output = OutputDriver::new();
-    let mut ext_listen = if args.osf_ext_listen != 0 {
+    let mut ext_listen = if args.vmc != 0 && args.osf_ext_listen != 0 {
         match ExtListener::bind(([0, 0, 0, 0], args.osf_ext_listen).into()) {
             Ok(l) => Some(l),
             Err(e) => {
@@ -231,7 +216,6 @@ fn main() -> Result<()> {
                 filter,
                 filter_mincutoff: args.filter_mincutoff,
                 filter_beta: args.filter_beta,
-                ..TrackerConfig::default()
             })?);
             if args.visualize != 0 {
                 viz = VizWindow::open(frame.width, frame.height).ok();
@@ -257,13 +241,15 @@ fn main() -> Result<()> {
             .iter()
             .map(|f| {
                 if args.silent == 0 {
+                    let r = if f.eye_blink[0] > 0.30 { "O" } else { "-" };
+                    let l = if f.eye_blink[1] > 0.30 { "O" } else { "-" };
                     println!(
-                        "Confidence[{}]: {:.4} / 3D fitting error: {:.4} / Eyes L,R: {}, {}",
+                        "Confidence[{}]: {:.4} / 3D fitting error: {:.4} / Eyes: {}, {}",
                         f.id + args.face_id_offset,
                         f.conf,
                         f.pnp_error,
-                        format_eye_open(f.eye_blink[1]),
-                        format_eye_open(f.eye_blink[0]),
+                        l,
+                        r,
                     );
                 }
                 FacePacket::from_face(
@@ -375,17 +361,4 @@ fn run_benchmark(args: &Args) -> Result<()> {
         println!("{}", 1.0 / (total / 100.0));
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::format_eye_open;
-
-    #[test]
-    fn eye_console_shows_analog_levels() {
-        assert_eq!(format_eye_open(0.95), "O 0.95");
-        assert_eq!(format_eye_open(0.52), "o 0.52");
-        assert_eq!(format_eye_open(0.22), "- 0.22");
-        assert_eq!(format_eye_open(0.05), "x 0.05");
-    }
 }

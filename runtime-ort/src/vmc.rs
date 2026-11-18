@@ -76,7 +76,7 @@ pub fn encode_vmc(frame: &VrmFrame) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::features::{FEAT_JAW_OPEN, FEAT_MOUTH_PUCKER};
+    use crate::features::{FEAT_CORNER_IO_L, FEAT_CORNER_IO_R, FEAT_MOUTH_OPEN};
     use crate::output::OutputDriver;
     use crate::udp::sample_packet;
     use crate::vrm::{VrmCfg, VrmDriver};
@@ -86,8 +86,9 @@ mod tests {
         let mut d = VrmDriver::new(VrmCfg::default());
         let mut out = OutputDriver::new();
         let mut pkt = sample_packet();
-        pkt.features[FEAT_MOUTH_PUCKER] = 0.5;
-        pkt.features[FEAT_JAW_OPEN] = 0.4;
+        pkt.features[FEAT_CORNER_IO_L] = -0.5;
+        pkt.features[FEAT_CORNER_IO_R] = -0.5;
+        pkt.features[FEAT_MOUTH_OPEN] = 0.4;
         let frame = d.map(&out.update(&pkt, None).unwrap()).unwrap();
         let buf = encode_vmc(&frame).unwrap();
         let text = String::from_utf8_lossy(&buf);

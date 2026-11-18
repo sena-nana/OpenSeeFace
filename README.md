@@ -20,7 +20,7 @@ I ran OpenSeeFace on a sample clip from the video presentation for [3D Face Reco
 
 # Usage
 
-The tracker is the `facetracker` CLI in `runtime-ort`. It reads a webcam, still, or video file, and writes one 1809-byte OpenSee packet per face to UDP (`127.0.0.1:11573` by default): 20 expression features. Slots 14–19 are `MouthPucker`, `MouthOffsetX` (positive = person's right), `CheekPuff`, `JawOpen`, `MouthFunnel`, and `MouthPressLipOpen` (landmark heuristic: +teeth / −thinner closed lips; no tongue). It also sends VMC OSC (`127.0.0.1:39539` by default) with head/eye/jaw bones and VRM blendshapes. Tracking can run on a different machine from the consumer. `--vmc 0` disables VMC.
+The tracker is the `facetracker` CLI in `runtime-ort`. It reads a webcam, still, or video file, and writes one 1785-byte OpenSee packet per face to UDP (`127.0.0.1:11573` by default) with the 14 standard OpenSeeFace expression features. It also sends VMC OSC (`127.0.0.1:39539` by default) with head/eye/jaw bones and VRM blendshapes. Tracking can run on a different machine from the consumer. `--vmc 0` disables VMC.
 
 If you downloaded a release on Windows, run `facetracker.exe` from the `Binary` folder (`run.bat` is a short camera demo). From source:
 
@@ -38,12 +38,11 @@ Webcam or video with the built-in overlay (no Unity required):
 # General notes
 
 * The tracking seems to be quite robust even with partial occlusion of the face, glasses or bad lighting conditions.
-* With glasses, next-frame crop switches to brows+nose when eye corners disagree with that fit. Blink skips EAR outliers / low eye conf; gaze holds the last pupil when heatmap conf drops and suppresses specular only when the eye crop is blown out. Sunglasses / missing iris still cannot recover appearance-based gaze.
 * The highest quality model is selected with `--model 3`, the fastest model with the lowest tracking quality is `--model 0`.
 * Lower tracking quality mainly means more rigid tracking, making it harder to detect blinking and eyebrow motion.
 * Depending on the frame rate, face tracking can easily use up a whole CPU core. At 30fps for a single face, it should still use less than 100% of one core on a decent CPU. If tracking uses too much CPU, try lowering the frame rate. A frame rate of 20 is probably fine and anything above 30 should rarely be necessary.
-* Once all `--faces` slots are filled, full-frame detection is skipped. The next crop comes from the previous frame's landmarks (eyes+nose fit). Detection runs again only after a lost face, or every `--scan-every` frames when fewer faces are tracked than `--faces`. Set `--faces` no higher than the number of faces you are actually tracking.
-* `--filter` (default `one-euro`) smooths UDP pose and 2D landmarks after PnP. Strength follows landmark confidence, PnP stability, and motion speed. `--filter none` keeps raw measurements. Crop tracking and expression features are unchanged. A/B notes: [benchmarks/filter-eval.md](benchmarks/filter-eval.md).
+* Once all `--faces` slots are filled, full-frame detection is skipped. The next crop comes from the previous frame's landmark bounding box. Detection runs again only after a lost face, or every `--scan-every` frames when fewer faces are tracked than `--faces`. Set `--faces` no higher than the number of faces you are actually tracking.
+* `--filter` defaults to `none` (raw measurements). `--filter one-euro` enables an optional speed-based One Euro output filter on UDP pose and 2D landmarks without changing crop tracking or expression features.
 
 # VRM / Unity (VMC)
 
@@ -121,30 +120,13 @@ Tracking no longer uses Python. `train/` keeps the PyTorch architectures (`model
 
 Per-model `bench()` times bound inference only.
 
-Realistic crop / glasses scenarios (synthetic webcam canvases, tracking loop, optional Wikimedia glasses photos). Default `--suite micro` is unchanged:
+Scenario sweep (synthetic webcam canvases, tracking loop):
 
     cargo run --release --manifest-path runtime-ort/Cargo.toml --bin osf-bench -- --suite realistic --model 3 --threads 4
 
-Face-size adaptive tracking zooms the 224 detector on small faces and switches to the 112px landmark model on large ones. `--adaptive` on `osf-bench` enables it for the realistic suite. `--suite scale` A/Bs default thresholds against a fixed model-3 baseline:
-
-    cargo run --release --manifest-path runtime-ort/Cargo.toml --bin osf-bench -- --suite scale
-
-Next-frame crop uses an eyes+nose similarity fit. After a face is locked, that crop is reused and the 224 detector is not run (`osf-bench --suite crop`):
-
-    cargo run --release --manifest-path runtime-ort/Cargo.toml --bin osf-bench -- --suite crop --model 3 --threads 4
-
-Glasses runtime path (bare vs synthetic rims/glare on the seed face; Wikimedia stills if `benchmarks/fixtures/cache/` is populated). Download the CC/PD portraits first:
-
-    python3 benchmarks/fixtures/fetch.py
-    cargo run --release --manifest-path runtime-ort/Cargo.toml --bin osf-bench -- --suite glasses --model 3 --threads 4
-
-Output post-process (`none` vs default `one-euro`) on the same raw pose and landmarks (`osf-bench --suite filter`). Decision notes: [benchmarks/filter-eval.md](benchmarks/filter-eval.md).
+Output post-process (`none` vs `one-euro`) on the same raw pose and landmarks (`osf-bench --suite filter`):
 
     cargo run --release --manifest-path runtime-ort/Cargo.toml --bin osf-bench -- --suite filter --model 3 --threads 4
-
-Symmetry / relative-distance / 3D-projection landmark correction after PnP (alone and stacked with One Euro) was tried and rejected: dark-frame NME got worse and clean measurements were pulled off. Notes: [benchmarks/geom-eval.md](benchmarks/geom-eval.md).
-
-Velocity / confidence / trajectory outlier rejection after PnP (alone and stacked with One Euro) was tried and rejected: hold lag pulled clean wander off, injected spikes did not improve NME, and the stack added step lag. Notes: [benchmarks/outlier-eval.md](benchmarks/outlier-eval.md).
 
 # References
 

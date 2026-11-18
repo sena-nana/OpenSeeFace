@@ -4,13 +4,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use crate::crop::{stable_landmark_bbox, CropSmoothState};
 use crate::decode::{decode_landmarks_data, detect_faces_data, LmSpec};
 use crate::features::{FeatureExtractor, FeatureVec};
-use crate::filter::{FilterCfg, FilterKind, FilterQuality, OutputFilter};
+use crate::filter::{FilterCfg, FilterKind, OutputFilter};
 use crate::gaze::get_eye_state;
 use crate::geom::{clamp_to_im, group_rects};
-use crate::glasses::hold_gaze;
 use crate::pnp::{adjust_3d, estimate_depth, Camera, CONTOUR_PTS, CONTOUR_PTS_T, FACE_3D};
 use crate::preprocess::{imagenet_nchw_into, imagenet_nchw_roi_into, BgrImage};
 use crate::retinaface::RetinaFace;
@@ -66,7 +64,6 @@ pub struct FaceInfo {
     fail_count: i32,
     update_counts: [[f32; 2]; 66],
     features: FeatureExtractor,
-    crop_smooth: CropSmoothState,
     output_filter: OutputFilter,
 }
 
@@ -95,7 +92,6 @@ impl FaceInfo {
             fail_count: 0,
             update_counts: [[0.0; 2]; 66],
             features: FeatureExtractor::new(max_feature_updates),
-            crop_smooth: CropSmoothState::default(),
             output_filter: OutputFilter::new(filter),
         };
         s.update_contour(model_type);
@@ -121,7 +117,6 @@ impl FaceInfo {
         let mut o = self.clone();
         o.update_counts = [[0.0; 2]; 66];
         o.features = FeatureExtractor::new(0.0);
-        o.crop_smooth = CropSmoothState::default();
         o.output_filter = OutputFilter::new(FilterCfg {
             kind: FilterKind::None,
             ..FilterCfg::default()
@@ -150,7 +145,6 @@ impl FaceInfo {
         self.update_contour(model_type);
         self.fail_count = 0;
         self.coord = None;
-        self.crop_smooth.reset();
         self.output_filter.reset();
     }
 
@@ -167,7 +161,7 @@ impl FaceInfo {
         self.frame_count = frame_count;
         self.conf = conf;
         self.lms = lms;
-        self.eye_state = hold_gaze(self.eye_state, eye);
+        self.eye_state = eye;
         self.coord = Some(coord);
         self.alive = true;
         let _ = (model_type, max_feature_updates);
@@ -247,7 +241,7 @@ impl Default for TrackerConfig {
             max_feature_updates: 0.0,
             static_model: true,
             try_hard: false,
-            filter: FilterKind::OneEuro,
+            filter: FilterKind::None,
             filter_mincutoff: 1.0,
             filter_beta: 0.007,
         }
@@ -596,16 +590,17 @@ impl Tracker {
                 best[g] = Some((score, i));
             }
         }
-        let mut picked: Vec<(f32, Vec<[f32; 3]>, [[f32; 4]; 2])> = best
+        let mut picked: Vec<_> = best
             .into_iter()
             .flatten()
-            .map(|(_, i)| {
+            .map(|(score, i)| {
                 let (c, l, e, _, _) = raw[i].clone();
-                (c, l, e)
+                (score, c, l, e)
             })
             .collect();
         picked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         picked.truncate(self.max_faces);
+        let picked: Vec<_> = picked.into_iter().map(|(_, c, l, e)| (c, l, e)).collect();
         self.assign_face_info(picked);
 
         let mut results = Vec::new();
@@ -650,7 +645,6 @@ impl Tracker {
                     fi.translation = [0.0; 3];
                     fi.update_counts = [[0.0; 2]; 66];
                     fi.update_contour(model_type);
-                    fi.crop_smooth.reset();
                     fi.output_filter.reset();
                 }
             } else {
@@ -685,12 +679,7 @@ impl Tracker {
                 y2 = y2.max(p[1]);
             }
             fi.bbox = [y1, x1, y2 - y1, x2 - x1];
-            fi.crop_smooth.seed_size(fi.bbox);
-            let next = stable_landmark_bbox(&fi.lms, Some(&mut fi.crop_smooth))
-                .map(|b| [b[0], b[1], b[2], b[3]])
-                .or_else(|| fi.crop_smooth.last_box())
-                .unwrap_or([0.0, 0.0, 1.0, 1.0]);
-            detected.push(next);
+            detected.push(fi.bbox);
             let mut out = fi.snapshot_output();
             fi.output_filter.apply(
                 &mut out.euler,
@@ -699,11 +688,6 @@ impl Tracker {
                 &mut out.lms,
                 &mut out.pts_3d,
                 dt,
-                FilterQuality {
-                    conf: fi.conf,
-                    pnp_error: fi.pnp_error,
-                    success: fi.success,
-                },
             );
             results.push(out);
             let _ = max_fu;

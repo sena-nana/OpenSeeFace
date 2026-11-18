@@ -3,7 +3,6 @@
 use nalgebra::{Matrix3, Vector3};
 use rand::Rng;
 
-use crate::decode::{EYE_IDX, mean_conf};
 use crate::geom::matrix_to_quaternion;
 
 pub const FACE_3D: [[f32; 3]; 70] = [
@@ -524,7 +523,8 @@ pub fn estimate_depth(
             t_reference[30].z
         };
         let xy = image_xy(lms[30]);
-        pnp_error += (xy[0] - t_reference[30].x / z).powi(2) + (xy[1] - t_reference[30].y / z).powi(2);
+        pnp_error +=
+            (xy[0] - t_reference[30].x / z).powi(2) + (xy[1] - t_reference[30].y / z).powi(2);
     }
     if pnp_error.is_nan() {
         pnp_error = 9_999_999.0;
@@ -691,7 +691,9 @@ fn model_update(solved: [f32; 3]) -> ModelUpdate {
     if roll.abs() > 30.0 {
         return ModelUpdate::Skip;
     }
-    ModelUpdate::Turned { lock_right: yaw > 10.0 }
+    ModelUpdate::Turned {
+        lock_right: yaw > 10.0,
+    }
 }
 
 enum ModelUpdate {
@@ -718,15 +720,6 @@ pub fn adjust_3d(
     eye_blink: &mut [f32; 2],
 ) {
     if conf < 0.4 || pnp_error > 300.0 {
-        normalize_pts3d(pts_3d, face_3d);
-        apply_features(
-            pts_3d,
-            feature_level,
-            features,
-            current_features,
-            eye_blink,
-            mean_conf(lms, &EYE_IDX),
-        );
         return;
     }
     if model_type != -1 && !static_model {
@@ -816,14 +809,7 @@ pub fn adjust_3d(
         }
     }
     normalize_pts3d(pts_3d, face_3d);
-    apply_features(
-        pts_3d,
-        feature_level,
-        features,
-        current_features,
-        eye_blink,
-        mean_conf(lms, &EYE_IDX),
-    );
+    apply_features(pts_3d, feature_level, features, current_features, eye_blink);
 }
 
 fn apply_features(
@@ -832,10 +818,9 @@ fn apply_features(
     features: &mut crate::features::FeatureExtractor,
     current_features: &mut crate::features::FeatureVec,
     eye_blink: &mut [f32; 2],
-    eye_conf: Option<f32>,
 ) {
     if feature_level >= 1 {
-        *current_features = features.update_ex(pts_3d, feature_level == 2, eye_conf);
+        *current_features = features.update(pts_3d, feature_level == 2);
         eye_blink[0] = 1.0 - (-current_features[1]).clamp(0.0, 1.0);
         eye_blink[1] = 1.0 - (-current_features[0]).clamp(0.0, 1.0);
     }
@@ -972,7 +957,11 @@ mod tests {
             yaw_nose[0] < rest_nose[0] - 3.0,
             "positive model yaw moves the nose to image left: {rest_nose:?} -> {yaw_nose:?}"
         );
-        assert!(yaw.success && yaw.pnp_error < 1.0, "yaw err {}", yaw.pnp_error);
+        assert!(
+            yaw.success && yaw.pnp_error < 1.0,
+            "yaw err {}",
+            yaw.pnp_error
+        );
         // Image left is the user's right, published as positive yaw.
         assert_usable(yaw.euler, [0.0, 18.0, 0.0], "yaw");
 
@@ -999,7 +988,11 @@ mod tests {
             roll_brow[0] > rest_brow[0] + 3.0,
             "positive model roll moves the brow to image right: {rest_brow:?} -> {roll_brow:?}"
         );
-        assert!(roll.success && roll.pnp_error < 1.0, "roll err {}", roll.pnp_error);
+        assert!(
+            roll.success && roll.pnp_error < 1.0,
+            "roll err {}",
+            roll.pnp_error
+        );
         // Brow moving to image right is a tilt toward the user's left.
         assert_usable(roll.euler, [0.0, 0.0, -11.0], "roll");
     }
@@ -1018,11 +1011,11 @@ mod tests {
             model_update([0.0, -25.0, 180.0]),
             ModelUpdate::Turned { lock_right: false }
         ));
-        assert!(matches!(model_update([-40.0, 0.0, -180.0]), ModelUpdate::Skip));
         assert!(matches!(
-            model_update([0.0, 18.0, 90.0]),
+            model_update([-40.0, 0.0, -180.0]),
             ModelUpdate::Skip
         ));
+        assert!(matches!(model_update([0.0, 18.0, 90.0]), ModelUpdate::Skip));
     }
 
     #[test]

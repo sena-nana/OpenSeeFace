@@ -6,10 +6,9 @@ use nalgebra::{Quaternion, Unit, UnitQuaternion, Vector3};
 
 use crate::ext::{expr_blend, VISEME_COUNT};
 use crate::features::{
-    FEAT_BROW_STEEP_L, FEAT_BROW_STEEP_R, FEAT_BROW_UD_L, FEAT_BROW_UD_R, FEAT_CHEEK_PUFF,
-    FEAT_CORNER_IO_L, FEAT_CORNER_IO_R, FEAT_CORNER_UD_L, FEAT_CORNER_UD_R, FEAT_EYE_L, FEAT_EYE_R,
-    FEAT_JAW_OPEN, FEAT_MOUTH_FUNNEL, FEAT_MOUTH_OFFSET_X, FEAT_MOUTH_OPEN,
-    FEAT_MOUTH_PRESS_LIP_OPEN, FEAT_MOUTH_PUCKER, FEAT_MOUTH_WIDE,
+    FEAT_BROW_STEEP_L, FEAT_BROW_STEEP_R, FEAT_BROW_UD_L, FEAT_BROW_UD_R, FEAT_CORNER_IO_L,
+    FEAT_CORNER_IO_R, FEAT_CORNER_UD_L, FEAT_CORNER_UD_R, FEAT_EYE_L, FEAT_EYE_R, FEAT_MOUTH_OPEN,
+    FEAT_MOUTH_WIDE,
 };
 use crate::output::FaceOutput;
 
@@ -221,21 +220,10 @@ impl VrmDriver {
 
     fn apply_ps_mouth(&self, out: &FaceOutput<'_>, blends: &mut BTreeMap<String, f32>) {
         let f = &out.packet.features;
-        set_blend(blends, "MouthPucker", f[FEAT_MOUTH_PUCKER]);
-        set_blend(blends, "JawOpen", f[FEAT_JAW_OPEN]);
+        let pucker = ((-f[FEAT_CORNER_IO_L]).max(0.0) + (-f[FEAT_CORNER_IO_R]).max(0.0)) * 0.5;
+        set_blend(blends, "MouthPucker", pucker);
+        set_blend(blends, "JawOpen", f[FEAT_MOUTH_OPEN].max(0.0));
         set_blend(blends, "MouthClose", (-f[FEAT_MOUTH_OPEN]).max(0.0));
-        set_blend(blends, "MouthFunnel", f[FEAT_MOUTH_FUNNEL]);
-        set_blend(blends, "CheekPuff", f[FEAT_CHEEK_PUFF]);
-        set_blend(
-            blends,
-            "MouthLeft",
-            below(f[FEAT_MOUTH_OFFSET_X], -0.3, 0.5),
-        );
-        set_blend(
-            blends,
-            "MouthRight",
-            above(f[FEAT_MOUTH_OFFSET_X], 0.3, 0.5),
-        );
         set_blend(
             blends,
             "MouthSmileLeft",
@@ -268,9 +256,6 @@ impl VrmDriver {
             "MouthStretchRight",
             (wide + f[FEAT_CORNER_IO_R].max(0.0)) * 0.6 * open_gate,
         );
-        let press = (-f[FEAT_MOUTH_PRESS_LIP_OPEN]).max(0.0);
-        set_blend(blends, "MouthPressLeft", press);
-        set_blend(blends, "MouthPressRight", press);
         let g = &out.ps_geom;
         set_blend(blends, "MouthUpperUpLeft", g.upper_l);
         set_blend(blends, "MouthUpperUpRight", g.upper_r);
@@ -456,7 +441,8 @@ mod tests {
         let mut d = VrmDriver::new(VrmCfg::default());
         let mut out = OutputDriver::new();
         let mut pkt = sample_packet();
-        pkt.features[FEAT_MOUTH_PUCKER] = 0.7;
+        pkt.features[FEAT_CORNER_IO_L] = -0.7;
+        pkt.features[FEAT_CORNER_IO_R] = -0.7;
         let got = frame_of(&mut d, &mut out, &pkt);
         assert!((got.blend("MouthPucker").unwrap_or(0.0) - 0.7).abs() < 1e-5);
         assert!(got.blend("A").is_none());

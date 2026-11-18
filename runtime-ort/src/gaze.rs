@@ -53,7 +53,6 @@ struct EyePrep {
     reference: [f32; 2],
     angle: f32,
     flip: bool,
-    glare: bool,
 }
 
 fn prepare_eye(face: &BgrImage, corners: [[f32; 2]; 2], flip: bool) -> Option<EyePrep> {
@@ -63,18 +62,8 @@ fn prepare_eye(face: &BgrImage, corners: [[f32; 2]; 2], flip: bool) -> Option<Ey
     let radius = ((c1[0] - c2.0).hypot(c1[1] - c2.1) / 2.0).max(1.0);
     let w = face.width as f32;
     let h = face.height as f32;
-    let probe_rx = radius * 1.4;
-    let probe_ry = radius * 1.2;
-    let glare = crate::glasses::region_glare_frac(
-        face,
-        center[0] - probe_rx,
-        center[1] - probe_ry,
-        center[0] + probe_rx,
-        center[1] + probe_ry,
-    ) > crate::glasses::GLARE_FRAC_THRESH;
-    let (px, py) = if glare { (1.65, 1.45) } else { (1.4, 1.2) };
-    let rx = radius * px;
-    let ry = radius * py;
+    let rx = radius * 1.4;
+    let ry = radius * 1.2;
     let (x1, y1) = clamp_to_im(center[0] - rx, center[1] - ry, w, h);
     let (x2, y2) = clamp_to_im(center[0] + rx, center[1] + ry, w, h);
     if x2 <= x1 || y2 <= y1 {
@@ -89,11 +78,10 @@ fn prepare_eye(face: &BgrImage, corners: [[f32; 2]; 2], flip: bool) -> Option<Ey
         reference: c1,
         angle: a,
         flip,
-        glare,
     })
 }
 
-/// Inverse of `rotate_about` over the eye box only, then ImageNet NCHW at 32×32.
+/// Inverse of `rotate_about` over the eye box only, then ImageNet `(C, X, Y)` at 32×32.
 fn eye_nchw_into(face: &BgrImage, p: &EyePrep, dst: &mut [f16]) {
     let (cw, ch) = (p.w, p.h);
     if cw < 2 || ch < 2 {
@@ -116,10 +104,25 @@ fn eye_nchw_into(face: &BgrImage, p: &EyePrep, dst: &mut [f16]) {
     if p.flip {
         crop.flip_h_in_place();
     }
-    if p.glare || crate::glasses::glare_frac(&crop) > crate::glasses::GLARE_FRAC_THRESH {
-        crate::glasses::suppress_glare(&mut crop);
-    }
     imagenet_nchw_into(&crop, 32, dst);
+    transpose_32x32_planes(dst);
+}
+
+/// Match upstream `np.transpose(im, (0, 3, 2, 1))`, swapping `(Y, X)` to `(X, Y)`.
+fn transpose_32x32_planes(dst: &mut [f16]) {
+    const N: usize = 32;
+    const PLANE: usize = N * N;
+    if dst.len() < 3 * PLANE {
+        return;
+    }
+    for c in 0..3 {
+        let plane = &mut dst[c * PLANE..(c + 1) * PLANE];
+        for y in 0..N {
+            for x in (y + 1)..N {
+                plane.swap(y * N + x, x * N + y);
+            }
+        }
+    }
 }
 
 /// Returns `[open, row, col, conf]` per eye (right, left), matching Python `eye_state`.
@@ -205,4 +208,43 @@ fn decode_eyes(
         }
     }
     state
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eye_nchw_transposes_to_channel_x_y() {
+        // Horizontal ramp in X, constant in Y, on a 32x32 crop aligned with image axes.
+        let mut face = BgrImage::zeros(64, 64);
+        for y in 0..64u32 {
+            for x in 0..64u32 {
+                let v = (x * 3) as u8;
+                let idx = ((y * 64 + x) * 3) as usize;
+                face.data[idx] = v;
+                face.data[idx + 1] = v;
+                face.data[idx + 2] = v;
+            }
+        }
+        let prep = EyePrep {
+            x1: 16.0,
+            y1: 16.0,
+            w: 32,
+            h: 32,
+            scale: [1.0, 1.0],
+            reference: [16.0, 16.0],
+            angle: 0.0,
+            flip: false,
+        };
+        let mut dst = vec![f16::ZERO; 3 * 32 * 32];
+        eye_nchw_into(&face, &prep, &mut dst);
+        // Under (C, X, Y) layout matching np.transpose(im, (0, 3, 2, 1)):
+        // increasing X advances the slow spatial axis (x * 32 + y), while varying Y leaves values constant.
+        let x0_y0 = dst[0].to_f32();
+        let x0_y20 = dst[20].to_f32();
+        let x20_y0 = dst[20 * 32].to_f32();
+        assert!((x0_y0 - x0_y20).abs() < 1e-2, "{x0_y0} vs {x0_y20}");
+        assert!(x20_y0 > x0_y0 + 0.5, "{x20_y0} vs {x0_y0}");
+    }
 }

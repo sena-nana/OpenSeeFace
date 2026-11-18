@@ -4,9 +4,8 @@ use std::time::Instant;
 
 use crate::ext::{cats, winning, ExtState, SIL, VISEME_COUNT};
 use crate::features::{
-    face_norm_basis, FeatureVec, FEAT_BROW_UD_L, FEAT_BROW_UD_R, FEAT_CORNER_UD_L,
-    FEAT_CORNER_UD_R, FEAT_JAW_OPEN, FEAT_MOUTH_FUNNEL, FEAT_MOUTH_OPEN, FEAT_MOUTH_PUCKER,
-    FEAT_MOUTH_WIDE,
+    face_norm_basis, FeatureVec, FEAT_BROW_UD_L, FEAT_BROW_UD_R, FEAT_CORNER_IO_L,
+    FEAT_CORNER_IO_R, FEAT_CORNER_UD_L, FEAT_CORNER_UD_R, FEAT_MOUTH_OPEN, FEAT_MOUTH_WIDE,
 };
 use crate::udp::FacePacket;
 
@@ -142,11 +141,8 @@ impl OutputDriver {
     fn update_ps_geom(&mut self, pkt: &FacePacket) -> PsGeom {
         let f = &pkt.features;
         let (nx, ny) = face_norm_basis(&pkt.pts_3d);
-        let rest = f[FEAT_MOUTH_OPEN] < 0.15
-            && f[FEAT_JAW_OPEN] < 0.15
-            && f[FEAT_MOUTH_WIDE].abs() < 0.2
-            && f[FEAT_MOUTH_PUCKER] < 0.15
-            && f[FEAT_MOUTH_FUNNEL] < 0.15;
+        let pucker = ((-f[FEAT_CORNER_IO_L]).max(0.0) + (-f[FEAT_CORNER_IO_R]).max(0.0)) * 0.5;
+        let rest = f[FEAT_MOUTH_OPEN] < 0.15 && f[FEAT_MOUTH_WIDE].abs() < 0.2 && pucker < 0.15;
         let p = &pkt.pts_3d;
         let d_ul = self.ps_delta(0, (p[51][1] - p[30][1]) / ny, rest);
         let d_ur = self.ps_delta(1, (p[49][1] - p[30][1]) / ny, rest);
@@ -157,8 +153,8 @@ impl OutputDriver {
         let ready = self.ps_geom_init;
         self.ps_geom_init = true;
         let mut g = PsGeom::default();
-        if ready && f[FEAT_MOUTH_PUCKER] < 0.25 && f[FEAT_MOUTH_FUNNEL] < 0.25 {
-            let jaw = f[FEAT_JAW_OPEN].max(0.0) * 0.55;
+        if ready && pucker < 0.25 {
+            let jaw = f[FEAT_MOUTH_OPEN].max(0.0) * 0.55;
             g.upper_l = (-d_ul * 1.8).clamp(0.0, 1.0);
             g.upper_r = (-d_ur * 1.8).clamp(0.0, 1.0);
             g.lower_l = (d_ll * 1.8 - jaw).clamp(0.0, 1.0);

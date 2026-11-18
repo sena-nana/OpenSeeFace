@@ -14,9 +14,6 @@ mod neon;
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 mod x86;
 
-pub(crate) const HIST: usize = 256;
-pub(crate) use scalar::{blend_u8, box3_bgr, clahe_remap, gray_world};
-
 static MODE: AtomicU8 = AtomicU8::new(SimdMode::Auto as u8);
 
 /// Which CPU preprocess kernel to run.
@@ -93,11 +90,6 @@ pub fn backend_name() -> &'static str {
     {
         "scalar"
     }
-}
-
-#[inline]
-pub(crate) fn clamp_u8(v: f32) -> u8 {
-    v.round().clamp(0.0, 255.0) as u8
 }
 
 fn run_nchw(
@@ -518,13 +510,6 @@ mod tests {
         rgb_to_bgr_isa(&mut a);
         scalar::rgb_to_bgr_in_place(&mut b);
         assert_eq!(a, b);
-    }
-
-    #[test]
-    fn box3_constant_is_identity() {
-        let mut im = vec![77u8; 24 * 18 * 3];
-        box3_bgr(&mut im, 24, 18);
-        assert!(im.iter().all(|&v| v == 77));
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]

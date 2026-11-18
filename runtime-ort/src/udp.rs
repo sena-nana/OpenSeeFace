@@ -1,19 +1,11 @@
-//! Official OpenSee UDP packet: 1809 bytes / face, 20 expression features.
-//! Slots 14–19 are `mouth_pucker`, `mouth_offset_x`, `cheek_puff`, `jaw_open`,
-//! `mouth_funnel`, `mouth_press_lip_open`. Older receivers still accept 1785-byte
-//! (14-feature), 1797-byte (17-feature), and 1805-byte (19-feature) packets.
+//! Official OpenSee UDP packet: 1785 bytes / face, 14 expression features.
 
 use crate::features::FeatureVec;
 use crate::tracker::FaceInfo;
 
-/// 8+4+8+8+1+4+12+12+16+272+544+840+80 = 1809
-pub const PACKET_FRAME_SIZE: usize = 1809;
-/// 19-feature packets from the previous extra-slot revision.
-pub const PACKET_FRAME_SIZE_19: usize = 1805;
-/// 17-feature packets from the previous extra-slot revision.
-pub const PACKET_FRAME_SIZE_17: usize = 1797;
-/// Older 14-feature packets. Tracker no longer emits these.
-pub const PACKET_FRAME_SIZE_LEGACY: usize = 1785;
+/// 8+4+8+8+1+4+12+12+16+272+544+840+56 = 1785
+pub const PACKET_FRAME_SIZE: usize = 1785;
+pub const PACKET_FRAME_SIZE_LEGACY: usize = PACKET_FRAME_SIZE;
 
 #[derive(Clone, Debug)]
 pub struct FacePacket {
@@ -133,13 +125,10 @@ pub(crate) fn sample_packet() -> FacePacket {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::features::{
-        FEATURE_COUNT, FEAT_CHEEK_PUFF, FEAT_JAW_OPEN, FEAT_MOUTH_FUNNEL, FEAT_MOUTH_OFFSET_X,
-        FEAT_MOUTH_PRESS_LIP_OPEN, FEAT_MOUTH_PUCKER,
-    };
+    use crate::features::{FEATURE_COUNT, FEAT_EYE_L, FEAT_MOUTH_OPEN, FEAT_MOUTH_WIDE};
 
     #[test]
-    fn packet_is_1809() {
+    fn packet_is_1785() {
         assert_eq!(encode_face(&sample_packet()).len(), PACKET_FRAME_SIZE);
         assert_eq!(
             PACKET_FRAME_SIZE,
@@ -156,33 +145,22 @@ mod tests {
                 + 4 * 3 * 70
                 + 4 * FEATURE_COUNT
         );
-        assert_eq!(PACKET_FRAME_SIZE_19, PACKET_FRAME_SIZE - 4);
-        assert_eq!(PACKET_FRAME_SIZE_17, PACKET_FRAME_SIZE - 4 * 3);
-        assert_eq!(PACKET_FRAME_SIZE_LEGACY, PACKET_FRAME_SIZE - 4 * 6);
+        assert_eq!(PACKET_FRAME_SIZE_LEGACY, PACKET_FRAME_SIZE);
     }
 
     #[test]
-    fn extra_features_are_appended() {
+    fn features_are_appended_in_slot_order() {
         let mut f = sample_packet();
-        f.features[FEAT_MOUTH_PUCKER] = 0.5;
-        f.features[FEAT_MOUTH_OFFSET_X] = -0.25;
-        f.features[FEAT_CHEEK_PUFF] = 0.8;
-        f.features[FEAT_JAW_OPEN] = 0.7;
-        f.features[FEAT_MOUTH_FUNNEL] = 0.4;
-        f.features[FEAT_MOUTH_PRESS_LIP_OPEN] = -0.6;
+        f.features[FEAT_EYE_L] = -0.75;
+        f.features[FEAT_MOUTH_OPEN] = 0.5;
+        f.features[FEAT_MOUTH_WIDE] = -0.25;
         let bytes = encode_face(&f);
         let n = bytes.len();
-        let pucker = f32::from_le_bytes(bytes[n - 24..n - 20].try_into().unwrap());
-        let offset = f32::from_le_bytes(bytes[n - 20..n - 16].try_into().unwrap());
-        let puff = f32::from_le_bytes(bytes[n - 16..n - 12].try_into().unwrap());
-        let jaw = f32::from_le_bytes(bytes[n - 12..n - 8].try_into().unwrap());
-        let funnel = f32::from_le_bytes(bytes[n - 8..n - 4].try_into().unwrap());
-        let press = f32::from_le_bytes(bytes[n - 4..n].try_into().unwrap());
-        assert_eq!(pucker, 0.5);
-        assert_eq!(offset, -0.25);
-        assert_eq!(puff, 0.8);
-        assert_eq!(jaw, 0.7);
-        assert_eq!(funnel, 0.4);
-        assert_eq!(press, -0.6);
+        let eye_l = f32::from_le_bytes(bytes[n - 56..n - 52].try_into().unwrap());
+        let mouth_open = f32::from_le_bytes(bytes[n - 8..n - 4].try_into().unwrap());
+        let mouth_wide = f32::from_le_bytes(bytes[n - 4..n].try_into().unwrap());
+        assert_eq!(eye_l, -0.75);
+        assert_eq!(mouth_open, 0.5);
+        assert_eq!(mouth_wide, -0.25);
     }
 }
